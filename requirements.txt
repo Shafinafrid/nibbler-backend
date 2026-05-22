@@ -18,3 +18,4 @@ tiktoken==0.7.0
 PyPDF2==3.0.1
 beautifulsoup4==4.12.3
 requests==2.32.3
+voyageai==0.2.3

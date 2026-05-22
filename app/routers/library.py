@@ -4,7 +4,7 @@ from app.database import get_db
 from app.middleware.auth import get_current_user
 from app.models.user import User
 from app.models.library import LibraryItem
-from app.schemas.library import LibraryItemCreate, LibraryItemResponse, LibraryItemList
+from app.schemas.library import LibraryItemCreate, LibraryItemResponse, LibraryItemList, LibraryItemUrlCreate
 from app.services.s3_service import S3Service
 from app.services.embedding_service import EmbeddingService
 from app.config import get_settings
@@ -24,12 +24,18 @@ def check_upload_limit(user: User, db: Session):
             )
 
 
+# ── GET /library/ ─────────────────────────────────────────────────────────────
 @router.get("/", response_model=LibraryItemList)
 async def list_library(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    items = db.query(LibraryItem).filter(LibraryItem.user_id == current_user.id).order_by(LibraryItem.created_at.desc()).all()
+    items = (
+        db.query(LibraryItem)
+        .filter(LibraryItem.user_id == current_user.id)
+        .order_by(LibraryItem.created_at.desc())
+        .all()
+    )
     count = len(items)
     return LibraryItemList(
         items=items,
@@ -38,6 +44,7 @@ async def list_library(
     )
 
 
+# ── POST /library/ (plain text / paste) ───────────────────────────────────────
 @router.post("/", response_model=LibraryItemResponse)
 async def add_library_item(
     data: LibraryItemCreate,
@@ -59,11 +66,11 @@ async def add_library_item(
     db.commit()
     db.refresh(item)
 
-    # Process embeddings in background
     background_tasks.add_task(process_item_embeddings, item.id, current_user.id)
     return item
 
 
+# ── POST /library/upload-pdf ───────────────────────────────────────────────────
 @router.post("/upload-pdf", response_model=LibraryItemResponse)
 async def upload_pdf(
     background_tasks: BackgroundTasks,
@@ -73,10 +80,9 @@ async def upload_pdf(
 ):
     check_upload_limit(current_user, db)
 
-    if not file.filename.endswith(".pdf"):
+    if not file.filename.lower().endswith(".pdf"):
         raise HTTPException(status_code=400, detail="Only PDF files are supported.")
 
-    # Upload to S3
     s3 = S3Service()
     file_content = await file.read()
     file_url = await s3.upload_file(
@@ -88,7 +94,7 @@ async def upload_pdf(
     item = LibraryItem(
         id=str(uuid.uuid4()),
         user_id=current_user.id,
-        title=file.filename.replace(".pdf", ""),
+        title=file.filename.replace(".pdf", "").replace(".PDF", ""),
         type="pdf",
         file_url=file_url,
         file_size=len(file_content),
@@ -102,6 +108,34 @@ async def upload_pdf(
     return item
 
 
+# ── POST /library/add-url ──────────────────────────────────────────────────────
+@router.post("/add-url", response_model=LibraryItemResponse)
+async def add_url(
+    data: LibraryItemUrlCreate,
+    background_tasks: BackgroundTasks,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Scrape an article/blog URL and add its content to the library."""
+    check_upload_limit(current_user, db)
+
+    item = LibraryItem(
+        id=str(uuid.uuid4()),
+        user_id=current_user.id,
+        title=data.title or data.url,
+        type="url",
+        source_url=data.url,
+        processed=False,
+    )
+    db.add(item)
+    db.commit()
+    db.refresh(item)
+
+    background_tasks.add_task(process_url_embeddings, item.id, data.url, current_user.id)
+    return item
+
+
+# ── DELETE /library/{item_id} ──────────────────────────────────────────────────
 @router.delete("/{item_id}")
 async def delete_library_item(
     item_id: str,
@@ -116,11 +150,9 @@ async def delete_library_item(
     if not item:
         raise HTTPException(status_code=404, detail="Item not found.")
 
-    # Delete from Pinecone
     embedding_svc = EmbeddingService()
-    await embedding_svc.delete_item_vectors(item_id)
+    await embedding_svc.delete_item_vectors(item_id, user_id=current_user.id)
 
-    # Delete from S3 if PDF
     if item.file_url:
         s3 = S3Service()
         await s3.delete_file(item.file_url)
@@ -130,8 +162,10 @@ async def delete_library_item(
     return {"message": "Item deleted successfully"}
 
 
+# ── Background tasks ───────────────────────────────────────────────────────────
+
 async def process_item_embeddings(item_id: str, user_id: str):
-    """Background task: chunk text content and upsert to Pinecone."""
+    """Chunk plain-text / pasted content and upsert to Pinecone."""
     from app.database import SessionLocal
     db = SessionLocal()
     try:
@@ -154,9 +188,8 @@ async def process_item_embeddings(item_id: str, user_id: str):
 
 
 async def process_pdf_embeddings(item_id: str, file_url: str, user_id: str):
-    """Background task: extract text from PDF, chunk, and upsert to Pinecone."""
+    """Extract text from a PDF in S3, chunk, and upsert to Pinecone."""
     from app.database import SessionLocal
-    from app.services.s3_service import S3Service
     import PyPDF2
     import io
 
@@ -171,6 +204,12 @@ async def process_pdf_embeddings(item_id: str, file_url: str, user_id: str):
         reader = PyPDF2.PdfReader(io.BytesIO(pdf_bytes))
         text = " ".join(page.extract_text() or "" for page in reader.pages)
 
+        if not text.strip():
+            item.processed = False
+            item.processing_error = "Could not extract text from PDF."
+            db.commit()
+            return
+
         embedding_svc = EmbeddingService()
         chunk_count = await embedding_svc.index_text(
             text=text,
@@ -181,5 +220,72 @@ async def process_pdf_embeddings(item_id: str, file_url: str, user_id: str):
         item.processed = True
         item.chunk_count = chunk_count
         db.commit()
+    except Exception as e:
+        db.rollback()
+        print(f"[process_pdf_embeddings] Error for item {item_id}: {e}")
+    finally:
+        db.close()
+
+
+async def process_url_embeddings(item_id: str, url: str, user_id: str):
+    """Scrape URL content, extract readable text, chunk, and upsert to Pinecone."""
+    from app.database import SessionLocal
+    import requests
+    from bs4 import BeautifulSoup
+
+    db = SessionLocal()
+    try:
+        item = db.query(LibraryItem).filter(LibraryItem.id == item_id).first()
+        if not item:
+            return
+
+        headers = {"User-Agent": "Mozilla/5.0 (compatible; Nibbler/1.0)"}
+        response = requests.get(url, headers=headers, timeout=15)
+        response.raise_for_status()
+
+        soup = BeautifulSoup(response.text, "html.parser")
+
+        # Remove boilerplate tags
+        for tag in soup(["script", "style", "nav", "footer", "header", "aside", "form", "iframe"]):
+            tag.decompose()
+
+        # Try to extract main article content first
+        main = (
+            soup.find("article")
+            or soup.find("main")
+            or soup.find(id="content")
+            or soup.find(class_="content")
+            or soup.find(class_="post-content")
+            or soup.find(class_="entry-content")
+            or soup.body
+        )
+
+        text = main.get_text(separator=" ", strip=True) if main else soup.get_text(separator=" ", strip=True)
+
+        # Auto-set title from page <title> if not provided
+        if item.title == url:
+            page_title = soup.find("title")
+            if page_title:
+                item.title = page_title.get_text(strip=True)[:200]
+
+        if not text.strip():
+            item.processed = False
+            item.processing_error = "Could not extract text from URL."
+            db.commit()
+            return
+
+        embedding_svc = EmbeddingService()
+        chunk_count = await embedding_svc.index_text(
+            text=text,
+            item_id=item_id,
+            user_id=user_id,
+            metadata={"title": item.title, "type": "url", "source_url": url},
+        )
+        item.processed = True
+        item.chunk_count = chunk_count
+        db.commit()
+    except Exception as e:
+        db.rollback()
+        print(f"[process_url_embeddings] Error for item {item_id}: {e}")
     finally:
         db.close()

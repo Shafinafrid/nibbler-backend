@@ -29,6 +29,9 @@ class Settings(BaseSettings):
     pinecone_index_name: str = "nibbler-content"
     pinecone_environment: str = "gcp-starter"
 
+    # Voyage AI (embeddings)
+    voyage_api_key: str = ""
+
     # App
     app_env: str = "development"
     secret_key: str = "changeme"

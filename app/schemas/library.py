@@ -9,6 +9,11 @@ class LibraryItemCreate(BaseModel):
     content: Optional[str] = None
 
 
+class LibraryItemUrlCreate(BaseModel):
+    url: str
+    title: Optional[str] = None
+
+
 class LibraryItemResponse(BaseModel):
     id: str
     user_id: str
@@ -17,8 +22,10 @@ class LibraryItemResponse(BaseModel):
     content: Optional[str]
     file_url: Optional[str]
     file_size: Optional[int]
+    source_url: Optional[str]
     processed: bool
     chunk_count: int
+    processing_error: Optional[str]
     created_at: datetime
 
     class Config:
