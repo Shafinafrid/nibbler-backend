@@ -41,8 +41,6 @@ def _run_migrations():
         # library_items — columns added with embedding pipeline (May 2026)
         "ALTER TABLE library_items ADD COLUMN IF NOT EXISTS chunk_count INTEGER DEFAULT 0",
         "ALTER TABLE library_items ADD COLUMN IF NOT EXISTS processing_error VARCHAR",
-        # bites — add saved_at timestamp if missing
-        "ALTER TABLE bites ADD COLUMN IF NOT EXISTS saved_at TIMESTAMP",
     ]
 
     with engine.connect() as conn:
