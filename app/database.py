@@ -28,3 +28,29 @@ def create_tables():
     """Create all tables. Called on startup."""
     from app.models import user, profile, library, bite, streak  # noqa
     Base.metadata.create_all(bind=engine)
+    _run_migrations()
+
+
+def _run_migrations():
+    """
+    Safe column-level migrations — adds missing columns without touching
+    existing data. Add new ALTER statements here whenever the models gain
+    new columns so Railway auto-applies them on next deploy.
+    """
+    migrations = [
+        # library_items — columns added with embedding pipeline (May 2026)
+        "ALTER TABLE library_items ADD COLUMN IF NOT EXISTS chunk_count INTEGER DEFAULT 0",
+        "ALTER TABLE library_items ADD COLUMN IF NOT EXISTS processing_error VARCHAR",
+        # bites — add saved_at timestamp if missing
+        "ALTER TABLE bites ADD COLUMN IF NOT EXISTS saved_at TIMESTAMP",
+    ]
+
+    with engine.connect() as conn:
+        for sql in migrations:
+            try:
+                conn.execute(__import__('sqlalchemy').text(sql))
+                conn.commit()
+            except Exception as e:
+                # Table might not exist yet on a brand-new deploy — that's fine,
+                # create_all() above will create it with the right schema.
+                print(f"[migration] skipped ({e})")
