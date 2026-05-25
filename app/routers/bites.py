@@ -9,6 +9,7 @@ from app.models.bite import DailyBite, SavedBite
 from app.models.streak import Streak
 from app.schemas.bite import BiteResponse, SavedBiteResponse, BiteHistoryResponse, StreakResponse
 from app.services.bite_generator import BiteGenerator
+from app.services import mixpanel_service
 import uuid
 
 router = APIRouter(prefix="/bites", tags=["bites"])
@@ -60,8 +61,14 @@ async def get_todays_bite(
         )
         db.add(bite)
 
-        # Update streak
+        # Update streak + track analytics in background
         background_tasks.add_task(update_streak, current_user.id)
+        background_tasks.add_task(
+            mixpanel_service.track,
+            "bite_generated",
+            current_user.id,
+            {"theme": bite_data.get("theme"), "is_premium": current_user.is_premium},
+        )
         db.commit()
         db.refresh(bite)
 

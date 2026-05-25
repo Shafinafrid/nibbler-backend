@@ -35,6 +35,9 @@ class Settings(BaseSettings):
     # Push Notifications (Expo)
     expo_access_token: str = ""  # Optional — increases Expo push API rate limits
 
+    # Analytics
+    mixpanel_token: str = ""    # Same project token as frontend
+
     # App
     app_env: str = "development"
     secret_key: str = "changeme"
