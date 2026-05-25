@@ -138,7 +138,6 @@ class EmbeddingService:
             return
         try:
             if user_id:
-                # Delete by ID prefix within the user namespace
                 self.index.delete(
                     filter={"item_id": {"$eq": item_id}},
                     namespace=user_id,
@@ -147,3 +146,12 @@ class EmbeddingService:
                 self.index.delete(filter={"item_id": {"$eq": item_id}})
         except Exception as e:
             print(f"[EmbeddingService] Delete error: {e}")
+
+    async def delete_user_namespace(self, user_id: str):
+        """Delete ALL vectors for a user (entire namespace). Used on account deletion."""
+        if not self.pinecone_available:
+            return
+        try:
+            self.index.delete(delete_all=True, namespace=user_id)
+        except Exception as e:
+            print(f"[EmbeddingService] Namespace delete error: {e}")
