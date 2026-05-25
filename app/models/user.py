@@ -20,3 +20,4 @@ class User(Base):
     daily_bites = relationship("DailyBite", back_populates="user", cascade="all, delete-orphan")
     saved_bites = relationship("SavedBite", back_populates="user", cascade="all, delete-orphan")
     streak = relationship("Streak", back_populates="user", uselist=False, cascade="all, delete-orphan")
+    push_tokens = relationship("PushToken", back_populates="user", cascade="all, delete-orphan")

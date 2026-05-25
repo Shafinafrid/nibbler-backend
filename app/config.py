@@ -32,6 +32,9 @@ class Settings(BaseSettings):
     # Voyage AI (embeddings)
     voyage_api_key: str = ""
 
+    # Push Notifications (Expo)
+    expo_access_token: str = ""  # Optional — increases Expo push API rate limits
+
     # App
     app_env: str = "development"
     secret_key: str = "changeme"

@@ -26,7 +26,7 @@ def get_db():
 
 def create_tables():
     """Create all tables. Called on startup."""
-    from app.models import user, profile, library, bite, streak  # noqa
+    from app.models import user, profile, library, bite, streak, push_token  # noqa
     Base.metadata.create_all(bind=engine)
     _run_migrations()
 
