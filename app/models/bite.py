@@ -1,4 +1,4 @@
-from sqlalchemy import Column, String, ForeignKey, DateTime, Text, Date, func
+from sqlalchemy import Column, String, ForeignKey, DateTime, Text, Date, Integer, JSON, func
 from sqlalchemy.orm import relationship
 from app.database import Base
 
@@ -15,6 +15,15 @@ class DailyBite(Base):
     source = Column(String, nullable=True)
     theme = Column(String, nullable=True)
     date = Column(Date, nullable=False)          # The date this bite is for
+    # ── Session fields (July 2026): per-book card-deck sessions ──
+    library_item_id = Column(String, nullable=True, index=True)
+    cards = Column(JSON, nullable=True)          # full card deck for the session
+    quiz = Column(JSON, nullable=True)           # book-specific quiz (next-day daily quiz + review)
+    read_length = Column(Integer, nullable=True) # 5 | 10 | 15 minutes
+    mode = Column(String, nullable=True)         # wisdom | story
+    chapter = Column(String, nullable=True)      # display line for the home card
+    headline = Column(String, nullable=True)
+    preview = Column(Text, nullable=True)
     generated_at = Column(DateTime, server_default=func.now())
 
     user = relationship("User", back_populates="daily_bites")

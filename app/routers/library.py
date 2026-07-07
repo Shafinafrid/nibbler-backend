@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, BackgroundTasks
+from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Form, BackgroundTasks
 from sqlalchemy.orm import Session
 from app.database import get_db
 from app.middleware.auth import get_current_user
@@ -60,6 +60,10 @@ async def add_library_item(
         title=data.title,
         type=data.type,
         content=data.content,
+        mode=data.mode or "wisdom",
+        kind=data.kind or "book",
+        author=data.author,
+        growth_profile_name=data.growth_profile_name if (data.mode or "wisdom") == "wisdom" else None,
         processed=False,
     )
     db.add(item)
@@ -75,6 +79,11 @@ async def add_library_item(
 async def upload_pdf(
     background_tasks: BackgroundTasks,
     file: UploadFile = File(...),
+    title: str = Form(None),
+    mode: str = Form("wisdom"),
+    kind: str = Form("book"),
+    author: str = Form(None),
+    growth_profile_name: str = Form(None),
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
@@ -94,10 +103,14 @@ async def upload_pdf(
     item = LibraryItem(
         id=str(uuid.uuid4()),
         user_id=current_user.id,
-        title=file.filename.replace(".pdf", "").replace(".PDF", ""),
+        title=(title or file.filename.replace(".pdf", "").replace(".PDF", "")).strip(),
         type="pdf",
         file_url=file_url,
         file_size=len(file_content),
+        mode=mode or "wisdom",
+        kind=kind or "book",
+        author=author,
+        growth_profile_name=growth_profile_name if (mode or "wisdom") == "wisdom" else None,
         processed=False,
     )
     db.add(item)
@@ -125,6 +138,9 @@ async def add_url(
         title=data.title or data.url,
         type="url",
         source_url=data.url,
+        mode=data.mode or "wisdom",
+        kind=data.kind or "article",
+        growth_profile_name=data.growth_profile_name if (data.mode or "wisdom") == "wisdom" else None,
         processed=False,
     )
     db.add(item)
@@ -210,6 +226,10 @@ async def process_pdf_embeddings(item_id: str, file_url: str, user_id: str):
             db.commit()
             return
 
+        # Keep the full extracted text on the row — story mode reads the book
+        # sequentially from here.
+        item.content = text
+
         embedding_svc = EmbeddingService()
         chunk_count = await embedding_svc.index_text(
             text=text,
@@ -273,6 +293,9 @@ async def process_url_embeddings(item_id: str, url: str, user_id: str):
             item.processing_error = "Could not extract text from URL."
             db.commit()
             return
+
+        # Full text on the row so story mode can read sequentially
+        item.content = text
 
         embedding_svc = EmbeddingService()
         chunk_count = await embedding_svc.index_text(

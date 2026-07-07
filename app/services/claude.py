@@ -1,5 +1,6 @@
 import json
 import re
+from typing import Optional
 import anthropic
 from app.config import get_settings
 
@@ -21,6 +22,58 @@ Respond ONLY with valid JSON — no markdown, no code fences. Use exactly these 
 - action: concrete, small action step (1-2 sentences)
 - source: title of source material used (or "Your Nibbler Library" if synthesized)
 - theme: one-word theme (e.g. Focus, Resilience, Habits, Mindset, Leadership)"""
+
+SESSION_SYSTEM = """You are Nibbler's session engine. You build a daily "nibble session" — a tap-through
+card deck — from excerpts of a book/article the user uploaded, personalized to their growth profile.
+
+Respond ONLY with valid JSON, no markdown fences, matching exactly:
+{
+  "title": "short session title (5-9 words)",
+  "chapter": "which part/theme of the source this draws from, e.g. 'On habits & identity'",
+  "headline": "one arresting sentence that makes the user want to read (max 18 words)",
+  "preview": "2-sentence preview of today's session (max 45 words)",
+  "cards": [ ... exactly CARD_TARGET cards ... ],
+  "quiz": [ ... exactly 3 items ... ]
+}
+
+Card shapes (kind determines shape):
+- {"kind":"hook","eyebrow":"TODAY'S SESSION","title":"...","body":"..."}                    — 1st card, a story/scene/surprising fact from the source
+- {"kind":"insight","eyebrow":"KEY IDEA","title":"...","body":"...","highlight":"optional pull-quote from the source"}
+- {"kind":"quiz","eyebrow":"QUICK CHECK","title":"the question","options":[{"text":"...","correct":false},... 4 options, exactly 1 correct],"explanation":"..."}
+- {"kind":"prompt","eyebrow":"TRY THIS TODAY"|"REFLECT & ACT"|"DAILY CHALLENGE","title":"...","body":"..."}
+- {"kind":"summary","eyebrow":"SESSION SUMMARY","title":"The ideas from today's session.","body":"numbered recap"}
+
+Deck structure: hook first, summary last, one interaction card (quiz OR prompt per the instruction you
+receive) second-to-last, all remaining cards are insights. Card bodies: 90-160 words, warm, concrete,
+faithful to the source excerpts — never invent facts not present in them. Use \\n\\n between paragraphs.
+
+PERSONALIZATION (critical): the user's growth profile is provided. In EXACTLY ONE insight card, append a
+final short paragraph that explicitly ties the idea to their stated goal or their answer about how they
+approach new things — e.g. "You told Nibbler you take things step by step — this idea is exactly that kind
+of small, repeatable move." Make it feel personally picked, never generic.
+
+The separate top-level "quiz" array (3 multiple-choice questions, 4 options each, exactly 1 correct, with
+explanations) tests today's session content — it is shown to the user TOMORROW, so questions must stand
+alone without seeing the cards."""
+
+STORY_SYSTEM = """You are Nibbler's story engine. The user reads a book in "story mode": sequential,
+faithful, no personalization — the book itself, served in daily portions.
+
+You receive the next raw excerpt of the book (extracted text, possibly messy). Clean it and split it into
+a card deck. Respond ONLY with valid JSON, no markdown fences:
+{
+  "title": "short evocative title for today's portion (4-8 words)",
+  "chapter": "PART N" (N provided in the instruction),
+  "headline": "one line that sets the scene for today's reading (max 16 words)",
+  "preview": "1-2 sentence teaser of today's portion (max 35 words)",
+  "cards": [ {"kind":"story","eyebrow":"THE STORY CONTINUES","title":"short section heading","body":"the text"}, ... ]
+}
+
+Rules: preserve the author's actual words and order — you may fix broken hyphenation/whitespace and drop
+page furniture (page numbers, headers), and lightly bridge a cut sentence, but never rewrite, summarize,
+or add commentary. Split into the requested number of cards at natural pauses. First card's eyebrow is
+"TODAY'S READING" instead of "THE STORY CONTINUES". End the last card's body with the sentence where the
+excerpt ends — no cliffhanger text of your own."""
 
 
 class ClaudeService:
@@ -98,3 +151,98 @@ Generate today's personalized bite."""
                 "source": "Your Nibbler Library",
                 "theme": "Growth",
             }
+
+    # ── Session generation (July 2026) ────────────────────────────────────────
+
+    @staticmethod
+    def _parse_json(text: str) -> dict:
+        clean = text.strip()
+        if clean.startswith("```"):
+            clean = re.sub(r"^```(?:json)?\s*|\s*```$", "", clean)
+        # Tolerate stray prose around the JSON object
+        start, end = clean.find("{"), clean.rfind("}")
+        if start >= 0 and end > start:
+            clean = clean[start:end + 1]
+        return json.loads(clean)
+
+    async def generate_wisdom_session(
+        self,
+        book_title: str,
+        author: Optional[str],
+        profile: dict,
+        context_chunks: list[str],
+        card_target: int,
+        read_length: int,
+    ) -> dict:
+        """Personalized card-deck session from the user's own book excerpts."""
+        interaction = {
+            "analytical": "a QUIZ card (kind quiz, eyebrow QUICK CHECK)",
+            "practical": 'a PROMPT card with eyebrow "TRY THIS TODAY"',
+            "reflective": 'a PROMPT card with eyebrow "REFLECT & ACT"',
+        }.get(profile.get("contentMode") or "practical", 'a PROMPT card with eyebrow "TRY THIS TODAY"')
+
+        goal_bits = []
+        if profile.get("aspirationUnderstanding"):
+            goal_bits.append(f'their goal in their own words: they want {profile["aspirationUnderstanding"]}')
+        elif profile.get("aspirationLabel"):
+            goal_bits.append(f'their chosen goal: "{profile["aspirationLabel"]}"')
+        if profile.get("lifeArea"):
+            goal_bits.append(f'life area: {profile["lifeArea"]}')
+
+        confidence_line = {
+            "dive": 'they said "I dive straight in" when facing new things',
+            "steps": 'they said "I take it step by step" when facing new things',
+            "overwhelmed": 'they said "I get overwhelmed easily" when facing new things — keep the framing gentle and small',
+            "depends": 'they said "depends on the topic" when facing new things',
+        }.get(profile.get("confidenceStyle") or "steps", "")
+
+        user_msg = f"""SOURCE: "{book_title}"{f' by {author}' if author else ''}
+
+GROWTH PROFILE:
+- {'; '.join(goal_bits) if goal_bits else 'general personal growth'}
+- Confidence: {confidence_line}
+- Interests: {', '.join(profile.get('interests') or [])}
+
+CARD_TARGET: {card_target} cards total ({read_length}-minute read).
+Interaction card (second-to-last): {interaction}.
+
+SOURCE EXCERPTS (build the session ONLY from these):
+{chr(10).join(f'--- excerpt {i+1} ---{chr(10)}{c}' for i, c in enumerate(context_chunks))}
+
+Build today's session JSON now."""
+
+        response = self.client.messages.create(
+            model=self.model,
+            max_tokens=8000,
+            system=SESSION_SYSTEM,
+            messages=[{"role": "user", "content": user_msg}],
+        )
+        return self._parse_json(response.content[0].text)
+
+    async def generate_story_session(
+        self,
+        book_title: str,
+        author: Optional[str],
+        excerpt: str,
+        card_target: int,
+        part_number: int,
+    ) -> dict:
+        """Sequential story-mode portion — faithful text, no personalization."""
+        user_msg = f"""SOURCE: "{book_title}"{f' by {author}' if author else ''}
+This is PART {part_number} of the user's sequential read.
+Split into {card_target} cards.
+
+RAW EXCERPT:
+{excerpt}
+
+Build today's portion JSON now."""
+
+        response = self.client.messages.create(
+            model=self.model,
+            max_tokens=8000,
+            system=STORY_SYSTEM,
+            messages=[{"role": "user", "content": user_msg}],
+        )
+        result = self._parse_json(response.content[0].text)
+        result["quiz"] = None
+        return result

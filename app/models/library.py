@@ -17,6 +17,12 @@ class LibraryItem(Base):
     processed = Column(Boolean, default=False)
     chunk_count = Column(Integer, default=0)      # number of Pinecone vectors
     processing_error = Column(String, nullable=True)  # error message if processing failed
+    # ── Nibble-session fields (July 2026) ──
+    mode = Column(String, default="wisdom")            # wisdom | story
+    kind = Column(String, default="book")              # book | article | paper
+    author = Column(String, nullable=True)
+    growth_profile_name = Column(String, nullable=True)  # premium: which profile this feeds
+    story_progress = Column(Integer, default=0)          # story mode: next chunk index to read
     created_at = Column(DateTime, server_default=func.now())
     updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now())
 
