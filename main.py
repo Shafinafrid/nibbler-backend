@@ -3,7 +3,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
 from app.database import create_tables, SessionLocal
 from app.routers import auth, profile, library, bites, streak
-from app.routers import notifications
+from app.routers import notifications, connect
 from app.services.notification_service import start_scheduler, stop_scheduler
 from app.config import get_settings
 
@@ -47,6 +47,7 @@ app.include_router(library.router)
 app.include_router(bites.router)
 app.include_router(streak.router)
 app.include_router(notifications.router)
+app.include_router(connect.router)
 
 
 # ── Health check ──────────────────────────────────────────────────────────────

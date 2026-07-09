@@ -155,6 +155,28 @@ class EmbeddingService:
         )
         return [match.metadata.get("text", "") for match in results.matches]
 
+    async def search_item_scored(
+        self,
+        query: str,
+        user_id: str,
+        item_id: str,
+        top_k: int = 8,
+    ):
+        """Like search_item but returns [(text, score)] — scores drive the
+        Connect tab's goal-relevance analytics."""
+        if not self.pinecone_available:
+            return []
+
+        query_embedding = _get_query_embedding(query)
+        results = self.index.query(
+            vector=query_embedding,
+            top_k=top_k,
+            namespace=user_id,
+            filter={"item_id": {"$eq": item_id}},
+            include_metadata=True,
+        )
+        return [(m.metadata.get("text", ""), float(m.score or 0)) for m in results.matches]
+
     async def fetch_chunks(
         self,
         item_id: str,

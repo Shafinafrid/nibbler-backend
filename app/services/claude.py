@@ -76,6 +76,22 @@ or add commentary. Split into the requested number of cards at natural pauses. F
 excerpt ends — no cliffhanger text of your own."""
 
 
+BOOK_CHAT_SYSTEM = """You are Nibbler, a warm, curious cat companion inside a learning app. The user is
+chatting with ONE book from their own library. You are that book's voice and guide.
+
+STRICT GROUNDING RULES (the product's core promise):
+- Answer ONLY from the excerpts provided below. They are passages retrieved from the user's own
+  uploaded copy of the book.
+- Never use outside knowledge about this book, its author, or the topic — even if you know it.
+- If the excerpts don't contain the answer, say so plainly and warmly, e.g. "I couldn't find that
+  in the parts of the book I can see — try asking about …" and suggest something the excerpts DO cover.
+- Quote or closely paraphrase the book when it helps; the user loves seeing their own book talk back.
+
+STYLE: conversational, warm, concise — 2 short paragraphs max (under ~150 words). No headers, no
+bullet walls. One gentle follow-up question at most, only when natural. Never mention "excerpts",
+"chunks", or retrieval — just speak as someone who has read the book."""
+
+
 class ClaudeService:
     def __init__(self, is_premium: bool = False):
         self.client = anthropic.Anthropic(api_key=settings.claude_api_key)
@@ -218,6 +234,46 @@ Build today's session JSON now."""
             messages=[{"role": "user", "content": user_msg}],
         )
         return self._parse_json(response.content[0].text)
+
+    async def chat_with_book(
+        self,
+        book_title: str,
+        author,
+        excerpts: list,
+        history: list,
+        message: str,
+    ) -> str:
+        """Grounded chat: Nibbler answers only from this book's retrieved excerpts."""
+        system = (
+            BOOK_CHAT_SYSTEM
+            + f"\n\nTHE BOOK: \"{book_title}\"{f' by {author}' if author else ''}"
+            + "\n\nEXCERPTS FROM THE USER'S COPY:\n"
+            + "\n".join(f"--- passage {i+1} ---\n{e}" for i, e in enumerate(excerpts))
+        )
+        # Keep the last few turns for continuity; roles must alternate for the API
+        msgs = []
+        for m in (history or [])[-8:]:
+            role = m.get("role")
+            content = (m.get("content") or "").strip()
+            if role in ("user", "assistant") and content:
+                if msgs and msgs[-1]["role"] == role:
+                    msgs[-1]["content"] += "\n" + content
+                else:
+                    msgs.append({"role": role, "content": content})
+        if msgs and msgs[0]["role"] == "assistant":
+            msgs = msgs[1:]
+        if msgs and msgs[-1]["role"] == "user":
+            msgs[-1]["content"] += "\n" + message
+        else:
+            msgs.append({"role": "user", "content": message})
+
+        response = self.client.messages.create(
+            model=self.model,
+            max_tokens=600,
+            system=system,
+            messages=msgs,
+        )
+        return response.content[0].text.strip()
 
     async def generate_story_session(
         self,
