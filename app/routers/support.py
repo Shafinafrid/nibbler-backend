@@ -38,6 +38,7 @@ class BugReportResponse(BaseModel):
     ok: bool
     sheet: bool
     email: bool
+    sheet_detail: Optional[str] = None  # why the sheet write failed, if it did
 
 
 @router.post("/bug-report", response_model=BugReportResponse)
@@ -109,4 +110,7 @@ async def create_bug_report(
     await mixpanel_service.track("bug_report_submitted", current_user.id, {
         "where": where, "sheet": sheet_ok, "email": email_ok,
     })
-    return BugReportResponse(ok=True, sheet=sheet_ok, email=email_ok)
+    return BugReportResponse(
+        ok=True, sheet=sheet_ok, email=email_ok,
+        sheet_detail=None if sheet_ok else sheet_detail,
+    )
