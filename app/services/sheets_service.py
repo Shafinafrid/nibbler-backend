@@ -87,6 +87,8 @@ def report_timestamp() -> str:
 
 
 async def _find_child(client, headers, parent_id, name, mime) -> Optional[str]:
+    # Drive file-name matching is case-insensitive, so "bug-report-July"
+    # and "bug-report-july" both resolve — no need to enforce lowercase.
     q = (f"'{parent_id}' in parents and name = '{name}' "
          f"and mimeType = '{mime}' and trashed = false")
     r = await client.get(f"{DRIVE}/files", headers=headers, params={
@@ -96,6 +98,20 @@ async def _find_child(client, headers, parent_id, name, mime) -> Optional[str]:
     r.raise_for_status()
     files = r.json().get("files", [])
     return files[0]["id"] if files else None
+
+
+async def _next_empty_row(client, headers, sheet_id) -> int:
+    """Column A (Reported at) is always filled for a real report row, so
+    counting its non-empty cells gives the true next row — this sidesteps
+    values.append's "detect the table" heuristic, which can be fooled by
+    checkbox/data-validation formatting on far-down cells (e.g. a template
+    with validation applied through row 2000 made append land at row 1001
+    instead of row 2, since the API treated those formatted-but-empty
+    cells as part of the existing table)."""
+    r = await client.get(f"{SHEETS}/spreadsheets/{sheet_id}/values/A:A", headers=headers)
+    r.raise_for_status()
+    rows = r.json().get("values", [])
+    return max(len(rows) + 1, 2)  # never below row 2 (row 1 is the header)
 
 
 async def append_bug_report(
@@ -128,10 +144,11 @@ async def append_bug_report(
             if not sheet_id:
                 return False, f"no '{file_name}' sheet yet in the '{year}' folder — duplicate the template and name it exactly that"
 
-            r = await client.post(
-                f"{SHEETS}/spreadsheets/{sheet_id}/values/A:F:append",
+            row = await _next_empty_row(client, headers, sheet_id)
+            r = await client.put(
+                f"{SHEETS}/spreadsheets/{sheet_id}/values/A{row}:F{row}",
                 headers=headers,
-                params={"valueInputOption": "USER_ENTERED", "insertDataOption": "INSERT_ROWS"},
+                params={"valueInputOption": "USER_ENTERED"},
                 json={"values": [[reported_at, user_id, name, where_seen, description, False]]},
             )
             r.raise_for_status()
