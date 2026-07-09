@@ -114,6 +114,32 @@ async def _next_empty_row(client, headers, sheet_id) -> int:
     return max(len(rows) + 1, 2)  # never below row 2 (row 1 is the header)
 
 
+async def _ensure_grid_rows(client, headers, sheet_id, needed_row: int):
+    """Deleting rows in the Sheets UI (rather than clearing their content)
+    shrinks the actual grid — e.g. down to 2 rows if everything but the
+    header + one row was deleted. Writing to a row beyond the grid's
+    current size fails outright ("exceeds grid limits"), so grow the grid
+    first whenever the target row doesn't exist yet."""
+    r = await client.get(
+        f"{SHEETS}/spreadsheets/{sheet_id}", headers=headers,
+        params={"fields": "sheets.properties(sheetId,gridProperties)"},
+    )
+    r.raise_for_status()
+    props = r.json()["sheets"][0]["properties"]
+    grid_sheet_id = props["sheetId"]
+    row_count = props.get("gridProperties", {}).get("rowCount", 0)
+    if needed_row <= row_count:
+        return
+    r = await client.post(
+        f"{SHEETS}/spreadsheets/{sheet_id}:batchUpdate", headers=headers,
+        json={"requests": [{"appendDimension": {
+            "sheetId": grid_sheet_id, "dimension": "ROWS",
+            "length": needed_row - row_count + 200,  # pad so this doesn't trigger every single report
+        }}]},
+    )
+    r.raise_for_status()
+
+
 async def append_bug_report(
     reported_at: str,
     user_id: str,
@@ -145,6 +171,7 @@ async def append_bug_report(
                 return False, f"no '{file_name}' sheet yet in the '{year}' folder — duplicate the template and name it exactly that"
 
             row = await _next_empty_row(client, headers, sheet_id)
+            await _ensure_grid_rows(client, headers, sheet_id, row)
             r = await client.put(
                 f"{SHEETS}/spreadsheets/{sheet_id}/values/A{row}:F{row}",
                 headers=headers,
