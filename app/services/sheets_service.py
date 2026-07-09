@@ -1,25 +1,32 @@
 """
 Bug-report Google Sheet mirror.
 
-Writes each bug report into Shafin's shared Drive folder
-(settings.bug_drive_folder_id) with this layout:
+Shafin maintains the monthly files himself (duplicated from a template),
+inside Shafin's shared Drive folder (settings.bug_drive_folder_id):
 
     <root shared folder>/
         2026/
-            bug-report-july      ← created on the first report of that month
-            bug-report-september ← months with no reports get no file
+            bug-report-july      ← duplicated from the template by Shafin
+            bug-report-september ← months with no file yet are simply skipped
+
+This module only SEARCHES for the year folder and month file by name and
+APPENDS a row — it never creates folders or files. That's deliberate:
+service accounts have zero Drive storage quota, so file/folder *creation*
+via the API can fail even with Editor access on the parent; searching an
+existing tree and appending values to an existing spreadsheet the account
+has Editor rights on does not touch that limit at all.
 
 Sheet columns: Reported at · User ID (Firebase UID) · Name · Where ·
-What happened · Resolved? (one-click checkbox — left unchecked for Shafin).
+What happened · Resolved? (checkbox — left unchecked for Shafin to fill).
 
 Auth reuses the SAME service account the backend already uses for Firebase
 Admin (settings.firebase_client_email). For this to work Shafin must, once:
   1. share the Drive folder with that service-account email as Editor, and
-  2. enable the "Google Drive API" and "Google Sheets API" on the Firebase
+  2. enable the "Google Drive API" and "Google Sheets API" for the Firebase
      project in Google Cloud Console.
-Until then (or on any Google-side failure) this module logs and returns
-False — the Postgres row and the email are the fallbacks, a report is
-never lost because of Drive.
+Until then (or on any Google-side failure, or a missing month file) this
+module logs and returns False — the Postgres row and the email are the
+fallbacks, a report is never lost because of Drive.
 """
 import asyncio
 import datetime
@@ -33,7 +40,7 @@ logger = logging.getLogger(__name__)
 settings = get_settings()
 
 SCOPES = [
-    "https://www.googleapis.com/auth/drive",
+    "https://www.googleapis.com/auth/drive.readonly",
     "https://www.googleapis.com/auth/spreadsheets",
 ]
 DRIVE = "https://www.googleapis.com/drive/v3"
@@ -43,8 +50,6 @@ SHEET_MIME = "application/vnd.google-apps.spreadsheet"
 
 MONTHS = ["january", "february", "march", "april", "may", "june",
           "july", "august", "september", "october", "november", "december"]
-
-HEADER = ["Reported at", "User ID", "Name", "Where", "What happened", "Resolved?"]
 
 _credentials = None  # cached google-auth credentials (token auto-refreshed)
 
@@ -93,69 +98,6 @@ async def _find_child(client, headers, parent_id, name, mime) -> Optional[str]:
     return files[0]["id"] if files else None
 
 
-async def _create_folder(client, headers, parent_id, name) -> str:
-    r = await client.post(f"{DRIVE}/files", headers=headers,
-                          params={"supportsAllDrives": "true"},
-                          json={"name": name, "mimeType": FOLDER_MIME, "parents": [parent_id]})
-    r.raise_for_status()
-    return r.json()["id"]
-
-
-async def _create_month_sheet(client, headers, parent_id, name) -> str:
-    """Create the monthly spreadsheet with header row + checkbox column."""
-    r = await client.post(f"{DRIVE}/files", headers=headers,
-                          params={"supportsAllDrives": "true"},
-                          json={"name": name, "mimeType": SHEET_MIME, "parents": [parent_id]})
-    r.raise_for_status()
-    sheet_id = r.json()["id"]
-
-    # Header text
-    r = await client.put(
-        f"{SHEETS}/spreadsheets/{sheet_id}/values/A1:F1",
-        headers=headers, params={"valueInputOption": "RAW"},
-        json={"values": [HEADER]},
-    )
-    r.raise_for_status()
-
-    # Formatting: bold orange header, frozen row, column widths,
-    # one-click checkboxes in the "Resolved?" column.
-    requests = [
-        {"repeatCell": {
-            "range": {"sheetId": 0, "startRowIndex": 0, "endRowIndex": 1},
-            "cell": {"userEnteredFormat": {
-                "textFormat": {"bold": True, "foregroundColor": {"red": 1, "green": 1, "blue": 1}},
-                "backgroundColor": {"red": 0.91, "green": 0.42, "blue": 0.12},  # Nibbler orange
-            }},
-            "fields": "userEnteredFormat(textFormat,backgroundColor)",
-        }},
-        {"updateSheetProperties": {
-            "properties": {"sheetId": 0, "gridProperties": {"frozenRowCount": 1}},
-            "fields": "gridProperties.frozenRowCount",
-        }},
-        {"setDataValidation": {
-            "range": {"sheetId": 0, "startRowIndex": 1, "endRowIndex": 5000,
-                      "startColumnIndex": 5, "endColumnIndex": 6},
-            "rule": {"condition": {"type": "BOOLEAN"}, "strict": True, "showCustomUi": True},
-        }},
-        # Column widths: time 170, uid 240, name 130, where 150, what 420, resolved 90
-        *[{"updateDimensionProperties": {
-            "range": {"sheetId": 0, "dimension": "COLUMNS",
-                      "startIndex": i, "endIndex": i + 1},
-            "properties": {"pixelSize": w}, "fields": "pixelSize",
-        }} for i, w in enumerate([170, 240, 130, 150, 420, 90])],
-        {"repeatCell": {
-            "range": {"sheetId": 0, "startRowIndex": 1, "endRowIndex": 5000,
-                      "startColumnIndex": 4, "endColumnIndex": 5},
-            "cell": {"userEnteredFormat": {"wrapStrategy": "WRAP"}},
-            "fields": "userEnteredFormat.wrapStrategy",
-        }},
-    ]
-    r = await client.post(f"{SHEETS}/spreadsheets/{sheet_id}:batchUpdate",
-                          headers=headers, json={"requests": requests})
-    r.raise_for_status()
-    return sheet_id
-
-
 async def append_bug_report(
     reported_at: str,
     user_id: str,
@@ -163,26 +105,28 @@ async def append_bug_report(
     where_seen: str,
     description: str,
 ) -> Tuple[bool, str]:
-    """Append one report row, creating the year folder / month file as
-    needed. Returns (ok, detail) — never raises."""
+    """Append one report row to this month's sheet. Returns (ok, detail) —
+    never raises. ok=False (with a human-readable detail) if the year
+    folder or month file doesn't exist yet, or Google isn't configured."""
     if not settings.firebase_client_email or not settings.firebase_private_key:
         return False, "service account not configured"
+
+    now = datetime.datetime.now()
+    year, month = str(now.year), MONTHS[now.month - 1]
+    file_name = f"bug-report-{month}"
 
     try:
         token = await asyncio.to_thread(_get_access_token_sync)
         headers = {"Authorization": f"Bearer {token}"}
-        now = datetime.datetime.now()
-        year, month = str(now.year), MONTHS[now.month - 1]
 
         async with httpx.AsyncClient(timeout=30) as client:
             year_id = await _find_child(client, headers, settings.bug_drive_folder_id, year, FOLDER_MIME)
             if not year_id:
-                year_id = await _create_folder(client, headers, settings.bug_drive_folder_id, year)
+                return False, f"no '{year}' folder yet in the bug-report Drive folder"
 
-            file_name = f"bug-report-{month}"
             sheet_id = await _find_child(client, headers, year_id, file_name, SHEET_MIME)
             if not sheet_id:
-                sheet_id = await _create_month_sheet(client, headers, year_id, file_name)
+                return False, f"no '{file_name}' sheet yet in the '{year}' folder — duplicate the template and name it exactly that"
 
             r = await client.post(
                 f"{SHEETS}/spreadsheets/{sheet_id}/values/A:F:append",
