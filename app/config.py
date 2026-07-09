@@ -38,6 +38,13 @@ class Settings(BaseSettings):
     # Analytics
     mixpanel_token: str = ""    # Same project token as frontend
 
+    # Support (bug reports + email)
+    resend_api_key: str = ""    # Same Resend account the website contact form uses
+    support_from_email: str = "noreply@getnibbler.com"
+    bug_report_email: str = "bug-report@getnibbler.com"
+    # Shafin's shared Drive folder that holds the yearly bug-report folders
+    bug_drive_folder_id: str = "1cGuEbgMMIzi2hCIpXIpyTw0M4PgLhkQM"
+
     # App
     app_env: str = "development"
     secret_key: str = "changeme"

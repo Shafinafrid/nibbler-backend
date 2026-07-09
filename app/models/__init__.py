@@ -4,5 +4,6 @@ from app.models.library import LibraryItem
 from app.models.bite import DailyBite, SavedBite
 from app.models.streak import Streak
 from app.models.push_token import PushToken
+from app.models.bug_report import BugReport
 
-__all__ = ["User", "Profile", "LibraryItem", "DailyBite", "SavedBite", "Streak", "PushToken"]
+__all__ = ["User", "Profile", "LibraryItem", "DailyBite", "SavedBite", "Streak", "PushToken", "BugReport"]
