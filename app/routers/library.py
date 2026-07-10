@@ -92,13 +92,24 @@ async def upload_pdf(
     if not file.filename.lower().endswith(".pdf"):
         raise HTTPException(status_code=400, detail="Only PDF files are supported.")
 
-    s3 = S3Service()
     file_content = await file.read()
-    file_url = await s3.upload_file(
-        file_content=file_content,
-        filename=f"{current_user.id}/{uuid.uuid4()}.pdf",
-        content_type="application/pdf",
-    )
+    if not file_content:
+        raise HTTPException(status_code=400, detail="That file appears to be empty.")
+
+    # S3 is best-effort archival of the original file — the reading pipeline
+    # works from the uploaded bytes directly, so a missing/broken AWS setup
+    # must never fail the upload (this was 500-ing every book upload while
+    # the Railway AWS keys were unset).
+    file_url = None
+    try:
+        s3 = S3Service()
+        file_url = await s3.upload_file(
+            file_content=file_content,
+            filename=f"{current_user.id}/{uuid.uuid4()}.pdf",
+            content_type="application/pdf",
+        )
+    except Exception as e:
+        print(f"[upload_pdf] S3 upload failed, continuing without file archive: {e}")
 
     item = LibraryItem(
         id=str(uuid.uuid4()),
@@ -117,7 +128,7 @@ async def upload_pdf(
     db.commit()
     db.refresh(item)
 
-    background_tasks.add_task(process_pdf_embeddings, item.id, file_url, current_user.id)
+    background_tasks.add_task(process_pdf_embeddings, item.id, file_content, current_user.id)
     return item
 
 
@@ -203,8 +214,10 @@ async def process_item_embeddings(item_id: str, user_id: str):
         db.close()
 
 
-async def process_pdf_embeddings(item_id: str, file_url: str, user_id: str):
-    """Extract text from a PDF in S3, chunk, and upsert to Pinecone."""
+async def process_pdf_embeddings(item_id: str, pdf_bytes: bytes, user_id: str):
+    """Extract text from the uploaded PDF bytes, chunk, and upsert to
+    Pinecone. Works straight from the request payload — no S3 round-trip,
+    so processing succeeds even when file archival is unavailable."""
     from app.database import SessionLocal
     import PyPDF2
     import io
@@ -215,14 +228,12 @@ async def process_pdf_embeddings(item_id: str, file_url: str, user_id: str):
         if not item:
             return
 
-        s3 = S3Service()
-        pdf_bytes = await s3.download_file(file_url)
         reader = PyPDF2.PdfReader(io.BytesIO(pdf_bytes))
         text = " ".join(page.extract_text() or "" for page in reader.pages)
 
         if not text.strip():
             item.processed = False
-            item.processing_error = "Could not extract text from PDF."
+            item.processing_error = "Couldn't read any text in this PDF — is it scanned pages/images?"
             db.commit()
             return
 
@@ -243,6 +254,15 @@ async def process_pdf_embeddings(item_id: str, file_url: str, user_id: str):
     except Exception as e:
         db.rollback()
         print(f"[process_pdf_embeddings] Error for item {item_id}: {e}")
+        # Leave a readable trace on the row so the app can show what went
+        # wrong instead of the item sitting in "processing" forever.
+        try:
+            item = db.query(LibraryItem).filter(LibraryItem.id == item_id).first()
+            if item:
+                item.processing_error = f"Processing failed: {str(e)[:250]}"
+                db.commit()
+        except Exception:
+            pass
     finally:
         db.close()
 
