@@ -96,27 +96,15 @@ async def upload_pdf(
     if not file_content:
         raise HTTPException(status_code=400, detail="That file appears to be empty.")
 
-    # S3 is best-effort archival of the original file — the reading pipeline
-    # works from the uploaded bytes directly, so a missing/broken AWS setup
-    # must never fail the upload (this was 500-ing every book upload while
-    # the Railway AWS keys were unset).
-    file_url = None
-    try:
-        s3 = S3Service()
-        file_url = await s3.upload_file(
-            file_content=file_content,
-            filename=f"{current_user.id}/{uuid.uuid4()}.pdf",
-            content_type="application/pdf",
-        )
-    except Exception as e:
-        print(f"[upload_pdf] S3 upload failed, continuing without file archive: {e}")
-
+    # Respond as soon as the bytes have arrived — S3 archival AND text
+    # extraction/embedding all happen in the background task, so the app
+    # never waits on Claude, Pinecone, or a slow/broken AWS setup.
     item = LibraryItem(
         id=str(uuid.uuid4()),
         user_id=current_user.id,
         title=(title or file.filename.replace(".pdf", "").replace(".PDF", "")).strip(),
         type="pdf",
-        file_url=file_url,
+        file_url=None,
         file_size=len(file_content),
         mode=mode or "wisdom",
         kind=kind or "book",
@@ -227,6 +215,19 @@ async def process_pdf_embeddings(item_id: str, pdf_bytes: bytes, user_id: str):
         item = db.query(LibraryItem).filter(LibraryItem.id == item_id).first()
         if not item:
             return
+
+        # Best-effort archive of the original file (needs AWS keys on Railway;
+        # skipped silently when unavailable — nothing downstream depends on it)
+        try:
+            s3 = S3Service()
+            item.file_url = await s3.upload_file(
+                file_content=pdf_bytes,
+                filename=f"{user_id}/{item_id}.pdf",
+                content_type="application/pdf",
+            )
+            db.commit()
+        except Exception as e:
+            print(f"[process_pdf_embeddings] S3 archive skipped: {e}")
 
         reader = PyPDF2.PdfReader(io.BytesIO(pdf_bytes))
         text = " ".join(page.extract_text() or "" for page in reader.pages)
