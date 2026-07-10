@@ -24,6 +24,7 @@ class DailyBite(Base):
     chapter = Column(String, nullable=True)      # display line for the home card
     headline = Column(String, nullable=True)
     preview = Column(Text, nullable=True)
+    goal_passage = Column(Text, nullable=True)   # this nibble's most goal-relevant excerpt (Connect tab)
     generated_at = Column(DateTime, server_default=func.now())
 
     user = relationship("User", back_populates="daily_bites")

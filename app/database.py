@@ -65,6 +65,7 @@ def _run_migrations():
         "ALTER TABLE daily_bites ADD COLUMN IF NOT EXISTS chapter VARCHAR",
         "ALTER TABLE daily_bites ADD COLUMN IF NOT EXISTS headline VARCHAR",
         "ALTER TABLE daily_bites ADD COLUMN IF NOT EXISTS preview TEXT",
+        "ALTER TABLE daily_bites ADD COLUMN IF NOT EXISTS goal_passage TEXT",
         # users
         "ALTER TABLE users ADD COLUMN IF NOT EXISTS premium_until TIMESTAMP",
         "ALTER TABLE users ADD COLUMN IF NOT EXISTS display_name VARCHAR",

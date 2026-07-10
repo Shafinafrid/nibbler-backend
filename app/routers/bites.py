@@ -58,6 +58,7 @@ class SessionResponse(BaseModel):
     cards: list
     quiz: Optional[list] = None
     story_finished: bool = False
+    goal_passage: Optional[str] = None  # today's most goal-relevant excerpt (wisdom only)
 
 
 def _bite_to_session(bite: DailyBite) -> SessionResponse:
@@ -74,6 +75,7 @@ def _bite_to_session(bite: DailyBite) -> SessionResponse:
         cards=bite.cards or [],
         quiz=bite.quiz,
         story_finished=bool(bite.theme == "story_finished"),
+        goal_passage=bite.goal_passage,
     )
 
 
@@ -111,6 +113,7 @@ async def get_or_create_session(
     mode = item.mode or "wisdom"
     card_target = CARD_TARGETS[read_length]
     story_finished = False
+    goal_passage = None
 
     if mode == "story":
         words = (item.content or "").split()
@@ -152,12 +155,19 @@ async def get_or_create_session(
             " ".join(profile.get("interests") or []),
             profile.get("lifeArea") or "",
         ]
-        query = " ".join(b for b in query_bits if b).strip() or item.title
+        profile_query = " ".join(b for b in query_bits if b).strip()
+        query = profile_query or item.title
         embeddings = EmbeddingService()
         chunks = await embeddings.search_item(
             query=query, user_id=current_user.id, item_id=item.id,
             top_k=WISDOM_TOP_K[read_length],
         )
+        # Retrieval is ranked by similarity to the growth profile, so the top
+        # chunk IS today's most goal-relevant passage — Connect shows it as
+        # "where this book speaks to your goal", dated to this nibble.
+        if chunks and profile_query:
+            goal_passage = " ".join(chunks[0].split())
+            goal_passage = goal_passage[:280] + ("…" if len(goal_passage) > 280 else "")
         if not chunks and item.content:
             # Pinecone unavailable — fall back to the beginning of the stored text
             chunks = [item.content[:8000]]
@@ -190,6 +200,7 @@ async def get_or_create_session(
         chapter=(result.get("chapter") or "")[:250],
         headline=(result.get("headline") or "")[:500],
         preview=result.get("preview") or "",
+        goal_passage=goal_passage,
     )
     db.add(bite)
     db.commit()
