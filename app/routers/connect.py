@@ -141,7 +141,7 @@ async def chat(
     if not excerpts:
         raise HTTPException(status_code=422, detail="No indexed content found for this book.")
 
-    claude = ClaudeService(is_premium=current_user.is_premium)
+    claude = ClaudeService(is_premium=current_user.effective_premium)
     try:
         reply = await claude.chat_with_book(
             book_title=item.title,

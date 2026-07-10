@@ -1,6 +1,11 @@
+from datetime import datetime, timedelta
 from sqlalchemy import Column, String, Boolean, DateTime, func
 from sqlalchemy.orm import relationship
 from app.database import Base
+
+TRIAL_DAYS = 7                     # Model A: every new signup gets 7 days of Premium
+DEV_ALWAYS_PRO = {"b@b.com"}       # dev account — always premium (mirrors the app's __DEV__ shortcut)
+DEV_ALWAYS_FREE = {"a@a.com"}      # dev account — always free, trial does NOT apply
 
 
 class User(Base):
@@ -13,6 +18,25 @@ class User(Base):
     premium_until = Column(DateTime, nullable=True)
     created_at = Column(DateTime, server_default=func.now())
     updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now())
+
+    @property
+    def effective_premium(self) -> bool:
+        """The single source of truth for tier gating: a real subscription
+        (is_premium / premium_until, once RevenueCat sync lands) OR the
+        7-day signup trial. The app computes the same trial client-side —
+        without this the backend blocked trial users at the free caps."""
+        if self.email in DEV_ALWAYS_FREE:
+            return False
+        if self.email in DEV_ALWAYS_PRO:
+            return True
+        if self.is_premium:
+            return True
+        now = datetime.utcnow()
+        if self.premium_until and self.premium_until > now:
+            return True
+        if self.created_at and (now - self.created_at) < timedelta(days=TRIAL_DAYS):
+            return True
+        return False
 
     # Relationships
     profile = relationship("Profile", back_populates="user", uselist=False, cascade="all, delete-orphan")

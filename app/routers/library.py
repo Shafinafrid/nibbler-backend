@@ -15,7 +15,7 @@ settings = get_settings()
 
 
 def check_upload_limit(user: User, db: Session):
-    if not user.is_premium:
+    if not user.effective_premium:
         count = db.query(LibraryItem).filter(LibraryItem.user_id == user.id).count()
         if count >= settings.free_upload_limit:
             raise HTTPException(
@@ -40,7 +40,7 @@ async def list_library(
     return LibraryItemList(
         items=items,
         total=count,
-        limit_reached=not current_user.is_premium and count >= settings.free_upload_limit,
+        limit_reached=not current_user.effective_premium and count >= settings.free_upload_limit,
     )
 
 

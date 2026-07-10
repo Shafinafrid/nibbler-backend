@@ -107,7 +107,7 @@ async def get_or_create_session(
         db.delete(existing)
         db.commit()
 
-    claude = ClaudeService(is_premium=current_user.is_premium)
+    claude = ClaudeService(is_premium=current_user.effective_premium)
     mode = item.mode or "wisdom"
     card_target = CARD_TARGETS[read_length]
     story_finished = False
@@ -233,7 +233,7 @@ async def get_todays_bite(
         if not current_user.profile:
             raise HTTPException(status_code=400, detail="Complete onboarding before getting your daily bite.")
 
-        generator = BiteGenerator(is_premium=current_user.is_premium)
+        generator = BiteGenerator(is_premium=current_user.effective_premium)
         bite_data = await generator.generate(
             profile=current_user.profile,
             user_id=current_user.id,
@@ -253,7 +253,7 @@ async def get_todays_bite(
             mixpanel_service.track,
             "bite_generated",
             current_user.id,
-            {"theme": bite_data.get("theme"), "is_premium": current_user.is_premium},
+            {"theme": bite_data.get("theme"), "is_premium": current_user.effective_premium},
         )
         db.commit()
         db.refresh(bite)
@@ -271,7 +271,7 @@ async def get_bite_history(
     """Get past daily bites. Free users: last 7 days. Premium: full archive."""
     query = db.query(DailyBite).filter(DailyBite.user_id == current_user.id)
 
-    if not current_user.is_premium:
+    if not current_user.effective_premium:
         from datetime import timedelta
         cutoff = date.today() - timedelta(days=7)
         query = query.filter(DailyBite.date >= cutoff)

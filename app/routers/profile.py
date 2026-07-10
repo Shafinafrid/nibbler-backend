@@ -70,7 +70,7 @@ async def onboarding_chat(
     Send a message to Nibbler during onboarding.
     Returns Nibbler's reply and optionally a completed profile.
     """
-    claude = ClaudeService(is_premium=current_user.is_premium)
+    claude = ClaudeService(is_premium=current_user.effective_premium)
     result = await claude.onboarding_reply(
         conversation_history=data.conversation_history,
         user_message=data.message,
