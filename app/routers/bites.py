@@ -1,23 +1,24 @@
-from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks
-from sqlalchemy.orm import Session
-from sqlalchemy import func
-from datetime import date, datetime
+from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks, Request
+from sqlalchemy.orm import Session, joinedload
+from sqlalchemy.exc import IntegrityError
+from datetime import date
 from typing import Optional, List
 from pydantic import BaseModel
 from app.database import get_db
 from app.middleware.auth import get_current_user
+from app.rate_limit import limiter
 from app.models.user import User
 from app.models.bite import DailyBite, SavedBite
 from app.models.library import LibraryItem
-from app.models.streak import Streak
-from app.schemas.bite import BiteResponse, SavedBiteResponse, BiteHistoryResponse, StreakResponse
-from app.services.bite_generator import BiteGenerator
+from app.schemas.bite import BiteResponse, SavedBiteResponse, BiteHistoryResponse
 from app.services.claude import ClaudeService
 from app.services.embedding_service import EmbeddingService
 from app.services import mixpanel_service
+from app.config import get_settings
 import uuid
 
 router = APIRouter(prefix="/bites", tags=["bites"])
+settings = get_settings()
 
 # ── Per-book session generation (July 2026) ───────────────────────────────
 
@@ -43,6 +44,21 @@ class SessionRequest(BaseModel):
     read_length: int = 5
     growth_profile: Optional[SessionProfile] = None
     force_new: bool = False
+    # The user's LOCAL date (YYYY-MM-DD) — the server day flips at UTC
+    # midnight, which is mid-evening for the Americas. Accepted within ±1
+    # day of the server date.
+    client_date: Optional[str] = None
+
+
+def _effective_today(client_date_str: Optional[str]) -> date:
+    today = date.today()
+    if not client_date_str:
+        return today
+    try:
+        d = date.fromisoformat(client_date_str)
+    except ValueError:
+        return today
+    return d if abs((d - today).days) <= 1 else today
 
 
 class SessionResponse(BaseModel):
@@ -80,8 +96,11 @@ def _bite_to_session(bite: DailyBite) -> SessionResponse:
 
 
 @router.post("/session", response_model=SessionResponse)
-async def get_or_create_session(
+@limiter.limit("30/day")
+def get_or_create_session(
+    request: Request,
     data: SessionRequest,
+    background_tasks: BackgroundTasks,
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
@@ -96,7 +115,7 @@ async def get_or_create_session(
         raise HTTPException(status_code=409, detail="Nibbler is still reading this one — try again in a moment.")
 
     read_length = data.read_length if data.read_length in CARD_TARGETS else 5
-    today = date.today()
+    today = _effective_today(data.client_date)
 
     existing = db.query(DailyBite).filter(
         DailyBite.user_id == current_user.id,
@@ -108,6 +127,30 @@ async def get_or_create_session(
     if existing and data.force_new:
         db.delete(existing)
         db.commit()
+
+    # Daily generation caps (free 1 / premium 3, from config — previously
+    # defined but never enforced). Re-opening today's existing sessions
+    # returns above without counting; force_new regenerates in place because
+    # the delete above already freed its slot.
+    cap = (
+        settings.premium_bites_per_day
+        if current_user.effective_premium
+        else settings.free_bites_per_day
+    )
+    todays_generations = db.query(DailyBite).filter(
+        DailyBite.user_id == current_user.id,
+        DailyBite.date == today,
+    ).count()
+    if todays_generations >= cap:
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "code": "daily_limit_reached",
+                "message": f"You've used today's {cap} {'bites' if cap > 1 else 'bite'}. Come back tomorrow!",
+                "limit": cap,
+                "is_premium": current_user.effective_premium,
+            },
+        )
 
     claude = ClaudeService(is_premium=current_user.effective_premium)
     mode = item.mode or "wisdom"
@@ -140,7 +183,7 @@ async def get_or_create_session(
             excerpt = " ".join(words[progress:progress + n])
             part_number = progress // n + 1
             try:
-                result = await claude.generate_story_session(
+                result = claude.generate_story_session(
                     book_title=item.title, author=item.author,
                     excerpt=excerpt, card_target=max(3, card_target - 1),
                     part_number=part_number,
@@ -158,7 +201,7 @@ async def get_or_create_session(
         profile_query = " ".join(b for b in query_bits if b).strip()
         query = profile_query or item.title
         embeddings = EmbeddingService()
-        chunks = await embeddings.search_item(
+        chunks = embeddings.search_item(
             query=query, user_id=current_user.id, item_id=item.id,
             top_k=WISDOM_TOP_K[read_length],
         )
@@ -174,7 +217,7 @@ async def get_or_create_session(
         if not chunks:
             raise HTTPException(status_code=422, detail="No indexed content found for this item.")
         try:
-            result = await claude.generate_wisdom_session(
+            result = claude.generate_wisdom_session(
                 book_title=item.title, author=item.author,
                 profile=profile, context_chunks=chunks,
                 card_target=card_target, read_length=read_length,
@@ -203,10 +246,23 @@ async def get_or_create_session(
         goal_passage=goal_passage,
     )
     db.add(bite)
-    db.commit()
+    try:
+        db.commit()
+    except IntegrityError:
+        # Unique index on (user, item, date): a concurrent request generated
+        # the same session first — return the winner instead of erroring.
+        db.rollback()
+        winner = db.query(DailyBite).filter(
+            DailyBite.user_id == current_user.id,
+            DailyBite.library_item_id == item.id,
+            DailyBite.date == today,
+        ).first()
+        if winner:
+            return _bite_to_session(winner)
+        raise
     db.refresh(bite)
 
-    await mixpanel_service.track("session_generated", current_user.id, {
+    background_tasks.add_task(mixpanel_service.track, "session_generated", current_user.id, {
         "mode": mode, "read_length": read_length, "cards": len(bite.cards or []),
     })
     return _bite_to_session(bite)
@@ -226,55 +282,15 @@ def _bite_to_response(bite: DailyBite, saved_ids: set) -> BiteResponse:
     )
 
 
-@router.get("/today", response_model=BiteResponse)
-async def get_todays_bite(
-    background_tasks: BackgroundTasks,
-    current_user: User = Depends(get_current_user),
-    db: Session = Depends(get_db),
-):
-    """Get today's daily bite. Generates one if it doesn't exist yet."""
-    today = date.today()
-
-    bite = db.query(DailyBite).filter(
-        DailyBite.user_id == current_user.id,
-        DailyBite.date == today,
-    ).first()
-
-    if not bite:
-        if not current_user.profile:
-            raise HTTPException(status_code=400, detail="Complete onboarding before getting your daily bite.")
-
-        generator = BiteGenerator(is_premium=current_user.effective_premium)
-        bite_data = await generator.generate(
-            profile=current_user.profile,
-            user_id=current_user.id,
-        )
-
-        bite = DailyBite(
-            id=str(uuid.uuid4()),
-            user_id=current_user.id,
-            date=today,
-            **bite_data,
-        )
-        db.add(bite)
-
-        # Update streak + track analytics in background
-        background_tasks.add_task(update_streak, current_user.id)
-        background_tasks.add_task(
-            mixpanel_service.track,
-            "bite_generated",
-            current_user.id,
-            {"theme": bite_data.get("theme"), "is_premium": current_user.effective_premium},
-        )
-        db.commit()
-        db.refresh(bite)
-
-    saved_ids = {s.bite_id for s in db.query(SavedBite).filter(SavedBite.user_id == current_user.id).all()}
-    return _bite_to_response(bite, saved_ids)
+# NOTE (July 2026): the legacy GET /bites/today endpoint was retired here.
+# It required the retired chat-interview Profile row (so it 400'd for every
+# local-onboarded user), the app has no callers, and its background streak
+# update double-counted total_bites_read alongside POST /streak/checkin —
+# which is now the single streak write path.
 
 
 @router.get("/history", response_model=BiteHistoryResponse)
-async def get_bite_history(
+def get_bite_history(
     limit: int = 30,
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
@@ -297,7 +313,7 @@ async def get_bite_history(
 
 
 @router.post("/{bite_id}/save", response_model=dict)
-async def save_bite(
+def save_bite(
     bite_id: str,
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
@@ -327,7 +343,7 @@ async def save_bite(
 
 
 @router.delete("/{bite_id}/save")
-async def unsave_bite(
+def unsave_bite(
     bite_id: str,
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
@@ -345,13 +361,17 @@ async def unsave_bite(
 
 
 @router.get("/saved", response_model=list[SavedBiteResponse])
-async def get_saved_bites(
+def get_saved_bites(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    saved = db.query(SavedBite).filter(
-        SavedBite.user_id == current_user.id,
-    ).order_by(SavedBite.saved_at.desc()).all()
+    saved = (
+        db.query(SavedBite)
+        .options(joinedload(SavedBite.bite))  # one query, not one per saved bite
+        .filter(SavedBite.user_id == current_user.id)
+        .order_by(SavedBite.saved_at.desc())
+        .all()
+    )
 
     saved_ids = {s.bite_id for s in saved}
     return [
@@ -362,41 +382,3 @@ async def get_saved_bites(
         )
         for s in saved
     ]
-
-
-async def update_streak(user_id: str):
-    """Background task to update the user's streak."""
-    from app.database import SessionLocal
-    db = SessionLocal()
-    try:
-        today = date.today()
-        streak = db.query(Streak).filter(Streak.user_id == user_id).first()
-
-        if not streak:
-            streak = Streak(
-                id=str(uuid.uuid4()),
-                user_id=user_id,
-                current_streak=1,
-                longest_streak=1,
-                last_active_date=today,
-                total_bites_read=1,
-            )
-            db.add(streak)
-        else:
-            if streak.last_active_date == today:
-                return  # Already checked in today
-
-            from datetime import timedelta
-            yesterday = today - timedelta(days=1)
-            if streak.last_active_date == yesterday:
-                streak.current_streak += 1
-            else:
-                streak.current_streak = 1
-
-            streak.longest_streak = max(streak.current_streak, streak.longest_streak)
-            streak.last_active_date = today
-            streak.total_bites_read += 1
-
-        db.commit()
-    finally:
-        db.close()

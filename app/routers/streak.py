@@ -12,7 +12,7 @@ router = APIRouter(prefix="/streak", tags=["streak"])
 
 
 @router.get("/", response_model=StreakResponse)
-async def get_streak(
+def get_streak(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
@@ -28,7 +28,7 @@ async def get_streak(
 
 
 @router.post("/checkin", response_model=StreakResponse)
-async def checkin(
+def checkin(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):

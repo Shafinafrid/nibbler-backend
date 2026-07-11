@@ -1,4 +1,4 @@
-from fastapi import Depends, HTTPException, status
+from fastapi import Depends, HTTPException, Request, status
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from sqlalchemy.orm import Session
 import firebase_admin
@@ -64,9 +64,14 @@ def get_or_create_user(decoded_token: dict, db: Session) -> User:
 
 
 def get_current_user(
+    request: Request,
     credentials: HTTPAuthorizationCredentials = Depends(security),
     db: Session = Depends(get_db),
 ) -> User:
     token = credentials.credentials
     decoded = verify_firebase_token(token)
-    return get_or_create_user(decoded, db)
+    user = get_or_create_user(decoded, db)
+    # Rate limits key on the uid so one user can't dodge them by rotating IPs
+    # (see app/rate_limit.py).
+    request.state.user_id = user.id
+    return user

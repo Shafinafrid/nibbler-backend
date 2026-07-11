@@ -56,6 +56,8 @@ def _run_migrations():
         "ALTER TABLE library_items ADD COLUMN IF NOT EXISTS source_url VARCHAR",
         "ALTER TABLE library_items ADD COLUMN IF NOT EXISTS file_size INTEGER",
         "ALTER TABLE library_items ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT now()",
+        # library_items — active nibble sources (July 2026)
+        "ALTER TABLE library_items ADD COLUMN IF NOT EXISTS is_active BOOLEAN DEFAULT TRUE",
         # daily_bites — per-book card-deck sessions (July 2026)
         "ALTER TABLE daily_bites ADD COLUMN IF NOT EXISTS library_item_id VARCHAR",
         "ALTER TABLE daily_bites ADD COLUMN IF NOT EXISTS cards JSON",
@@ -69,6 +71,10 @@ def _run_migrations():
         # users
         "ALTER TABLE users ADD COLUMN IF NOT EXISTS premium_until TIMESTAMP",
         "ALTER TABLE users ADD COLUMN IF NOT EXISTS display_name VARCHAR",
+        # profiles — local-first growth state sync (July 2026)
+        "ALTER TABLE profiles ADD COLUMN IF NOT EXISTS growth_state JSON",
+        # push_tokens — minute-precision delivery (July 2026)
+        "ALTER TABLE push_tokens ADD COLUMN IF NOT EXISTS notification_minute INTEGER DEFAULT 0",
     ]
 
     applied, failed = 0, 0

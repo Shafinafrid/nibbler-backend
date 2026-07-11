@@ -35,6 +35,10 @@ class Settings(BaseSettings):
     # Push Notifications (Expo)
     expo_access_token: str = ""  # Optional — increases Expo push API rate limits
 
+    # RevenueCat (subscription sync)
+    revenuecat_webhook_secret: str = ""   # Authorization header value configured in the RC dashboard webhook
+    revenuecat_secret_api_key: str = ""   # RC secret API key (sk_...) for GET /v1/subscribers
+
     # Analytics
     mixpanel_token: str = ""    # Same project token as frontend
 
@@ -51,6 +55,10 @@ class Settings(BaseSettings):
     free_upload_limit: int = 3
     free_bites_per_day: int = 1
     premium_bites_per_day: int = 3
+    # Upload safety: one unbounded file.read() can OOM the single Railway
+    # process, so uploads are hard-capped (and extracted text bounded too).
+    max_pdf_upload_mb: int = 20
+    max_extracted_text_chars: int = 2_000_000
 
     class Config:
         env_file = ".env"

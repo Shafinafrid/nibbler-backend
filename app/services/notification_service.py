@@ -70,29 +70,36 @@ async def send_push_notifications(
 
 async def _send_daily_bite_reminder(db_factory) -> None:
     """
-    Scheduled job: called once per hour, sends "Your bite is ready" to every
-    user whose preferred notification_hour matches the current UTC hour.
+    Scheduled job: runs every 5 minutes and sends "Your bite is ready" to
+    every token whose (notification_hour, notification_minute) matches the
+    current UTC 5-minute slot. Stored minutes are snapped to 5-minute steps
+    on registration, so equality is exact.
     """
     from datetime import datetime, timezone
     from app.models.push_token import PushToken
     from app.config import get_settings
 
     settings = get_settings()
-    current_hour = datetime.now(timezone.utc).hour
+    now = datetime.now(timezone.utc)
+    current_hour = now.hour
+    current_slot = (now.minute // 5) * 5
 
     with db_factory() as db:
         rows = (
             db.query(PushToken)
-            .filter(PushToken.notification_hour == current_hour)
+            .filter(
+                PushToken.notification_hour == current_hour,
+                PushToken.notification_minute == current_slot,
+            )
             .all()
         )
         tokens = [r.token for r in rows]
 
     if not tokens:
-        logger.debug("No push tokens for hour %d UTC", current_hour)
+        logger.debug("No push tokens for %02d:%02d UTC", current_hour, current_slot)
         return
 
-    logger.info("Sending daily bite reminder to %d tokens (hour=%d UTC)", len(tokens), current_hour)
+    logger.info("Sending daily bite reminder to %d tokens (%02d:%02d UTC)", len(tokens), current_hour, current_slot)
     await send_push_notifications(
         tokens=tokens,
         title="Your daily bite is ready 🐱",
@@ -113,11 +120,11 @@ def start_scheduler(db_factory) -> None:
     scheduler.add_job(
         _send_daily_bite_reminder,
         trigger="cron",
-        minute=0,        # top of every hour
+        minute="*/5",    # every 5 minutes — matches the 5-min delivery slots
         kwargs={"db_factory": db_factory},
         id="daily_bite_reminder",
         replace_existing=True,
-        misfire_grace_time=300,
+        misfire_grace_time=240,  # under one slot, so a stalled tick can't double-fire into the next
     )
     scheduler.start()
     logger.info("Notification scheduler started")

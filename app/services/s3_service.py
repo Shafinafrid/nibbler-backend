@@ -15,27 +15,31 @@ class S3Service:
         )
         self.bucket = settings.s3_bucket_name
 
-    async def upload_file(self, file_content: bytes, filename: str, content_type: str) -> str:
-        """Upload a file to S3 and return its public URL."""
+    def _key_from(self, ref: str) -> str:
+        """Accept either a bare object key (current rows) or a full public URL
+        (rows written before July 2026, when the bucket was public)."""
+        return ref.split(f"{self.bucket}.s3.{settings.aws_region}.amazonaws.com/")[-1]
+
+    def upload_file(self, file_content: bytes, filename: str, content_type: str) -> str:
+        """Upload a file to S3 and return its object KEY — not a URL. The
+        bucket is private; use generate_presigned_url() for temporary access."""
         self.client.put_object(
             Bucket=self.bucket,
             Key=filename,
             Body=file_content,
             ContentType=content_type,
         )
-        return f"https://{self.bucket}.s3.{settings.aws_region}.amazonaws.com/{filename}"
+        return filename
 
-    async def download_file(self, file_url: str) -> bytes:
-        """Download a file from S3 by URL."""
-        key = file_url.split(f"{self.bucket}.s3.{settings.aws_region}.amazonaws.com/")[-1]
-        response = self.client.get_object(Bucket=self.bucket, Key=key)
+    def download_file(self, ref: str) -> bytes:
+        """Download a file from S3 by key or legacy URL."""
+        response = self.client.get_object(Bucket=self.bucket, Key=self._key_from(ref))
         return response["Body"].read()
 
-    async def delete_file(self, file_url: str):
-        """Delete a file from S3 by URL."""
+    def delete_file(self, ref: str):
+        """Delete a file from S3 by key or legacy URL."""
         try:
-            key = file_url.split(f"{self.bucket}.s3.{settings.aws_region}.amazonaws.com/")[-1]
-            self.client.delete_object(Bucket=self.bucket, Key=key)
+            self.client.delete_object(Bucket=self.bucket, Key=self._key_from(ref))
         except ClientError:
             pass
 

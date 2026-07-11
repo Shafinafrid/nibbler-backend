@@ -1,17 +1,21 @@
-from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Form, BackgroundTasks
+from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Form, BackgroundTasks, Request
 from sqlalchemy.orm import Session
 from app.database import get_db
 from app.middleware.auth import get_current_user
 from app.models.user import User
 from app.models.library import LibraryItem
-from app.schemas.library import LibraryItemCreate, LibraryItemResponse, LibraryItemList, LibraryItemUrlCreate
+from app.rate_limit import limiter
+from app.schemas.library import LibraryItemCreate, LibraryItemResponse, LibraryItemList, LibraryItemUrlCreate, SetActiveRequest
 from app.services.s3_service import S3Service
 from app.services.embedding_service import EmbeddingService
+from app.services.url_safety import UnsafeUrlError, validate_public_url, fetch_public_url
 from app.config import get_settings
 import uuid
 
 router = APIRouter(prefix="/library", tags=["library"])
 settings = get_settings()
+
+MAX_ACTIVE_SOURCES = 5  # mirrors MAX_ACTIVE_BOOKS in nibbler/src/data/sessionStore.js
 
 
 def check_upload_limit(user: User, db: Session):
@@ -26,7 +30,7 @@ def check_upload_limit(user: User, db: Session):
 
 # ── GET /library/ ─────────────────────────────────────────────────────────────
 @router.get("/", response_model=LibraryItemList)
-async def list_library(
+def list_library(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
@@ -46,7 +50,9 @@ async def list_library(
 
 # ── POST /library/ (plain text / paste) ───────────────────────────────────────
 @router.post("/", response_model=LibraryItemResponse)
-async def add_library_item(
+@limiter.limit("20/hour")
+def add_library_item(
+    request: Request,
     data: LibraryItemCreate,
     background_tasks: BackgroundTasks,
     current_user: User = Depends(get_current_user),
@@ -76,7 +82,9 @@ async def add_library_item(
 
 # ── POST /library/upload-pdf ───────────────────────────────────────────────────
 @router.post("/upload-pdf", response_model=LibraryItemResponse)
-async def upload_pdf(
+@limiter.limit("10/hour")
+def upload_pdf(
+    request: Request,
     background_tasks: BackgroundTasks,
     file: UploadFile = File(...),
     title: str = Form(None),
@@ -92,7 +100,25 @@ async def upload_pdf(
     if not file.filename.lower().endswith(".pdf"):
         raise HTTPException(status_code=400, detail="Only PDF files are supported.")
 
-    file_content = await file.read()
+    max_bytes = settings.max_pdf_upload_mb * 1024 * 1024
+    too_large = HTTPException(
+        status_code=413,
+        detail=f"PDFs up to {settings.max_pdf_upload_mb} MB are supported — this file is larger.",
+    )
+    # Fast reject on the declared size, then enforce for real while reading in
+    # chunks — one unbounded read() of a huge file can OOM the whole server.
+    if file.size and file.size > max_bytes:
+        raise too_large
+
+    chunks, size = [], 0
+    # Sync handler (runs in FastAPI's threadpool) — read the spooled temp file
+    # via the underlying file object.
+    while chunk := file.file.read(1024 * 1024):
+        size += len(chunk)
+        if size > max_bytes:
+            raise too_large
+        chunks.append(chunk)
+    file_content = b"".join(chunks)
     if not file_content:
         raise HTTPException(status_code=400, detail="That file appears to be empty.")
 
@@ -122,7 +148,9 @@ async def upload_pdf(
 
 # ── POST /library/add-url ──────────────────────────────────────────────────────
 @router.post("/add-url", response_model=LibraryItemResponse)
-async def add_url(
+@limiter.limit("10/hour")
+def add_url(
+    request: Request,
     data: LibraryItemUrlCreate,
     background_tasks: BackgroundTasks,
     current_user: User = Depends(get_current_user),
@@ -130,6 +158,13 @@ async def add_url(
 ):
     """Scrape an article/blog URL and add its content to the library."""
     check_upload_limit(current_user, db)
+
+    # SSRF guard: reject non-http(s) schemes and private/internal hosts up
+    # front — the background task re-validates every redirect hop too.
+    try:
+        validate_public_url(data.url)
+    except UnsafeUrlError as e:
+        raise HTTPException(status_code=400, detail=str(e))
 
     item = LibraryItem(
         id=str(uuid.uuid4()),
@@ -150,9 +185,48 @@ async def add_url(
     return item
 
 
+# ── PATCH /library/{item_id}/active ────────────────────────────────────────────
+@router.patch("/{item_id}/active", response_model=LibraryItemResponse)
+def set_item_active(
+    item_id: str,
+    data: SetActiveRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Toggle whether this source feeds nibble generation. At most
+    MAX_ACTIVE_SOURCES can be active at once (uploads stay uncapped for
+    premium — the 5 limit is on ACTIVE sources, swappable anytime)."""
+    item = db.query(LibraryItem).filter(
+        LibraryItem.id == item_id,
+        LibraryItem.user_id == current_user.id,
+    ).first()
+    if not item:
+        raise HTTPException(status_code=404, detail="Item not found.")
+
+    if data.active and not item.is_active:
+        active_count = db.query(LibraryItem).filter(
+            LibraryItem.user_id == current_user.id,
+            LibraryItem.is_active.is_(True),
+        ).count()
+        if active_count >= MAX_ACTIVE_SOURCES:
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "code": "active_limit_reached",
+                    "message": f"You can keep up to {MAX_ACTIVE_SOURCES} sources sending nibbles at a time. Stop one first.",
+                    "limit": MAX_ACTIVE_SOURCES,
+                },
+            )
+
+    item.is_active = data.active
+    db.commit()
+    db.refresh(item)
+    return item
+
+
 # ── DELETE /library/{item_id} ──────────────────────────────────────────────────
 @router.delete("/{item_id}")
-async def delete_library_item(
+def delete_library_item(
     item_id: str,
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
@@ -166,11 +240,11 @@ async def delete_library_item(
         raise HTTPException(status_code=404, detail="Item not found.")
 
     embedding_svc = EmbeddingService()
-    await embedding_svc.delete_item_vectors(item_id, user_id=current_user.id)
+    embedding_svc.delete_item_vectors(item_id, user_id=current_user.id)
 
     if item.file_url:
         s3 = S3Service()
-        await s3.delete_file(item.file_url)
+        s3.delete_file(item.file_url)
 
     db.delete(item)
     db.commit()
@@ -179,7 +253,7 @@ async def delete_library_item(
 
 # ── Background tasks ───────────────────────────────────────────────────────────
 
-async def process_item_embeddings(item_id: str, user_id: str):
+def process_item_embeddings(item_id: str, user_id: str):
     """Chunk plain-text / pasted content and upsert to Pinecone."""
     from app.database import SessionLocal
     db = SessionLocal()
@@ -189,7 +263,7 @@ async def process_item_embeddings(item_id: str, user_id: str):
             return
 
         embedding_svc = EmbeddingService()
-        chunk_count = await embedding_svc.index_text(
+        chunk_count = embedding_svc.index_text(
             text=item.content,
             item_id=item_id,
             user_id=user_id,
@@ -198,11 +272,23 @@ async def process_item_embeddings(item_id: str, user_id: str):
         item.processed = True
         item.chunk_count = chunk_count
         db.commit()
+    except Exception as e:
+        # Without this the row sat processed=False forever with no error —
+        # the app polled endlessly with nothing to show the user.
+        db.rollback()
+        print(f"[process_item_embeddings] Error for item {item_id}: {e}")
+        try:
+            item = db.query(LibraryItem).filter(LibraryItem.id == item_id).first()
+            if item:
+                item.processing_error = f"Processing failed: {str(e)[:250]}"
+                db.commit()
+        except Exception:
+            pass
     finally:
         db.close()
 
 
-async def process_pdf_embeddings(item_id: str, pdf_bytes: bytes, user_id: str):
+def process_pdf_embeddings(item_id: str, pdf_bytes: bytes, user_id: str):
     """Extract text from the uploaded PDF bytes, chunk, and upsert to
     Pinecone. Works straight from the request payload — no S3 round-trip,
     so processing succeeds even when file archival is unavailable."""
@@ -220,7 +306,7 @@ async def process_pdf_embeddings(item_id: str, pdf_bytes: bytes, user_id: str):
         # skipped silently when unavailable — nothing downstream depends on it)
         try:
             s3 = S3Service()
-            item.file_url = await s3.upload_file(
+            item.file_url = s3.upload_file(
                 file_content=pdf_bytes,
                 filename=f"{user_id}/{item_id}.pdf",
                 content_type="application/pdf",
@@ -231,6 +317,7 @@ async def process_pdf_embeddings(item_id: str, pdf_bytes: bytes, user_id: str):
 
         reader = PyPDF2.PdfReader(io.BytesIO(pdf_bytes))
         text = " ".join(page.extract_text() or "" for page in reader.pages)
+        text = text[: settings.max_extracted_text_chars]
 
         if not text.strip():
             item.processed = False
@@ -243,7 +330,7 @@ async def process_pdf_embeddings(item_id: str, pdf_bytes: bytes, user_id: str):
         item.content = text
 
         embedding_svc = EmbeddingService()
-        chunk_count = await embedding_svc.index_text(
+        chunk_count = embedding_svc.index_text(
             text=text,
             item_id=item_id,
             user_id=user_id,
@@ -268,10 +355,9 @@ async def process_pdf_embeddings(item_id: str, pdf_bytes: bytes, user_id: str):
         db.close()
 
 
-async def process_url_embeddings(item_id: str, url: str, user_id: str):
+def process_url_embeddings(item_id: str, url: str, user_id: str):
     """Scrape URL content, extract readable text, chunk, and upsert to Pinecone."""
     from app.database import SessionLocal
-    import requests
     from bs4 import BeautifulSoup
 
     db = SessionLocal()
@@ -281,8 +367,8 @@ async def process_url_embeddings(item_id: str, url: str, user_id: str):
             return
 
         headers = {"User-Agent": "Mozilla/5.0 (compatible; Nibbler/1.0)"}
-        response = requests.get(url, headers=headers, timeout=15)
-        response.raise_for_status()
+        # SSRF-guarded fetch: validates every redirect hop, caps download size
+        response = fetch_public_url(url, headers=headers, timeout=15)
 
         soup = BeautifulSoup(response.text, "html.parser")
 
@@ -302,6 +388,7 @@ async def process_url_embeddings(item_id: str, url: str, user_id: str):
         )
 
         text = main.get_text(separator=" ", strip=True) if main else soup.get_text(separator=" ", strip=True)
+        text = text[: settings.max_extracted_text_chars]
 
         # Auto-set title from page <title> if not provided
         if item.title == url:
@@ -319,7 +406,7 @@ async def process_url_embeddings(item_id: str, url: str, user_id: str):
         item.content = text
 
         embedding_svc = EmbeddingService()
-        chunk_count = await embedding_svc.index_text(
+        chunk_count = embedding_svc.index_text(
             text=text,
             item_id=item_id,
             user_id=user_id,
@@ -328,6 +415,17 @@ async def process_url_embeddings(item_id: str, url: str, user_id: str):
         item.processed = True
         item.chunk_count = chunk_count
         db.commit()
+    except UnsafeUrlError as e:
+        # A redirect hop pointed somewhere non-public (or the page was too
+        # large) — surface it on the row instead of leaving it "processing".
+        db.rollback()
+        try:
+            item = db.query(LibraryItem).filter(LibraryItem.id == item_id).first()
+            if item:
+                item.processing_error = str(e)
+                db.commit()
+        except Exception:
+            pass
     except Exception as e:
         db.rollback()
         print(f"[process_url_embeddings] Error for item {item_id}: {e}")

@@ -15,6 +15,8 @@ class UserResponse(BaseModel):
     display_name: Optional[str]
     is_premium: bool
     premium_until: Optional[datetime]
+    # Computed tier (subscription OR 7-day trial) — what the app should trust.
+    effective_premium: bool = False
     created_at: datetime
 
     class Config:
@@ -22,5 +24,7 @@ class UserResponse(BaseModel):
 
 
 class UserUpdate(BaseModel):
+    # NOTE: deliberately no is_premium here — premium state is only ever
+    # written by RevenueCat sync (webhook + /auth/sync-premium), never by
+    # a client-supplied value.
     display_name: Optional[str] = None
-    is_premium: Optional[bool] = None

@@ -14,8 +14,17 @@ router = APIRouter(prefix="/notifications", tags=["notifications"])
 
 class RegisterTokenRequest(BaseModel):
     token: str
-    platform: Optional[str] = None        # 'ios' | 'android'
-    notification_hour: Optional[int] = 8  # UTC hour (0-23)
+    platform: Optional[str] = None          # 'ios' | 'android'
+    notification_hour: Optional[int] = 8    # UTC hour (0-23)
+    notification_minute: Optional[int] = 0  # UTC minute — snapped to 5-min steps
+
+
+def _clamp_time(data: RegisterTokenRequest) -> tuple:
+    hour = max(0, min(23, data.notification_hour or 8))
+    # Scheduler ticks every 5 minutes, so snap to the slot it will check.
+    minute = max(0, min(59, data.notification_minute or 0))
+    minute = (minute // 5) * 5
+    return hour, minute
 
 
 class RegisterTokenResponse(BaseModel):
@@ -24,7 +33,7 @@ class RegisterTokenResponse(BaseModel):
 
 
 @router.post("/register", response_model=RegisterTokenResponse)
-async def register_push_token(
+def register_push_token(
     data: RegisterTokenRequest,
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
@@ -33,13 +42,14 @@ async def register_push_token(
     if not data.token or not data.token.startswith("ExponentPushToken"):
         raise HTTPException(status_code=400, detail="Invalid Expo push token format.")
 
-    notification_hour = max(0, min(23, data.notification_hour or 8))
+    notification_hour, notification_minute = _clamp_time(data)
 
     existing = db.query(PushToken).filter(PushToken.token == data.token).first()
     if existing:
         existing.user_id = current_user.id
         existing.platform = data.platform
         existing.notification_hour = notification_hour
+        existing.notification_minute = notification_minute
     else:
         db.add(PushToken(
             id=str(uuid.uuid4()),
@@ -47,6 +57,7 @@ async def register_push_token(
             token=data.token,
             platform=data.platform,
             notification_hour=notification_hour,
+            notification_minute=notification_minute,
         ))
 
     db.commit()
@@ -54,7 +65,7 @@ async def register_push_token(
 
 
 @router.delete("/unregister", response_model=RegisterTokenResponse)
-async def unregister_push_token(
+def unregister_push_token(
     data: RegisterTokenRequest,
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
@@ -72,13 +83,13 @@ async def unregister_push_token(
 
 
 @router.put("/time", response_model=RegisterTokenResponse)
-async def update_notification_time(
+def update_notification_time(
     data: RegisterTokenRequest,
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    """Update the preferred delivery hour for an existing push token."""
-    notification_hour = max(0, min(23, data.notification_hour or 8))
+    """Update the preferred delivery time (UTC hour + minute) for an existing token."""
+    notification_hour, notification_minute = _clamp_time(data)
     rows = (
         db.query(PushToken)
         .filter(PushToken.token == data.token, PushToken.user_id == current_user.id)
@@ -88,5 +99,6 @@ async def update_notification_time(
         raise HTTPException(status_code=404, detail="Token not found. Register first.")
     for row in rows:
         row.notification_hour = notification_hour
+        row.notification_minute = notification_minute
     db.commit()
     return {"success": True, "message": "Notification time updated."}

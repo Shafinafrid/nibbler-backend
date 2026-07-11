@@ -9,14 +9,15 @@ Connect — chat with your own books (premium).
                             this book (retrieved per question), and says so when
                             the answer isn't in the book.
 """
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request
 from sqlalchemy.orm import Session
 from typing import Optional, List
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from app.database import get_db
 from app.middleware.auth import get_current_user
 from app.models.user import User
 from app.models.library import LibraryItem
+from app.rate_limit import limiter
 from app.services.claude import ClaudeService
 from app.services.embedding_service import EmbeddingService
 from app.services import mixpanel_service
@@ -47,12 +48,27 @@ class InsightsResponse(BaseModel):
 
 class ChatRequest(BaseModel):
     library_item_id: str
-    message: str
-    history: List[dict] = []
+    # Caps keep a single request's Claude cost bounded; the service only uses
+    # the last 8 history turns anyway.
+    message: str = Field(..., max_length=2000)
+    history: List[dict] = Field(default_factory=list, max_length=20)
 
 
 class ChatResponse(BaseModel):
     reply: str
+
+
+def _require_premium(user: User):
+    """Connect is a Premium feature (PRD §5): free users see the paywall.
+    Structured detail so the app can route to the paywall by code."""
+    if not user.effective_premium:
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "code": "premium_required",
+                "message": "Chatting with your books is a Premium feature.",
+            },
+        )
 
 
 def _get_item(item_id: str, user: User, db: Session) -> LibraryItem:
@@ -68,11 +84,14 @@ def _get_item(item_id: str, user: User, db: Session) -> LibraryItem:
 
 
 @router.post("/insights", response_model=InsightsResponse)
-async def get_insights(
+@limiter.limit("30/hour")
+def get_insights(
+    request: Request,
     data: InsightsRequest,
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
+    _require_premium(current_user)
     item = _get_item(data.library_item_id, current_user, db)
 
     profile = data.growth_profile
@@ -86,7 +105,7 @@ async def get_insights(
     query = " ".join(b for b in query_bits if b).strip() or "personal growth and learning"
 
     embeddings = EmbeddingService()
-    scored = await embeddings.search_item_scored(
+    scored = embeddings.search_item_scored(
         query=query, user_id=current_user.id, item_id=item.id, top_k=8,
     )
 
@@ -121,11 +140,15 @@ async def get_insights(
 
 
 @router.post("/chat", response_model=ChatResponse)
-async def chat(
+@limiter.limit("20/hour")
+def chat(
+    request: Request,
     data: ChatRequest,
+    background_tasks: BackgroundTasks,
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
+    _require_premium(current_user)
     message = (data.message or "").strip()
     if not message:
         raise HTTPException(status_code=422, detail="Message is empty.")
@@ -133,7 +156,7 @@ async def chat(
     item = _get_item(data.library_item_id, current_user, db)
 
     embeddings = EmbeddingService()
-    excerpts = await embeddings.search_item(
+    excerpts = embeddings.search_item(
         query=message, user_id=current_user.id, item_id=item.id, top_k=8,
     )
     if not excerpts and item.content:
@@ -143,7 +166,7 @@ async def chat(
 
     claude = ClaudeService(is_premium=current_user.effective_premium)
     try:
-        reply = await claude.chat_with_book(
+        reply = claude.chat_with_book(
             book_title=item.title,
             author=item.author,
             excerpts=excerpts,
@@ -153,7 +176,7 @@ async def chat(
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"Chat failed: {e}")
 
-    await mixpanel_service.track("book_chat_message", current_user.id, {
+    background_tasks.add_task(mixpanel_service.track, "book_chat_message", current_user.id, {
         "item_id": item.id, "mode": item.mode or "wisdom",
     })
     return ChatResponse(reply=reply)

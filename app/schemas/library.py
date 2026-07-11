@@ -1,12 +1,13 @@
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from datetime import datetime
 from typing import Optional
 
 
 class LibraryItemCreate(BaseModel):
-    title: str
+    title: str = Field(..., max_length=300)
     type: str   # pdf | url | text | note
-    content: Optional[str] = None
+    # Same ceiling as extracted PDF/URL text (settings.max_extracted_text_chars)
+    content: Optional[str] = Field(None, max_length=2_000_000)
     mode: Optional[str] = "wisdom"          # wisdom | story
     kind: Optional[str] = "book"            # book | article | paper
     author: Optional[str] = None
@@ -14,8 +15,8 @@ class LibraryItemCreate(BaseModel):
 
 
 class LibraryItemUrlCreate(BaseModel):
-    url: str
-    title: Optional[str] = None
+    url: str = Field(..., max_length=2000)
+    title: Optional[str] = Field(None, max_length=300)
     mode: Optional[str] = "wisdom"
     kind: Optional[str] = "article"
     growth_profile_name: Optional[str] = None
@@ -37,10 +38,15 @@ class LibraryItemResponse(BaseModel):
     author: Optional[str] = None
     growth_profile_name: Optional[str] = None
     story_progress: Optional[int] = 0
+    is_active: Optional[bool] = True
     created_at: datetime
 
     class Config:
         from_attributes = True
+
+
+class SetActiveRequest(BaseModel):
+    active: bool
 
 
 class LibraryItemList(BaseModel):

@@ -1,9 +1,12 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
+from slowapi import _rate_limit_exceeded_handler
+from slowapi.errors import RateLimitExceeded
 from app.database import create_tables, SessionLocal
+from app.rate_limit import limiter
 from app.routers import auth, profile, library, bites, streak
-from app.routers import notifications, connect, support
+from app.routers import notifications, connect, support, revenuecat
 from app.services.notification_service import start_scheduler, stop_scheduler
 from app.config import get_settings
 
@@ -31,11 +34,20 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
+# ── Rate limiting (see app/rate_limit.py) ─────────────────────────────────────
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+
 # ── CORS ──────────────────────────────────────────────────────────────────────
+# Only the website needs browser CORS; the native app sends no Origin header
+# and is unaffected by this allowlist.
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],   # Tighten this in production
-    allow_credentials=True,
+    allow_origins=[
+        "https://getnibbler.com",
+        "https://www.getnibbler.com",
+    ],
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -49,6 +61,7 @@ app.include_router(streak.router)
 app.include_router(notifications.router)
 app.include_router(connect.router)
 app.include_router(support.router)
+app.include_router(revenuecat.router)
 
 
 # ── Health check ──────────────────────────────────────────────────────────────

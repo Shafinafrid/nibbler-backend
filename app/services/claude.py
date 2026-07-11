@@ -1,27 +1,12 @@
 import json
+import logging
 import re
 from typing import Optional
 import anthropic
 from app.config import get_settings
 
 settings = get_settings()
-
-ONBOARDING_SYSTEM = """You are Nibbler, a warm, curious, gently mischievous cat companion in a learning app.
-You are conducting a friendly onboarding interview to understand the user's goals, struggles, and learning habits.
-Keep responses conversational, warm, and SHORT (2-4 sentences max). Ask ONE follow-up question at a time.
-You're building a picture of: their background, current goals (career/health/relationships/mindset),
-what they're struggling with, reading habits, time available daily, and preferred tone (motivating/gentle/direct).
-After gathering enough info (5-7 exchanges), output a JSON object wrapped in <PROFILE>...</PROFILE> tags with keys:
-name, goals (list), struggles, readingHabits, dailyTime, tonePreference, backgroundSummary"""
-
-BITE_SYSTEM = """You are Nibbler's insight engine. Generate a personalized daily learning bite.
-Respond ONLY with valid JSON — no markdown, no code fences. Use exactly these keys:
-- title: catchy 5-8 word title
-- insight: the main insight, 200-250 words, in the user's preferred tone
-- reflection: single thought-provoking question (1 sentence)
-- action: concrete, small action step (1-2 sentences)
-- source: title of source material used (or "Your Nibbler Library" if synthesized)
-- theme: one-word theme (e.g. Focus, Resilience, Habits, Mindset, Leadership)"""
+logger = logging.getLogger(__name__)
 
 SESSION_SYSTEM = """You are Nibbler's session engine. You build a daily "nibble session" — a tap-through
 card deck — from excerpts of a book/article the user uploaded, personalized to their growth profile.
@@ -76,6 +61,106 @@ or add commentary. Split into the requested number of cards at natural pauses. F
 excerpt ends — no cliffhanger text of your own."""
 
 
+ASPIRATION_SYSTEM = """You are the onboarding interpreter for Nibbler, a personalized learning app.
+The user was asked: "A year from now, what’s one thing you’d love to understand or be able to do better?"
+Read their answer and return ONE JSON object that seeds their first growth profile.
+Output ONLY valid JSON — no prose, no markdown fences.
+
+CRITICAL RULE — needsClarification:
+Set needsClarification to TRUE in two situations:
+1. GIBBERISH — the answer is not real language: random keyboard characters ("askjdbaisdb", "fjfjfj"),
+   only punctuation/numbers/emoji, or otherwise meaningless. Nibbler should admit it didn't catch that
+   and ask them to say it again in a few words.
+2. TOO VAGUE TO AIM — the answer is real words but gives NO concrete learning direction to build a
+   profile from: "everything", "idk", "be better", "be happy", "success", "I want love", "life",
+   "I don't know", "stuff". For these, warmly acknowledge what they said and ask them to elaborate —
+   name the ambiguity if you can (e.g. love → romantic relationships? loving the people around them?
+   self-love?).
+An answer IS clear when it names a concrete domain, subject, skill, or activity with enough context to
+aim at — even if short or grammatically rough ("learn to code", "understand money", "I want to learn
+how to love people better"). Rough grammar is never a reason to clarify. Genuine ambiguity or emptiness is.
+
+Fields:
+- needsClarification (boolean): see CRITICAL RULE above.
+- clarifyPrompt (string|null): ONLY if needsClarification is true — ONE warm sentence from Nibbler that
+  (a) admits it didn't fully catch/understand that, and (b) asks them to say it differently or share a
+  bit more (max ~25 words). Specific beats generic. Else null.
+- lifeArea (string): short human-readable area. Map broadly and generously:
+  business/startups/entrepreneurship → "Business & Entrepreneurship"
+  coding/tech/software/AI → "Technology & Coding"
+  finance/money/investing → "Personal Finance"
+  health/fitness/diet → "Health & Fitness"
+  relationships/people/communication → "Relationships"
+  career/work/leadership → "Career Growth"
+  creativity/art/writing/music → "Creativity"
+  science/history/philosophy/world → "Understanding the World"
+  focus/habits/productivity → "Focus & Productivity"
+  spirituality/meaning/self → "Personal Growth"
+- contentMode ("analytical" | "reflective" | "practical"):
+   analytical = understanding facts/concepts/how things work
+   reflective = meaning, emotions, relationships, self-understanding
+   practical = building a skill/habit/behavior; doing something better
+- motivation ("career" | "skill" | "habit" | "curiosity" | "prep")
+- motivationType ("intrinsic" | "instrumental" | "mixed")
+- goalOrientation ("mastery" | "summary" | "application")
+- interests (array of 2-4 short topic tags WITHIN the life area, lowercase_snake)
+- profileName (string): short, warm, user-facing name for this growth journey (max ~4 words)
+- confirmation (string): ONE warm second-person sentence Nibbler shows to confirm it understood
+  (max ~15 words)
+- understanding (string): a restatement of the user's goal that completes the sentence
+  "So, if I understand correctly, you want ..." — lowercase start, max ~18 words, plain and
+  concrete, faithful to what they actually said (e.g. "to finally feel confident about
+  investing your own money."). Never include the words "So, if I understand correctly".
+
+Examples:
+
+Input: "I want to understand businesses"
+Output: {"needsClarification":false,"clarifyPrompt":null,"lifeArea":"Business & Entrepreneurship","contentMode":"analytical","motivation":"curiosity","motivationType":"mixed","goalOrientation":"mastery","interests":["business_strategy","entrepreneurship","how_companies_work"],"profileName":"Understanding How Business Works","confirmation":"Love that ambition — let’s start building your business mind.","understanding":"to understand how businesses really work, from strategy to what makes companies succeed."}
+
+Input: "I want to understand of making businesses"
+Output: {"needsClarification":false,"clarifyPrompt":null,"lifeArea":"Business & Entrepreneurship","contentMode":"analytical","motivation":"skill","motivationType":"mixed","goalOrientation":"application","interests":["entrepreneurship","startups","business_building"],"profileName":"Building a Business Mind","confirmation":"Love it — let’s explore what it really takes to build something.","understanding":"to learn what it actually takes to build a business of your own."}
+
+Input: "I want to finally understand investing and stop being scared of my finances"
+Output: {"needsClarification":false,"clarifyPrompt":null,"lifeArea":"Personal Finance","contentMode":"analytical","motivation":"skill","motivationType":"mixed","goalOrientation":"mastery","interests":["investing","personal_finance","money_mindset"],"profileName":"Getting Smart with Money","confirmation":"Love it — let’s make money feel a lot less scary.","understanding":"to finally understand investing and stop feeling scared of your own finances."}
+
+Input: "be better at understanding the people I love and not messing up my relationships"
+Output: {"needsClarification":false,"clarifyPrompt":null,"lifeArea":"Relationships","contentMode":"reflective","motivation":"curiosity","motivationType":"intrinsic","goalOrientation":"application","interests":["relationships","communication","emotional_intelligence"],"profileName":"Understanding the People I Love","confirmation":"Beautiful goal — let’s explore what makes relationships work.","understanding":"to better understand the people you love and take care of your relationships."}
+
+Input: "i want to stop procrastinating and actually focus"
+Output: {"needsClarification":false,"clarifyPrompt":null,"lifeArea":"Focus & Productivity","contentMode":"practical","motivation":"habit","motivationType":"intrinsic","goalOrientation":"application","interests":["focus","habits","procrastination"],"profileName":"Beating Procrastination","confirmation":"Let’s build the focus you’re after, one small step at a time.","understanding":"to stop procrastinating and build real, lasting focus."}
+
+Input: "learn to code"
+Output: {"needsClarification":false,"clarifyPrompt":null,"lifeArea":"Technology & Coding","contentMode":"practical","motivation":"skill","motivationType":"mixed","goalOrientation":"application","interests":["programming","coding","software_development"],"profileName":"Learning to Code","confirmation":"Let’s get you building things — one line at a time.","understanding":"to learn how to code and start building things yourself."}
+
+Input: "askjdbaisdb"
+Output: {"needsClarification":true,"clarifyPrompt":"Hmm, I didn't quite catch that — could you tell me in a few words what you'd love to learn or get better at?","lifeArea":"Personal Growth","contentMode":"practical","motivation":"curiosity","motivationType":"intrinsic","goalOrientation":"summary","interests":["self_improvement"],"profileName":"Growing Every Day","confirmation":"","understanding":""}
+
+Input: "I want love"
+Output: {"needsClarification":true,"clarifyPrompt":"Love is a big, beautiful goal — do you mean relationships, loving the people around you, or something else? Tell me a bit more.","lifeArea":"Relationships","contentMode":"reflective","motivation":"curiosity","motivationType":"intrinsic","goalOrientation":"application","interests":["relationships"],"profileName":"Understanding Love","confirmation":"","understanding":""}
+
+Input: "I want to learn love. I want to know how to love people."
+Output: {"needsClarification":false,"clarifyPrompt":null,"lifeArea":"Relationships","contentMode":"reflective","motivation":"curiosity","motivationType":"intrinsic","goalOrientation":"application","interests":["relationships","empathy","emotional_intelligence"],"profileName":"Learning to Love Well","confirmation":"What a beautiful thing to grow at — let's start.","understanding":"to learn how to truly love and care for the people in your life."}
+
+Input: "everything"
+Output: {"needsClarification":true,"clarifyPrompt":"I love the ambition! To point you somewhere real though — what's ONE area you'd pick first if you had to?","lifeArea":"Personal Growth","contentMode":"practical","motivation":"curiosity","motivationType":"intrinsic","goalOrientation":"summary","interests":["self_improvement"],"profileName":"Growing Every Day","confirmation":"","understanding":""}"""
+
+# Returned when both interpretation attempts fail — mirrors the app's old
+# client-side fallback so onboarding never blocks on a Claude outage.
+ASPIRATION_FALLBACK = {
+    "needsClarification": True,
+    "clarifyPrompt": "Could you tell me a bit more about what you'd love to learn or do better?",
+    "lifeArea": "Personal Growth",
+    "contentMode": "practical",
+    "motivation": "curiosity",
+    "motivationType": "intrinsic",
+    "goalOrientation": "summary",
+    "interests": ["growth", "self_improvement"],
+    "profileName": "Growing Every Day",
+    "confirmation": "",
+    "understanding": "",
+}
+
+
 BOOK_CHAT_SYSTEM = """You are Nibbler, a warm, curious cat companion inside a learning app. The user is
 chatting with ONE book from their own library. You are that book's voice and guide.
 
@@ -97,76 +182,26 @@ class ClaudeService:
         self.client = anthropic.Anthropic(api_key=settings.claude_api_key)
         self.model = settings.claude_model_paid if is_premium else settings.claude_model_free
 
-    async def onboarding_reply(
-        self,
-        conversation_history: list[dict],
-        user_message: str,
-    ) -> dict:
-        messages = [*conversation_history, {"role": "user", "content": user_message}]
+    def interpret_aspiration(self, answer: str) -> dict:
+        """Turn a free-text onboarding aspiration into the structured profile seed.
 
-        response = self.client.messages.create(
-            model=self.model,
-            max_tokens=512,
-            system=ONBOARDING_SYSTEM,
-            messages=messages,
-        )
-        text = response.content[0].text
-
-        # Check if onboarding is complete (profile tag present)
-        profile_match = re.search(r"<PROFILE>([\s\S]*?)</PROFILE>", text)
-        if profile_match:
+        Ported from the app's aspirationInterpreter.js (July 2026) so the Anthropic
+        key never ships in the client. One retry on failure; on double failure
+        returns a clarification fallback so onboarding never blocks.
+        """
+        for attempt in (1, 2):
             try:
-                raw = json.loads(profile_match.group(1).strip())
-                profile = {
-                    "name": raw.get("name", ""),
-                    "goals": raw.get("goals", []),
-                    "struggles": raw.get("struggles", ""),
-                    "reading_habits": raw.get("readingHabits", ""),
-                    "daily_time": raw.get("dailyTime", ""),
-                    "tone_preference": raw.get("tonePreference", ""),
-                    "background_summary": raw.get("backgroundSummary", ""),
-                }
-                reply = text.replace(profile_match.group(0), "").strip()
-                return {"reply": reply, "profile": profile, "is_complete": True}
-            except json.JSONDecodeError:
-                pass
-
-        return {"reply": text, "profile": None, "is_complete": False}
-
-    async def generate_bite(self, profile: dict, context_chunks: list[str] = None) -> dict:
-        context = "\n\n".join(context_chunks) if context_chunks else "Use your general knowledge about personal growth."
-        user_msg = f"""User profile:
-Name: {profile.get('name')}
-Goals: {', '.join(profile.get('goals', []))}
-Struggles: {profile.get('struggles', 'Not specified')}
-Tone preference: {profile.get('tone_preference', 'warm')}
-Daily time: {profile.get('daily_time', '5-10 minutes')}
-
-Relevant library content:
-{context}
-
-Generate today's personalized bite."""
-
-        response = self.client.messages.create(
-            model=self.model,
-            max_tokens=700,
-            system=BITE_SYSTEM,
-            messages=[{"role": "user", "content": user_msg}],
-        )
-        text = response.content[0].text.strip()
-
-        try:
-            return json.loads(text)
-        except json.JSONDecodeError:
-            # Fallback if JSON is malformed
-            return {
-                "title": "Today's Insight",
-                "insight": text,
-                "reflection": "What small step can you take today?",
-                "action": "Reflect on this insight for 5 minutes.",
-                "source": "Your Nibbler Library",
-                "theme": "Growth",
-            }
+                response = self.client.messages.create(
+                    model=self.model,
+                    max_tokens=400,
+                    temperature=0.2,
+                    system=ASPIRATION_SYSTEM,
+                    messages=[{"role": "user", "content": answer}],
+                )
+                return self._parse_json(response.content[0].text)
+            except Exception as e:
+                logger.warning("interpret_aspiration attempt %d failed: %s", attempt, e)
+        return dict(ASPIRATION_FALLBACK)
 
     # ── Session generation (July 2026) ────────────────────────────────────────
 
@@ -181,7 +216,7 @@ Generate today's personalized bite."""
             clean = clean[start:end + 1]
         return json.loads(clean)
 
-    async def generate_wisdom_session(
+    def generate_wisdom_session(
         self,
         book_title: str,
         author: Optional[str],
@@ -229,13 +264,17 @@ Build today's session JSON now."""
 
         response = self.client.messages.create(
             model=self.model,
-            max_tokens=8000,
-            system=SESSION_SYSTEM,
+            # Right-sized to the deck instead of a flat 8000: ~450 tokens per
+            # card (90-160 words + JSON) plus headroom for the quiz/preview.
+            max_tokens=min(8000, 1500 + card_target * 450),
+            # cache_control: the large static instruction block is cached
+            # (~10% of input price on repeat calls within the TTL).
+            system=[{"type": "text", "text": SESSION_SYSTEM, "cache_control": {"type": "ephemeral"}}],
             messages=[{"role": "user", "content": user_msg}],
         )
         return self._parse_json(response.content[0].text)
 
-    async def chat_with_book(
+    def chat_with_book(
         self,
         book_title: str,
         author,
@@ -244,12 +283,19 @@ Build today's session JSON now."""
         message: str,
     ) -> str:
         """Grounded chat: Nibbler answers only from this book's retrieved excerpts."""
-        system = (
-            BOOK_CHAT_SYSTEM
-            + f"\n\nTHE BOOK: \"{book_title}\"{f' by {author}' if author else ''}"
-            + "\n\nEXCERPTS FROM THE USER'S COPY:\n"
-            + "\n".join(f"--- passage {i+1} ---\n{e}" for i, e in enumerate(excerpts))
-        )
+        # Two system blocks: the static grounding rules are cached; the
+        # per-question book/excerpt block is not (it changes with retrieval).
+        system = [
+            {"type": "text", "text": BOOK_CHAT_SYSTEM, "cache_control": {"type": "ephemeral"}},
+            {
+                "type": "text",
+                "text": (
+                    f"THE BOOK: \"{book_title}\"{f' by {author}' if author else ''}"
+                    + "\n\nEXCERPTS FROM THE USER'S COPY:\n"
+                    + "\n".join(f"--- passage {i+1} ---\n{e}" for i, e in enumerate(excerpts))
+                ),
+            },
+        ]
         # Keep the last few turns for continuity; roles must alternate for the API
         msgs = []
         for m in (history or [])[-8:]:
@@ -275,7 +321,7 @@ Build today's session JSON now."""
         )
         return response.content[0].text.strip()
 
-    async def generate_story_session(
+    def generate_story_session(
         self,
         book_title: str,
         author: Optional[str],
@@ -295,8 +341,10 @@ Build today's portion JSON now."""
 
         response = self.client.messages.create(
             model=self.model,
-            max_tokens=8000,
-            system=STORY_SYSTEM,
+            # Story cards carry the excerpt text through: budget ~600 tokens
+            # per card plus headroom (excerpts are 1100-3300 words).
+            max_tokens=min(8000, 2000 + card_target * 600),
+            system=[{"type": "text", "text": STORY_SYSTEM, "cache_control": {"type": "ephemeral"}}],
             messages=[{"role": "user", "content": user_msg}],
         )
         result = self._parse_json(response.content[0].text)
