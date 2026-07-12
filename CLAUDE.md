@@ -37,7 +37,7 @@ Alembic is in requirements but **not used**. `create_tables()` runs `Base.metada
 
 ### Content pipeline (library → embeddings → bites)
 1. `POST /library/` (text/note), `/library/upload-pdf` (S3 upload, bucket `nibbler-user-files`, eu-north-1), or `/library/add-url` (requests + BeautifulSoup scrape).
-2. Each add schedules a FastAPI `BackgroundTasks` job that extracts text, chunks it (tiktoken, 500 tokens / 50 overlap), embeds via **Voyage AI `voyage-3-lite` (512 dims)**, and upserts to **Pinecone** index `nibbler-content` under a **per-user namespace**. Result recorded on the row (`processed`, `chunk_count`, `processing_error`). Without a Voyage key, embeddings fall back to a deterministic mock (dev only); without Pinecone, indexing silently no-ops.
+2. Each add schedules a FastAPI `BackgroundTasks` job that extracts text (per-page for PDFs, then `text_cleaning.clean_extracted_pages` strips watermarks/ads/page furniture), chunks it (tiktoken, 500 tokens / 50 overlap), embeds via **Voyage AI `voyage-3-lite` (512 dims)**, and upserts to **Pinecone** index `nibbler-content` under a **per-user namespace** with an `embedder` metadata stamp. Result recorded on the row (`processed`, `chunk_count`, `processing_error`). Mock embeddings are used ONLY when no Voyage key is configured (keyless dev); if a key is set and Voyage fails, `EmbeddingError` is raised and recorded on the row — never silently indexed (a July-2026 bug did exactly that and poisoned Connect's goal-match; `/connect/insights` detects legacy mock vectors and re-embeds in the background). Without Pinecone, indexing silently no-ops. NOTE: the Voyage account needs a payment method for real rate limits (LAUNCH_CHECKLIST §3b).
 3. `POST /bites/session` generates the per-book card-deck session on demand (cached per user/item/day, `client_date`-aware): retrieval query from the transmitted growth profile, top-K chunks from Pinecone, strict-JSON deck from Claude. Free users get `claude-haiku-4-5`, premium `claude-sonnet-4-6`. Daily caps enforced: 1 new generation/day free, 3/day premium (`config.py`). Streaks are written ONLY by `POST /streak/checkin`. (The legacy `GET /bites/today` + chat-onboarding endpoints were removed July 2026.) Uploads: 20 MB PDF cap, SSRF-guarded URL fetch (`app/services/url_safety.py`), Voyage embeds batched 128/call.
 
 ### Notifications
@@ -50,7 +50,7 @@ Alembic is in requirements but **not used**. `create_tables()` runs `Base.metada
 - Rate limits (slowapi, in-memory): chat 20/hr, session 30/day, uploads 10-20/hr, interpret-aspiration 10/hr/IP.
 
 ## Canonical product decisions (July 2026 — override older docs)
-- Pricing: **$9.99/mo, $59.99/yr** (correct on all surfaces as of 2026-07-10).
+- Pricing: **$9.99/mo, $69.99/yr** (correct on all surfaces as of 2026-07-12).
 - Library model: uploads are **uncapped**; premium users select **up to 5 "active" sources** (`library_items.is_active` + `PATCH /library/{id}/active`, cap enforced server-side).
 - Free tier: 3 uploads, 1 bite/day, 7-day history.
 
