@@ -17,6 +17,14 @@ logger = logging.getLogger(__name__)
 
 EXPO_PUSH_URL = "https://exp.host/--/exponent-push-token"
 
+# Minimum hours between one user's scheduled nibble sets. A hard ~24h cooldown
+# stops users farming extra nibbles by nudging their delivery time forward the
+# same day (read at 10:00 → change to 11:00 → new set an hour later). Set to 23h
+# (not a strict 24h) so the normal daily cadence isn't blocked by 5-minute-slot
+# and generation-time jitter — an unchanged schedule is exactly 24h apart, a
+# changed one only re-fires the next day.
+NIBBLE_LOCK_HOURS = 23
+
 # APScheduler instance (started in main.py lifespan)
 scheduler = AsyncIOScheduler()
 
@@ -148,7 +156,8 @@ def _prepare_user_nibbles(db_factory, user_id: str) -> None:
     stalls the event loop. Generates today's scheduled nibble set for one user,
     honoring the hold-until-read rule and streak reset.
     """
-    from datetime import date
+    from datetime import date, datetime, timedelta
+    from sqlalchemy import func
     from app.models.user import User
     from app.models.library import LibraryItem
     from app.models.bite import DailyBite
@@ -192,16 +201,21 @@ def _prepare_user_nibbles(db_factory, user_id: str) -> None:
                 _reset_streak_if_needed(db, user_id)
             return  # keep the held session; do not obsolete or regenerate
 
-        # Idempotency: today's set already prepared.
-        if (
-            db.query(DailyBite)
+        # 24-hour cooldown: only prepare a new set once ~24h has passed since the
+        # last one. Blocks the "nudge my delivery time forward to farm extra
+        # nibbles the same day" exploit — a changed time simply takes effect the
+        # next day. Also serves as idempotency so an overlapping cron tick can't
+        # double-generate. (Uses generated_at, not `date`, so it can't be beaten
+        # by crossing midnight either.)
+        last_gen = (
+            db.query(func.max(DailyBite.generated_at))
             .filter(
                 DailyBite.user_id == user_id,
                 DailyBite.origin == "scheduled",
-                DailyBite.date == today,
             )
-            .count()
-        ):
+            .scalar()
+        )
+        if last_gen and (datetime.utcnow() - last_gen) < timedelta(hours=NIBBLE_LOCK_HOURS):
             return
 
         cap = settings.premium_bites_per_day if user.effective_premium else settings.free_bites_per_day
