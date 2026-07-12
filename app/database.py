@@ -68,6 +68,9 @@ def _run_migrations():
         "ALTER TABLE daily_bites ADD COLUMN IF NOT EXISTS headline VARCHAR",
         "ALTER TABLE daily_bites ADD COLUMN IF NOT EXISTS preview TEXT",
         "ALTER TABLE daily_bites ADD COLUMN IF NOT EXISTS goal_passage TEXT",
+        # daily_bites — session lifecycle: scheduled generation + hold-until-read (July 2026)
+        "ALTER TABLE daily_bites ADD COLUMN IF NOT EXISTS origin VARCHAR DEFAULT 'manual'",
+        "ALTER TABLE daily_bites ADD COLUMN IF NOT EXISTS read_at TIMESTAMP",
         # users
         "ALTER TABLE users ADD COLUMN IF NOT EXISTS premium_until TIMESTAMP",
         "ALTER TABLE users ADD COLUMN IF NOT EXISTS display_name VARCHAR",

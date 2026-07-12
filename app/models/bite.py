@@ -26,6 +26,9 @@ class DailyBite(Base):
     preview = Column(Text, nullable=True)
     goal_passage = Column(Text, nullable=True)   # this nibble's most goal-relevant excerpt (Connect tab)
     generated_at = Column(DateTime, server_default=func.now())
+    # ── Session lifecycle (July 2026): scheduled generation + hold-until-read ──
+    origin = Column(String, nullable=True, default="manual")  # 'scheduled' (pre-generated at delivery time) | 'manual' (user tapped a book)
+    read_at = Column(DateTime, nullable=True)    # when the user finished reading; NULL = unread/held
 
     user = relationship("User", back_populates="daily_bites")
 
