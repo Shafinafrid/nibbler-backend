@@ -4,8 +4,6 @@ from sqlalchemy.orm import relationship
 from app.database import Base
 
 TRIAL_DAYS = 7                     # Model A: every new signup gets 7 days of Premium
-DEV_ALWAYS_PRO = {"b@b.com"}       # dev account — always premium (mirrors the app's __DEV__ shortcut)
-DEV_ALWAYS_FREE = {"a@a.com"}      # dev account — always free, trial does NOT apply
 
 
 class User(Base):
@@ -25,15 +23,6 @@ class User(Base):
         (is_premium / premium_until, once RevenueCat sync lands) OR the
         7-day signup trial. The app computes the same trial client-side —
         without this the backend blocked trial users at the free caps."""
-        # Dev-only email overrides — gated to a development env so they never act
-        # as a backdoor on the production server. (a@a.com forced-free masked a
-        # real RevenueCat purchase during sandbox testing.)
-        from app.config import get_settings
-        if get_settings().app_env == "development":
-            if self.email in DEV_ALWAYS_FREE:
-                return False
-            if self.email in DEV_ALWAYS_PRO:
-                return True
         if self.is_premium:
             return True
         now = datetime.utcnow()
