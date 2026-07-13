@@ -25,10 +25,15 @@ class User(Base):
         (is_premium / premium_until, once RevenueCat sync lands) OR the
         7-day signup trial. The app computes the same trial client-side —
         without this the backend blocked trial users at the free caps."""
-        if self.email in DEV_ALWAYS_FREE:
-            return False
-        if self.email in DEV_ALWAYS_PRO:
-            return True
+        # Dev-only email overrides — gated to a development env so they never act
+        # as a backdoor on the production server. (a@a.com forced-free masked a
+        # real RevenueCat purchase during sandbox testing.)
+        from app.config import get_settings
+        if get_settings().app_env == "development":
+            if self.email in DEV_ALWAYS_FREE:
+                return False
+            if self.email in DEV_ALWAYS_PRO:
+                return True
         if self.is_premium:
             return True
         now = datetime.utcnow()
