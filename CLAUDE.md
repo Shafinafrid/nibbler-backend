@@ -44,7 +44,7 @@ Alembic is in requirements but **not used**. `create_tables()` runs `Base.metada
 `notification_service` runs an **APScheduler cron every 5 minutes** that pushes "Your daily bite is ready" via Expo's push API to every token whose `notification_hour` + `notification_minute` (stored **in UTC**, minutes snapped to 5-min slots; the app converts from local time) matches the current slot. Tokens are registered/updated via `/notifications/*`. Do NOT run uvicorn with multiple workers — the scheduler would fire once per process (duplicate pushes).
 
 ### Free vs premium enforcement (implemented July 2026)
-- `User.effective_premium` is the single tier source: subscription (`premium_until`) OR 7-day signup trial OR dev-email override.
+- `User.effective_premium` is the single tier source: `is_premium` (manual comps) OR subscription (`premium_until`) OR 7-day signup trial. (The a@a.com/b@b.com dev-email overrides were removed — do not re-add.)
 - Subscription sync writes `premium_until`: `POST /webhooks/revenuecat` (shared-secret Authorization header; configure the URL + `REVENUECAT_WEBHOOK_SECRET` in the RC dashboard/Railway) and `POST /auth/sync-premium` (app calls it after purchase/restore; server verifies with RC's REST API — needs `REVENUECAT_SECRET_API_KEY`). Never trust client-claimed premium.
 - Free: 3 uploads, 1 new session/day, 7-day history; Connect (chat + insights) is premium-only (403 `premium_required`). Premium: 3 sessions/day, ≤5 active sources (`PATCH /library/{id}/active`).
 - Rate limits (slowapi, in-memory): chat 20/hr, session 30/day, uploads 10-20/hr, interpret-aspiration 10/hr/IP.
@@ -58,5 +58,7 @@ Alembic is in requirements but **not used**. `create_tables()` runs `Base.metada
 - The growth profile now persists server-side as a JSON blob (`profiles.growth_state`, `PUT /profile/growth`); the legacy chat-interview columns remain on the table but have no write path.
 - Quizzes are generated inside sessions and reviewed client-side; there is no standalone quiz/flashcard endpoint or spaced-repetition persistence (post-launch).
 - Multiple growth profiles (Phase 2) not started server-side.
-- Unique indexes on `daily_bites (user_id, library_item_id, date)` and `saved_bites (user_id, bite_id)` need one-off manual SQL (the `_run_migrations` pattern can't add constraints); the session handler already tolerates the resulting IntegrityError.
 - Account deletion does not purge the bug-report mirror rows in the Google Sheet (founder decision pending).
+
+### Prod-DB one-offs already applied (2026-07-16)
+Unique indexes are LIVE in production: `uq_daily_bites_user_item_date` on `daily_bites (user_id, library_item_id, date) WHERE library_item_id IS NOT NULL`, and `uq_saved_bites_user_bite` on `saved_bites (user_id, bite_id)`. Both write paths tolerate the IntegrityError (session_service returns the winning row; the save endpoint returns "Already saved"). **Running SQL on prod:** Railway → Postgres service → **Console** tab (a bash shell) → `psql "$DATABASE_URL"` (internal endpoint, no egress fees). The Database→Query tab silently appends `LIMIT` — SELECT-only, DDL/DELETE will syntax-error there.
