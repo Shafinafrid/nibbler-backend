@@ -287,7 +287,12 @@ def save_bite(
         bite_id=bite_id,
     )
     db.add(saved)
-    db.commit()
+    try:
+        db.commit()
+    except IntegrityError:
+        # Unique index on (user_id, bite_id): a concurrent save won the race.
+        db.rollback()
+        return {"message": "Already saved"}
     return {"message": "Saved"}
 
 
