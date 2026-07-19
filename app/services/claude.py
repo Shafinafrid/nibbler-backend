@@ -182,7 +182,11 @@ bullet walls. One gentle follow-up question at most, only when natural. Never me
 class ClaudeService:
     def __init__(self, is_premium: bool = False):
         self.client = anthropic.Anthropic(api_key=settings.claude_api_key)
-        self.model = settings.claude_model_paid if is_premium else settings.claude_model_free
+        # Founder decision 2026-07-19: EVERY call uses the cheapest model
+        # (Haiku), premium included — token cost control pre-launch. The
+        # is_premium flag and claude_model_paid config stay as an easy
+        # escape hatch if premium quality ever needs to come back.
+        self.model = settings.claude_model_free
 
     def interpret_aspiration(self, answer: str) -> dict:
         """Turn a free-text onboarding aspiration into the structured profile seed.
