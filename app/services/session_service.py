@@ -76,6 +76,7 @@ def generate_session_for_item(
     card_target = CARD_TARGETS[read_length]
     story_finished = False
     goal_passage = None
+    chunk_ids = None
 
     if mode == "story":
         words = (item.content or "").split()
@@ -115,10 +116,34 @@ def generate_session_for_item(
         pq = _profile_query(profile)
         query = pq or item.title
         embeddings = EmbeddingService()
-        chunks = embeddings.search_item(
-            query=query, user_id=user.id, item_id=item.id,
-            top_k=WISDOM_TOP_K[read_length],
-        )
+
+        # Progressive coverage: exclude every chunk this user's previous
+        # sessions already drew from, so each nibble explores NEW ground —
+        # without this, the same profile query returned the same top-K chunks
+        # every single day, and 'Explored %' could never honestly grow.
+        served: set = set()
+        for (ids,) in (
+            db.query(DailyBite.chunk_ids)
+            .filter(
+                DailyBite.user_id == user.id,
+                DailyBite.library_item_id == item.id,
+                DailyBite.chunk_ids.isnot(None),
+            )
+            .all()
+        ):
+            served.update(i for i in (ids or []) if isinstance(i, int))
+
+        try:
+            fresh = embeddings.search_item_fresh(
+                query=query, user_id=user.id, item_id=item.id,
+                top_k=WISDOM_TOP_K[read_length],
+                exclude_indexes=sorted(served),
+            )
+        except Exception as e:
+            logger.warning("Fresh retrieval failed (%s) — raw-text fallback", e)
+            fresh = []
+        chunks = [f["text"] for f in fresh if f.get("text")]
+        chunk_ids = [f["chunk_index"] for f in fresh if isinstance(f.get("chunk_index"), int)]
         # Retrieval is ranked by similarity to the growth profile, so the top
         # chunk IS today's most goal-relevant passage (Connect tab uses it).
         if chunks and pq:
@@ -126,6 +151,7 @@ def generate_session_for_item(
             goal_passage = goal_passage[:280] + ("…" if len(goal_passage) > 280 else "")
         if not chunks and item.content:
             chunks = [item.content[:8000]]  # Pinecone down — fall back to raw text
+            chunk_ids = []
         if not chunks:
             raise SessionGenerationError("No indexed content found for this item.", 422)
         try:
@@ -156,6 +182,7 @@ def generate_session_for_item(
         headline=(result.get("headline") or "")[:500],
         preview=result.get("preview") or "",
         goal_passage=goal_passage,
+        chunk_ids=chunk_ids,
         origin=origin,
     )
     db.add(bite)

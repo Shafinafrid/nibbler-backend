@@ -80,6 +80,7 @@ def _run_migrations():
         "ALTER TABLE push_tokens ADD COLUMN IF NOT EXISTS notification_minute INTEGER DEFAULT 0",
         "ALTER TABLE push_tokens ADD COLUMN IF NOT EXISTS streak_alerts_enabled BOOLEAN DEFAULT TRUE",
         "ALTER TABLE streaks ADD COLUMN IF NOT EXISTS last_completed_at TIMESTAMP",
+        "ALTER TABLE daily_bites ADD COLUMN IF NOT EXISTS chunk_ids JSON",
     ]
 
     applied, failed = 0, 0

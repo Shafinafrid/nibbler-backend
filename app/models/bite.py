@@ -25,6 +25,7 @@ class DailyBite(Base):
     headline = Column(String, nullable=True)
     preview = Column(Text, nullable=True)
     goal_passage = Column(Text, nullable=True)   # this nibble's most goal-relevant excerpt (Connect tab)
+    chunk_ids = Column(JSON, nullable=True)      # chunk indexes this session drew from — drives honest Explored % + no-repeat retrieval
     generated_at = Column(DateTime, server_default=func.now())
     # ── Session lifecycle (July 2026): scheduled generation + hold-until-read ──
     origin = Column(String, nullable=True, default="manual")  # 'scheduled' (pre-generated at delivery time) | 'manual' (user tapped a book)

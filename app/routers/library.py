@@ -7,7 +7,7 @@ from app.models.library import LibraryItem
 from app.rate_limit import limiter
 from app.schemas.library import LibraryItemCreate, LibraryItemResponse, LibraryItemList, LibraryItemUrlCreate, SetActiveRequest
 from app.services.s3_service import S3Service
-from app.services.embedding_service import EmbeddingService
+from app.services.embedding_service import EmbeddingService, EmbeddingError
 from app.services.url_safety import UnsafeUrlError, validate_public_url, fetch_public_url
 from app.config import get_settings
 import uuid
@@ -253,6 +253,30 @@ def delete_library_item(
 
 # ── Background tasks ───────────────────────────────────────────────────────────
 
+# Shown on the library row when Voyage rejects the embedding batches. Before
+# July 2026 this failure was silently swallowed into random mock vectors, which
+# poisoned Pinecone and made the Connect goal-match read ~4% forever. Failing
+# loudly is the correct behavior.
+EMBEDDING_DOWN_MESSAGE = (
+    "Nibbler couldn't finish reading this one — the reading service is briefly "
+    "unavailable. Delete it and upload again in a few minutes."
+)
+
+
+def _record_processing_error(item_id: str, message: str):
+    from app.database import SessionLocal
+    db = SessionLocal()
+    try:
+        item = db.query(LibraryItem).filter(LibraryItem.id == item_id).first()
+        if item:
+            item.processing_error = message[:250]
+            db.commit()
+    except Exception:
+        db.rollback()
+    finally:
+        db.close()
+
+
 def process_item_embeddings(item_id: str, user_id: str):
     """Chunk plain-text / pasted content and upsert to Pinecone."""
     from app.database import SessionLocal
@@ -272,6 +296,10 @@ def process_item_embeddings(item_id: str, user_id: str):
         item.processed = True
         item.chunk_count = chunk_count
         db.commit()
+    except EmbeddingError as e:
+        db.rollback()
+        print(f"[process_item_embeddings] Embedding failed for item {item_id}: {e}")
+        _record_processing_error(item_id, EMBEDDING_DOWN_MESSAGE)
     except Exception as e:
         # Without this the row sat processed=False forever with no error —
         # the app polled endlessly with nothing to show the user.
@@ -339,6 +367,10 @@ def process_pdf_embeddings(item_id: str, pdf_bytes: bytes, user_id: str):
         item.processed = True
         item.chunk_count = chunk_count
         db.commit()
+    except EmbeddingError as e:
+        db.rollback()
+        print(f"[process_pdf_embeddings] Embedding failed for item {item_id}: {e}")
+        _record_processing_error(item_id, EMBEDDING_DOWN_MESSAGE)
     except Exception as e:
         db.rollback()
         print(f"[process_pdf_embeddings] Error for item {item_id}: {e}")
@@ -426,6 +458,10 @@ def process_url_embeddings(item_id: str, url: str, user_id: str):
                 db.commit()
         except Exception:
             pass
+    except EmbeddingError as e:
+        db.rollback()
+        print(f"[process_url_embeddings] Embedding failed for item {item_id}: {e}")
+        _record_processing_error(item_id, EMBEDDING_DOWN_MESSAGE)
     except Exception as e:
         db.rollback()
         print(f"[process_url_embeddings] Error for item {item_id}: {e}")

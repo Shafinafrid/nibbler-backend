@@ -1,8 +1,15 @@
+import math
 import tiktoken
-from typing import List
+from typing import List, Optional
 from app.config import get_settings
 
 settings = get_settings()
+
+
+class EmbeddingError(Exception):
+    """Voyage failed while a key IS configured. Never swallowed into mock
+    vectors: one silently-mocked book poisons its Pinecone entries with random
+    vectors, and the Connect goal-match reads a nonsense ~4% forever."""
 
 CHUNK_SIZE = 500     # tokens per chunk
 CHUNK_OVERLAP = 50   # token overlap between chunks
@@ -30,16 +37,19 @@ _voyage_client = None
 
 
 def _get_voyage_client():
-    """One client for the process — it was being re-created per chunk."""
+    """One client for the process — it was being re-created per chunk.
+    max_retries handles transient rate limits / 5xx with backoff."""
     global _voyage_client
     if _voyage_client is None and settings.voyage_api_key:
         import voyageai
-        _voyage_client = voyageai.Client(api_key=settings.voyage_api_key)
+        _voyage_client = voyageai.Client(api_key=settings.voyage_api_key, max_retries=5)
     return _voyage_client
 
 
 def _mock_embedding(text: str) -> List[float]:
-    """Deterministic local-dev fallback when Voyage is unavailable."""
+    """Deterministic stand-in used ONLY when no Voyage key is configured
+    (keyless local dev). A failing key raises EmbeddingError instead — silent
+    mock fallback is what poisoned production vectors in July 2026."""
     import hashlib
     import random
     seed = int(hashlib.md5(text.encode()).hexdigest(), 16)
@@ -47,23 +57,28 @@ def _mock_embedding(text: str) -> List[float]:
     return [rng.uniform(-1, 1) for _ in range(EMBEDDING_DIM)]
 
 
+def embedding_provider() -> str:
+    """Which provider vectors from this process come from ('voyage'|'mock')."""
+    return "voyage" if settings.voyage_api_key else "mock"
+
+
 def _get_embeddings(texts: List[str]) -> List[List[float]]:
     """
-    Embed many texts in batches of 128 — a 300-chunk book used to make 300
-    separate Voyage calls (one per chunk, each with a fresh client); now it
-    makes 3. Uses voyage-3-lite, the most cost-effective model.
+    Embed many texts in batches — a 300-chunk book used to make 300 separate
+    Voyage calls; now a handful. Uses voyage-3-lite, the most cost-effective
+    model. Raises EmbeddingError on failure when a key is configured.
     """
     client = _get_voyage_client()
-    if client:
-        try:
-            out: List[List[float]] = []
-            for i in range(0, len(texts), VOYAGE_BATCH):
-                result = client.embed(texts[i:i + VOYAGE_BATCH], model=VOYAGE_MODEL, input_type="document")
-                out.extend(result.embeddings)
-            return out
-        except Exception as e:
-            print(f"[EmbeddingService] Voyage AI error: {e} — falling back to mock")
-    return [_mock_embedding(t) for t in texts]
+    if client is None:
+        return [_mock_embedding(t) for t in texts]
+    try:
+        out: List[List[float]] = []
+        for i in range(0, len(texts), VOYAGE_BATCH):
+            result = client.embed(texts[i:i + VOYAGE_BATCH], model=VOYAGE_MODEL, input_type="document")
+            out.extend(result.embeddings)
+        return out
+    except Exception as e:
+        raise EmbeddingError(f"Voyage AI embedding failed: {e}") from e
 
 
 def _get_embedding(text: str) -> List[float]:
@@ -76,13 +91,28 @@ def _get_query_embedding(text: str) -> List[float]:
     Embedding for search queries (uses input_type='query' for better retrieval).
     """
     client = _get_voyage_client()
-    if client:
-        try:
-            result = client.embed([text], model=VOYAGE_MODEL, input_type="query")
-            return result.embeddings[0]
-        except Exception as e:
-            print(f"[EmbeddingService] Voyage AI query error: {e} — falling back to mock")
-    return _mock_embedding(text)
+    if client is None:
+        return _mock_embedding(text)
+    try:
+        result = client.embed([text], model=VOYAGE_MODEL, input_type="query")
+        return result.embeddings[0]
+    except Exception as e:
+        raise EmbeddingError(f"Voyage AI query embedding failed: {e}") from e
+
+
+def _classify_embedder(match) -> str:
+    """'voyage' or 'mock' for a Pinecone match. New vectors carry an explicit
+    metadata stamp; legacy ones are classified by norm — Voyage embeddings are
+    unit-length (‖v‖ ≈ 1) while the mock's uniform(-1,1) gives ‖v‖ ≈ 13."""
+    meta = match.metadata or {}
+    stamped = meta.get("embedder")
+    if stamped:
+        return stamped
+    values = getattr(match, "values", None) or []
+    if not values:
+        return "voyage"  # can't tell without values — assume real
+    norm = math.sqrt(sum(v * v for v in values))
+    return "voyage" if norm < 2.0 else "mock"
 
 
 class EmbeddingService:
@@ -109,6 +139,7 @@ class EmbeddingService:
 
         chunks = _chunk_text(text)
         embeddings = _get_embeddings(chunks)
+        provider = embedding_provider()
         vectors = []
         for i, (chunk, embedding) in enumerate(zip(chunks, embeddings)):
             vectors.append({
@@ -118,6 +149,9 @@ class EmbeddingService:
                     "user_id": user_id,
                     "item_id": item_id,
                     "chunk_index": i,
+                    # Lets Connect refuse to score against dev-mock vectors
+                    # instead of reporting a nonsense ~4% goal match.
+                    "embedder": provider,
                     # Full chunk text (500 tokens ≈ 2KB — well within Pinecone's 40KB
                     # metadata limit). Truncating here starved session generation.
                     "text": chunk[:8000],
@@ -179,8 +213,9 @@ class EmbeddingService:
         item_id: str,
         top_k: int = 8,
     ):
-        """Like search_item but returns [(text, score)] — scores drive the
-        Connect tab's goal-relevance analytics."""
+        """Like search_item but returns [{text, score, embedder}] — scores
+        drive the Connect goal-match; embedder lets the caller refuse to score
+        against dev-mock vectors (random values → cosine ≈ 0 → nonsense %)."""
         if not self.pinecone_available:
             return []
 
@@ -191,8 +226,74 @@ class EmbeddingService:
             namespace=user_id,
             filter={"item_id": {"$eq": item_id}},
             include_metadata=True,
+            include_values=True,
         )
-        return [(m.metadata.get("text", ""), float(m.score or 0)) for m in results.matches]
+        return [
+            {
+                "text": (m.metadata or {}).get("text", ""),
+                "score": float(m.score or 0),
+                "embedder": _classify_embedder(m),
+            }
+            for m in results.matches
+        ]
+
+    # Pinecone metadata filters have a size cap — cap the $nin list and, once a
+    # book is nearly fully served, let retrieval recycle earlier chunks.
+    MAX_EXCLUDE = 400
+
+    def search_item_fresh(
+        self,
+        query: str,
+        user_id: str,
+        item_id: str,
+        top_k: int = 8,
+        exclude_indexes: Optional[List[int]] = None,
+    ):
+        """Search within ONE item, skipping already-served chunks, returning
+        [{text, chunk_index}]. This is what makes daily sessions cover NEW
+        ground instead of re-serving the same top-K forever — and what makes
+        the Connect 'Explored %' an honest number instead of an extrapolation."""
+        if not self.pinecone_available:
+            return []
+
+        flt = {"item_id": {"$eq": item_id}}
+        exclude = list(exclude_indexes or [])
+        if exclude:
+            flt["chunk_index"] = {"$nin": exclude[-self.MAX_EXCLUDE:]}
+
+        query_embedding = _get_query_embedding(query)
+        results = self.index.query(
+            vector=query_embedding,
+            top_k=top_k,
+            namespace=user_id,
+            filter=flt,
+            include_metadata=True,
+        )
+        out = [
+            {
+                "text": (m.metadata or {}).get("text", ""),
+                "chunk_index": (m.metadata or {}).get("chunk_index"),
+            }
+            for m in results.matches
+        ]
+        # Book exhausted under exclusions → recycle from the whole book so the
+        # user always gets a session (revisiting > nothing).
+        if not out and exclude:
+            results = self.index.query(
+                vector=query_embedding,
+                top_k=top_k,
+                namespace=user_id,
+                filter={"item_id": {"$eq": item_id}},
+                include_metadata=True,
+            )
+            out = [
+                {
+                    "text": (m.metadata or {}).get("text", ""),
+                    "chunk_index": (m.metadata or {}).get("chunk_index"),
+                }
+                for m in results.matches
+            ]
+        return out
 
     def fetch_chunks(
         self,
