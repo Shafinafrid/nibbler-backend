@@ -80,8 +80,10 @@ def sync_premium(
             .replace(tzinfo=None)  # model timestamps are naive UTC
         )
         current_user.premium_until = expires
-    else:
-        current_user.premium_until = None
+    # No entitlement in the payload → leave premium_until untouched. RevenueCat
+    # keeps expired entitlements in the subscriber object, so "missing" means
+    # the user never subscribed — and wiping a stored past expiry would wrongly
+    # re-open the signup trial for a lapsed subscriber.
 
     db.commit()
     db.refresh(current_user)

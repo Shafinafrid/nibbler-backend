@@ -89,9 +89,12 @@ def revenuecat_webhook(
         return {"ok": True, "handled": event_type, "premium_until": str(expires)}
 
     if event_type == "EXPIRATION":
-        user.premium_until = None
+        # Keep the (past) expiry timestamp instead of nulling it: a set-but-past
+        # premium_until is how effective_premium recognises a LAPSED subscriber,
+        # who must land on the free tier rather than back in the signup trial.
+        user.premium_until = _ms_to_naive_utc(event.get("expiration_at_ms")) or datetime.utcnow()
         db.commit()
-        logger.info("RC EXPIRATION: user %s premium cleared", user.id)
+        logger.info("RC EXPIRATION: user %s premium ended at %s", user.id, user.premium_until)
         return {"ok": True, "handled": "EXPIRATION"}
 
     logger.info("RC webhook %s for user %s — no action", event_type, user.id)

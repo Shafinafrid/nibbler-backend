@@ -28,6 +28,12 @@ class User(Base):
         now = datetime.utcnow()
         if self.premium_until and self.premium_until > now:
             return True
+        # A lapsed subscriber (premium_until set but in the past) lands on the
+        # FREE tier — the signup trial never resumes after a real subscription.
+        # The RC webhook/sync keep the expired timestamp instead of nulling it
+        # precisely so this check works.
+        if self.premium_until:
+            return False
         if self.created_at and (now - self.created_at) < timedelta(days=TRIAL_DAYS):
             return True
         return False
