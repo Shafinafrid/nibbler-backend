@@ -97,13 +97,15 @@ def upload_pdf(
 ):
     check_upload_limit(current_user, db)
 
-    if not file.filename.lower().endswith(".pdf"):
-        raise HTTPException(status_code=400, detail="Only PDF files are supported.")
+    fname = (file.filename or "").lower()
+    is_epub = fname.endswith(".epub")
+    if not (fname.endswith(".pdf") or is_epub):
+        raise HTTPException(status_code=400, detail="Only PDF and EPUB files are supported.")
 
     max_bytes = settings.max_pdf_upload_mb * 1024 * 1024
     too_large = HTTPException(
         status_code=413,
-        detail=f"PDFs up to {settings.max_pdf_upload_mb} MB are supported — this file is larger.",
+        detail=f"Files up to {settings.max_pdf_upload_mb} MB are supported — this file is larger.",
     )
     # Fast reject on the declared size, then enforce for real while reading in
     # chunks — one unbounded read() of a huge file can OOM the whole server.
@@ -125,11 +127,13 @@ def upload_pdf(
     # Respond as soon as the bytes have arrived — S3 archival AND text
     # extraction/embedding all happen in the background task, so the app
     # never waits on Claude, Pinecone, or a slow/broken AWS setup.
+    import re as _re
+    clean_title = _re.sub(r"\.(pdf|epub)$", "", file.filename or "", flags=_re.IGNORECASE)
     item = LibraryItem(
         id=str(uuid.uuid4()),
         user_id=current_user.id,
-        title=(title or file.filename.replace(".pdf", "").replace(".PDF", "")).strip(),
-        type="pdf",
+        title=(title or clean_title).strip(),
+        type="epub" if is_epub else "pdf",
         file_url=None,
         file_size=len(file_content),
         mode=mode or "wisdom",
@@ -142,7 +146,8 @@ def upload_pdf(
     db.commit()
     db.refresh(item)
 
-    background_tasks.add_task(process_pdf_embeddings, item.id, file_content, current_user.id)
+    task = process_epub_embeddings if is_epub else process_pdf_embeddings
+    background_tasks.add_task(task, item.id, file_content, current_user.id)
     return item
 
 
@@ -376,6 +381,130 @@ def process_pdf_embeddings(item_id: str, pdf_bytes: bytes, user_id: str):
         print(f"[process_pdf_embeddings] Error for item {item_id}: {e}")
         # Leave a readable trace on the row so the app can show what went
         # wrong instead of the item sitting in "processing" forever.
+        try:
+            item = db.query(LibraryItem).filter(LibraryItem.id == item_id).first()
+            if item:
+                item.processing_error = f"Processing failed: {str(e)[:250]}"
+                db.commit()
+        except Exception:
+            pass
+    finally:
+        db.close()
+
+
+def _extract_epub_text(epub_bytes: bytes) -> str:
+    """Extract readable text from an EPUB (a zip of XHTML chapters).
+
+    Proper path: META-INF/container.xml → the OPF package file → its manifest
+    (id → href) + spine (reading order) → each chapter document's text.
+    Fallback: every .xhtml/.html in the archive, sorted by path — still yields
+    the full book when a publisher's OPF is malformed.
+    No new dependency: zipfile + BeautifulSoup (already used for URL scraping).
+    """
+    import io
+    import posixpath
+    import warnings
+    import zipfile
+    from bs4 import BeautifulSoup
+
+    try:  # html.parser on the OPF/container XML works fine — silence the advisory
+        from bs4 import XMLParsedAsHTMLWarning
+        warnings.filterwarnings("ignore", category=XMLParsedAsHTMLWarning)
+    except ImportError:
+        pass
+
+    def doc_text(raw: bytes) -> str:
+        soup = BeautifulSoup(raw, "html.parser")
+        for tag in soup(["script", "style", "nav"]):
+            tag.decompose()
+        return soup.get_text(separator="\n", strip=True)
+
+    with zipfile.ZipFile(io.BytesIO(epub_bytes)) as zf:
+        names = set(zf.namelist())
+        ordered_docs = []
+        try:
+            container = BeautifulSoup(zf.read("META-INF/container.xml"), "html.parser")
+            opf_path = container.find("rootfile")["full-path"]
+            opf_dir = posixpath.dirname(opf_path)
+            opf = BeautifulSoup(zf.read(opf_path), "html.parser")
+            hrefs = {i.get("id"): i.get("href") for i in opf.find_all("item")}
+            for ref in opf.find_all("itemref"):
+                href = hrefs.get(ref.get("idref"))
+                if not href:
+                    continue
+                path = posixpath.normpath(posixpath.join(opf_dir, href)) if opf_dir else href
+                if path in names and path.lower().endswith((".xhtml", ".html", ".htm")):
+                    ordered_docs.append(path)
+        except Exception:
+            ordered_docs = []
+        if not ordered_docs:
+            ordered_docs = sorted(
+                n for n in names if n.lower().endswith((".xhtml", ".html", ".htm"))
+            )
+
+        parts = []
+        for path in ordered_docs:
+            try:
+                t = doc_text(zf.read(path))
+                if t:
+                    parts.append(t)
+            except Exception:
+                continue
+        return "\n\n".join(parts)
+
+
+def process_epub_embeddings(item_id: str, epub_bytes: bytes, user_id: str):
+    """Extract text from an EPUB in spine (reading) order, chunk, and upsert
+    to Pinecone — the same pipeline as PDFs, including story-mode content."""
+    from app.database import SessionLocal
+
+    db = SessionLocal()
+    try:
+        item = db.query(LibraryItem).filter(LibraryItem.id == item_id).first()
+        if not item:
+            return
+
+        # Best-effort archive of the original file (same as PDFs)
+        try:
+            s3 = S3Service()
+            item.file_url = s3.upload_file(
+                file_content=epub_bytes,
+                filename=f"{user_id}/{item_id}.epub",
+                content_type="application/epub+zip",
+            )
+            db.commit()
+        except Exception as e:
+            print(f"[process_epub_embeddings] S3 archive skipped: {e}")
+
+        text = _extract_epub_text(epub_bytes)
+        text = text[: settings.max_extracted_text_chars]
+
+        if not text.strip():
+            item.processed = False
+            item.processing_error = "Couldn't read any text in this EPUB — the file may be DRM-protected."
+            db.commit()
+            return
+
+        # Full text on the row — story mode reads the book sequentially from here.
+        item.content = text
+
+        embedding_svc = EmbeddingService()
+        chunk_count = embedding_svc.index_text(
+            text=text,
+            item_id=item_id,
+            user_id=user_id,
+            metadata={"title": item.title, "type": "epub"},
+        )
+        item.processed = True
+        item.chunk_count = chunk_count
+        db.commit()
+    except EmbeddingError as e:
+        db.rollback()
+        print(f"[process_epub_embeddings] Embedding failed for item {item_id}: {e}")
+        _record_processing_error(item_id, EMBEDDING_DOWN_MESSAGE)
+    except Exception as e:
+        db.rollback()
+        print(f"[process_epub_embeddings] Error for item {item_id}: {e}")
         try:
             item = db.query(LibraryItem).filter(LibraryItem.id == item_id).first()
             if item:
