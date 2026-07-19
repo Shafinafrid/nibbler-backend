@@ -78,6 +78,8 @@ def _run_migrations():
         "ALTER TABLE profiles ADD COLUMN IF NOT EXISTS growth_state JSON",
         # push_tokens — minute-precision delivery (July 2026)
         "ALTER TABLE push_tokens ADD COLUMN IF NOT EXISTS notification_minute INTEGER DEFAULT 0",
+        "ALTER TABLE push_tokens ADD COLUMN IF NOT EXISTS streak_alerts_enabled BOOLEAN DEFAULT TRUE",
+        "ALTER TABLE streaks ADD COLUMN IF NOT EXISTS last_completed_at TIMESTAMP",
     ]
 
     applied, failed = 0, 0

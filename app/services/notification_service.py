@@ -141,10 +141,21 @@ def _select_sources_for_today(active: list, count: int, today) -> list:
     return [active[(offset + i) % n] for i in range(count)]
 
 
-def _reset_streak_if_needed(db, user_id: str) -> None:
+def _reset_streak_if_broken(db, user_id: str, today) -> None:
+    """Called AT the user's generation boundary (T−5 tick). A full cycle with
+    no completed session — regardless of how that cycle's sessions were
+    generated (scheduled or manual/prefetched) — resets the streak to 0, so
+    the number the app shows is already 0 the moment the miss becomes final."""
+    from datetime import datetime, timedelta
     from app.models.streak import Streak
     s = db.query(Streak).filter(Streak.user_id == user_id).first()
-    if s and s.current_streak:
+    if not s or not s.current_streak:
+        return
+    if s.last_completed_at:
+        broken = s.last_completed_at < datetime.utcnow() - timedelta(hours=24)
+    else:
+        broken = not s.last_active_date or s.last_active_date < today - timedelta(days=1)
+    if broken:
         s.current_streak = 0
         db.commit()
         logger.info("Streak reset (missed cycle) for user %s", user_id)
@@ -181,25 +192,39 @@ def _prepare_user_nibbles(db_factory, user_id: str) -> None:
             .order_by(LibraryItem.id.asc())
             .all()
         )
+        # This tick IS the user's cycle boundary — settle the streak first,
+        # whatever happens with generation below.
+        _reset_streak_if_broken(db, user_id, today)
+
         if not active:
             return  # nothing to generate from
 
         # Hold-until-read: never generate a new set while one is unread.
+        # Origin-agnostic on purpose: an unread manual/prefetched session is
+        # still "the current session" and must be held, not buried under a
+        # fresh scheduled one.
         unread = (
             db.query(DailyBite)
             .filter(
                 DailyBite.user_id == user_id,
-                DailyBite.origin == "scheduled",
                 DailyBite.read_at.is_(None),
             )
             .order_by(DailyBite.date.desc())
             .first()
         )
         if unread:
-            if unread.date < today:
-                # A prior scheduled set was never read → user missed a cycle.
-                _reset_streak_if_needed(db, user_id)
             return  # keep the held session; do not obsolete or regenerate
+
+        # One set per day, whatever its origin: if the user already generated
+        # today's session(s) by tapping a book (origin='manual'), the scheduler
+        # must not top them up with a second scheduled set.
+        made_today = (
+            db.query(DailyBite)
+            .filter(DailyBite.user_id == user_id, DailyBite.date >= today)
+            .first()
+        )
+        if made_today:
+            return
 
         # 24-hour cooldown: only prepare a new set once ~24h has passed since the
         # last one. Blocks the "nudge my delivery time forward to farm extra
@@ -263,11 +288,12 @@ async def _notify_delivery_slot(db_factory, now) -> None:
         for r in rows:
             by_user.setdefault(r.user_id, []).append(r.token)
         for user_id, toks in by_user.items():
+            # Origin-agnostic: a session the user generated themselves (manual/
+            # prefetched) is still today's session — remind about it the same way.
             unread = (
                 db.query(DailyBite)
                 .filter(
                     DailyBite.user_id == user_id,
-                    DailyBite.origin == "scheduled",
                     DailyBite.read_at.is_(None),
                 )
                 .order_by(DailyBite.date.desc())
@@ -298,11 +324,77 @@ async def _notify_delivery_slot(db_factory, now) -> None:
         )
 
 
+async def _notify_streak_alert_slot(db_factory, now) -> None:
+    """Streak alert — fires 65 minutes before a user's delivery time (one hour
+    before their generation boundary), the last stretch of the closing window.
+    Sent only when it can still make a difference:
+      · the user's streak-alert toggle is on (push_tokens.streak_alerts_enabled)
+      · they have an unread session from a PRIOR cycle (any origin)
+      · their current streak is > 0 (already-broken streaks have nothing to lose)
+    """
+    from datetime import timedelta
+    from app.models.push_token import PushToken
+    from app.models.bite import DailyBite
+    from app.models.streak import Streak
+    from app.config import get_settings
+
+    settings = get_settings()
+    hour, slot = _slot(now + timedelta(minutes=65))
+    today = now.date()
+
+    at_risk_tokens = []
+    with db_factory() as db:
+        rows = (
+            db.query(PushToken)
+            .filter(
+                PushToken.notification_hour == hour,
+                PushToken.notification_minute == slot,
+                PushToken.streak_alerts_enabled.is_(True),
+            )
+            .all()
+        )
+        if not rows:
+            return
+        by_user: dict[str, list[str]] = {}
+        for r in rows:
+            by_user.setdefault(r.user_id, []).append(r.token)
+        for user_id, toks in by_user.items():
+            streak = db.query(Streak).filter(Streak.user_id == user_id).first()
+            if not streak or not streak.current_streak:
+                continue
+            if streak.last_active_date and streak.last_active_date >= today:
+                continue  # already read today — nothing at risk
+            held = (
+                db.query(DailyBite)
+                .filter(
+                    DailyBite.user_id == user_id,
+                    DailyBite.read_at.is_(None),
+                    DailyBite.date < today,
+                )
+                .first()
+            )
+            if not held:
+                continue  # no session whose window is closing
+            at_risk_tokens.extend(toks)
+
+    if at_risk_tokens:
+        logger.info("Streak alert to %d tokens (%02d:%02d UTC delivery)", len(at_risk_tokens), hour, slot)
+        await send_push_notifications(
+            tokens=at_risk_tokens,
+            title="Your streak ends in 1 hour 🔥",
+            body="Yesterday's nibble is still waiting — finish it now to keep your streak alive.",
+            data={"screen": "Home"},
+            expo_access_token=getattr(settings, "expo_access_token", ""),
+        )
+
+
 async def _run_delivery_cycle(db_factory) -> None:
     """
-    Runs every 5 minutes. Two jobs in one tick:
-      1. PRE-GENERATE for users whose delivery is 5 min from now (their T−5 slot).
-      2. NOTIFY users whose delivery is now.
+    Runs every 5 minutes. Three jobs in one tick:
+      1. STREAK ALERT for users whose delivery is 65 min from now (T−65) and
+         whose streak is about to break.
+      2. PRE-GENERATE for users whose delivery is 5 min from now (their T−5 slot).
+      3. NOTIFY users whose delivery is now.
     Generation is blocking, so it runs in a threadpool to spare the event loop.
     """
     import asyncio
@@ -310,6 +402,11 @@ async def _run_delivery_cycle(db_factory) -> None:
     from app.models.push_token import PushToken
 
     now = datetime.now(timezone.utc)
+
+    try:
+        await _notify_streak_alert_slot(db_factory, now)
+    except Exception as e:
+        logger.error("Streak-alert pass failed: %s", e)
 
     gen_hour, gen_slot = _slot(now + timedelta(minutes=5))
     with db_factory() as db:

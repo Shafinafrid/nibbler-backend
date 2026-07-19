@@ -11,6 +11,10 @@ class Streak(Base):
     current_streak = Column(Integer, default=0)
     longest_streak = Column(Integer, default=0)
     last_active_date = Column(Date, nullable=True)
+    # Exact completion timestamp (UTC). last_active_date is only a DATE, which
+    # can't tell "read at 10:15, inside the closing window" from "read at 11:30,
+    # after it closed" — the cycle-boundary streak math needs the real moment.
+    last_completed_at = Column(DateTime, nullable=True)
     total_bites_read = Column(Integer, default=0)
     updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now())
 

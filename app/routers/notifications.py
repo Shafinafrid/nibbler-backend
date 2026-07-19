@@ -17,6 +17,12 @@ class RegisterTokenRequest(BaseModel):
     platform: Optional[str] = None          # 'ios' | 'android'
     notification_hour: Optional[int] = 8    # UTC hour (0-23)
     notification_minute: Optional[int] = 0  # UTC minute — snapped to 5-min steps
+    streak_alerts: Optional[bool] = None    # None = leave the stored value alone
+
+
+class StreakAlertsRequest(BaseModel):
+    token: str
+    enabled: bool
 
 
 def _clamp_time(data: RegisterTokenRequest) -> tuple:
@@ -50,6 +56,8 @@ def register_push_token(
         existing.platform = data.platform
         existing.notification_hour = notification_hour
         existing.notification_minute = notification_minute
+        if data.streak_alerts is not None:
+            existing.streak_alerts_enabled = data.streak_alerts
     else:
         db.add(PushToken(
             id=str(uuid.uuid4()),
@@ -58,6 +66,7 @@ def register_push_token(
             platform=data.platform,
             notification_hour=notification_hour,
             notification_minute=notification_minute,
+            streak_alerts_enabled=True if data.streak_alerts is None else data.streak_alerts,
         ))
 
     db.commit()
@@ -80,6 +89,26 @@ def unregister_push_token(
     if deleted:
         return {"success": True, "message": "Push token removed."}
     return {"success": False, "message": "Token not found."}
+
+
+@router.put("/streak-alerts", response_model=RegisterTokenResponse)
+def update_streak_alerts(
+    data: StreakAlertsRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Toggle the T−65 'streak ends in 1 hour' push for the user's token(s)."""
+    rows = (
+        db.query(PushToken)
+        .filter(PushToken.token == data.token, PushToken.user_id == current_user.id)
+        .all()
+    )
+    if not rows:
+        raise HTTPException(status_code=404, detail="Token not found. Register first.")
+    for row in rows:
+        row.streak_alerts_enabled = data.enabled
+    db.commit()
+    return {"success": True, "message": "Streak alerts updated."}
 
 
 @router.put("/time", response_model=RegisterTokenResponse)
