@@ -18,7 +18,7 @@ Respond ONLY with valid JSON, no markdown fences, matching exactly:
   "headline": "one arresting sentence that makes the user want to read (max 18 words)",
   "preview": "2-sentence preview of today's session (max 45 words)",
   "cards": [ ... exactly CARD_TARGET cards ... ],
-  "quiz": [ ... exactly 3 items ... ]
+  "quiz": [ ... exactly QUIZ_TARGET items ... ]
 }
 
 Card shapes (kind determines shape):
@@ -37,9 +37,11 @@ final short paragraph that explicitly ties the idea to their stated goal or thei
 approach new things — e.g. "You told Nibbler you take things step by step — this idea is exactly that kind
 of small, repeatable move." Make it feel personally picked, never generic.
 
-The separate top-level "quiz" array (3 multiple-choice questions, 4 options each, exactly 1 correct, with
-explanations) tests today's session content — it is shown to the user TOMORROW, so questions must stand
-alone without seeing the cards."""
+The separate top-level "quiz" array (QUIZ_TARGET multiple-choice questions, 4 options each, exactly 1
+correct, with explanations) tests today's session content — it is shown to the user TOMORROW in the
+Review tab, so questions must stand alone without seeing the cards. Keep quiz questions ≤ 20 words and
+each option ≤ 12 words: they are answered as quick recall taps, not reading exercises. Explanations
+stay 1-2 tight sentences."""
 
 STORY_SYSTEM = """You are Nibbler's story engine. The user reads a book in "story mode": sequential,
 faithful, no personalization — the book itself, served in daily portions.
@@ -226,6 +228,9 @@ class ClaudeService:
         read_length: int,
     ) -> dict:
         """Personalized card-deck session from the user's own book excerpts."""
+        # Review-deck size scales with the session length (founder spec
+        # 2026-07-19): 5 min → 4 questions, 10 min → 7, 15 min → 9.
+        quiz_target = {5: 4, 10: 7, 15: 9}.get(read_length, 4)
         interaction = {
             "analytical": "a QUIZ card (kind quiz, eyebrow QUICK CHECK)",
             "practical": 'a PROMPT card with eyebrow "TRY THIS TODAY"',
@@ -255,6 +260,7 @@ GROWTH PROFILE:
 - Interests: {', '.join(profile.get('interests') or [])}
 
 CARD_TARGET: {card_target} cards total ({read_length}-minute read).
+QUIZ_TARGET: {quiz_target} quiz questions.
 Interaction card (second-to-last): {interaction}.
 
 SOURCE EXCERPTS (build the session ONLY from these):
@@ -265,8 +271,9 @@ Build today's session JSON now."""
         response = self.client.messages.create(
             model=self.model,
             # Right-sized to the deck instead of a flat 8000: ~450 tokens per
-            # card (90-160 words + JSON) plus headroom for the quiz/preview.
-            max_tokens=min(8000, 1500 + card_target * 450),
+            # card (90-160 words + JSON) plus headroom for the quiz/preview
+            # (~120 tokens per quiz question).
+            max_tokens=min(8000, 1500 + card_target * 450 + quiz_target * 120),
             # cache_control: the large static instruction block is cached
             # (~10% of input price on repeat calls within the TTL).
             system=[{"type": "text", "text": SESSION_SYSTEM, "cache_control": {"type": "ephemeral"}}],
