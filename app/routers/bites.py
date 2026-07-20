@@ -93,7 +93,15 @@ def _bite_to_session(bite: DailyBite) -> SessionResponse:
 
 
 @router.post("/session", response_model=SessionResponse)
-@limiter.limit("30/day")
+# Generous safety net against a genuine runaway-loop bug, NOT the real cost
+# control — that's the todays_generations/cap check below, which correctly
+# counts only actual generations (persisted in the DB) and is what limits
+# real Claude spend (1 free / 3 premium per day). This decorator used to be
+# 30/day and counted EVERY call including free re-reads of an already-cached
+# bite (the early return a few lines down) — a user simply re-opening the
+# same 5 books a few times while testing could exhaust it with zero new
+# generations, surfacing as "That bite got away" for no real reason.
+@limiter.limit("200/day")
 def get_or_create_session(
     request: Request,
     data: SessionRequest,
