@@ -62,6 +62,31 @@ def embedding_provider() -> str:
     return "voyage" if settings.voyage_api_key else "mock"
 
 
+def _embed_batch_with_backoff(client, batch: List[str], input_type: str, max_attempts: int = 6, base_delay: int = 5):
+    """
+    Manual retry on top of the client's own max_retries: without a payment
+    method on the Voyage account, the limit is 3 RPM / 10K TPM (documented,
+    LAUNCH_CHECKLIST §3b) — a book with several batches back-to-back WILL hit
+    that ceiling. Background ingestion has no request timeout, so the default
+    budget waits out real rate limits (429) with growing backoff (5s, 10s,
+    20s, 40s, 80s, 160s ≈ 5 min total) instead of failing the whole book.
+    Live request paths (chat/insights) pass a shorter base_delay + fewer
+    attempts so they don't block the HTTP response for minutes. Non-rate-limit
+    errors (bad key, malformed request) fail immediately — retrying is pointless.
+    """
+    import time
+    delay = base_delay
+    for attempt in range(1, max_attempts + 1):
+        try:
+            return client.embed(batch, model=VOYAGE_MODEL, input_type=input_type)
+        except Exception as e:
+            is_rate_limit = '429' in str(e) or 'rate limit' in str(e).lower()
+            if not is_rate_limit or attempt == max_attempts:
+                raise
+            time.sleep(delay)
+            delay *= 2
+
+
 def _get_embeddings(texts: List[str]) -> List[List[float]]:
     """
     Embed many texts in batches — a 300-chunk book used to make 300 separate
@@ -74,7 +99,7 @@ def _get_embeddings(texts: List[str]) -> List[List[float]]:
     try:
         out: List[List[float]] = []
         for i in range(0, len(texts), VOYAGE_BATCH):
-            result = client.embed(texts[i:i + VOYAGE_BATCH], model=VOYAGE_MODEL, input_type="document")
+            result = _embed_batch_with_backoff(client, texts[i:i + VOYAGE_BATCH], "document")
             out.extend(result.embeddings)
         return out
     except Exception as e:
@@ -89,12 +114,14 @@ def _get_embedding(text: str) -> List[float]:
 def _get_query_embedding(text: str) -> List[float]:
     """
     Embedding for search queries (uses input_type='query' for better retrieval).
+    Runs on a LIVE request (chat, insights) — short retry budget (~6s total)
+    on a rate limit, not the multi-minute one used for background ingestion.
     """
     client = _get_voyage_client()
     if client is None:
         return _mock_embedding(text)
     try:
-        result = client.embed([text], model=VOYAGE_MODEL, input_type="query")
+        result = _embed_batch_with_backoff(client, [text], "query", max_attempts=3, base_delay=2)
         return result.embeddings[0]
     except Exception as e:
         raise EmbeddingError(f"Voyage AI query embedding failed: {e}") from e
