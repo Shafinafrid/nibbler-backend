@@ -15,7 +15,7 @@ from sqlalchemy.orm import Session
 
 logger = logging.getLogger(__name__)
 
-EXPO_PUSH_URL = "https://exp.host/--/exponent-push-token"
+EXPO_PUSH_URL = "https://exp.host/--/api/v2/push/send"
 
 # Minimum hours between one user's scheduled nibble sets. A hard ~24h cooldown
 # stops users farming extra nibbles by nudging their delivery time forward the
