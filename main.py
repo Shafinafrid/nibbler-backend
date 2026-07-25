@@ -1,7 +1,7 @@
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from contextlib import asynccontextmanager
-from slowapi import _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
 from app.database import create_tables, SessionLocal
 from app.rate_limit import limiter
@@ -36,7 +36,25 @@ app = FastAPI(
 
 # ── Rate limiting (see app/rate_limit.py) ─────────────────────────────────────
 app.state.limiter = limiter
-app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+
+
+def _rate_limit_handler(request: Request, exc: RateLimitExceeded) -> JSONResponse:
+    # slowapi's own default handler responds with {"error": "..."} — every
+    # client-side error path here (api.js's shared `request()` AND the
+    # hand-rolled uploadPdf) only ever reads `detail`, so a real rate limit
+    # was silently swallowed into the generic "Upload failed"/"Request failed"
+    # fallback text with zero indication of the real cause. Found 2026-07-25
+    # after an upload failed with no useful reason attached.
+    response = JSONResponse(
+        {"detail": "You're doing that a bit too fast — wait a few minutes and try again."},
+        status_code=429,
+    )
+    # Keep the Retry-After / X-RateLimit-* headers slowapi's own handler adds —
+    # only the body shape changes here.
+    return request.app.state.limiter._inject_headers(response, request.state.view_rate_limit)
+
+
+app.add_exception_handler(RateLimitExceeded, _rate_limit_handler)
 
 # ── CORS ──────────────────────────────────────────────────────────────────────
 # Only the website needs browser CORS; the native app sends no Origin header
