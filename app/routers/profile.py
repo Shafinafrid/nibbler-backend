@@ -56,6 +56,21 @@ def update_growth_state(
     The app pushes on every ProfileRepository.saveState and pulls when its
     local copy is empty at sign-in."""
     profile = _get_or_create_profile(current_user, db)
+
+    # Defense in depth: a client-side bug (2026-07-25 — a fresh install could
+    # end up pushing throwaway pre-signup onboarding data over a real profile)
+    # was able to permanently erase this column with nothing but a normal PUT.
+    # The client fix removes the way that happened, but the row itself should
+    # never trust a client enough to let one push wipe real data down to zero
+    # profiles — that's not a legitimate edit under any normal product flow.
+    existing_profiles = ((profile.growth_state or {}).get("profiles")) or []
+    new_profiles = (data.growth_state.get("profiles")) or []
+    if existing_profiles and not new_profiles:
+        raise HTTPException(
+            status_code=409,
+            detail="Refusing to overwrite an existing growth profile with an empty one.",
+        )
+
     profile.growth_state = data.growth_state
     person_name = ((data.growth_state.get("person") or {}).get("name") or "").strip()
     if person_name:
