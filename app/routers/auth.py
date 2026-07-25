@@ -119,6 +119,12 @@ def delete_account(
         ).all()
         for item in library_items:
             s3.delete_file(item.file_url)
+        # The profile photo lives at its own key ({uid}/avatar.jpg) and is NOT
+        # a library item, so the loop above never touched it — it would have
+        # survived account deletion, which is exactly what GDPR erasure must
+        # not leave behind.
+        if current_user.avatar_url:
+            s3.delete_file(current_user.avatar_url)
         logger.info("Deleted %d S3 files for user %s", len(library_items), user_id)
     except Exception as e:
         logger.error("S3 deletion failed for user %s: %s", user_id, e)

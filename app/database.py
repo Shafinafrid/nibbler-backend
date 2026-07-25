@@ -81,6 +81,23 @@ def _run_migrations():
         "ALTER TABLE push_tokens ADD COLUMN IF NOT EXISTS streak_alerts_enabled BOOLEAN DEFAULT TRUE",
         "ALTER TABLE streaks ADD COLUMN IF NOT EXISTS last_completed_at TIMESTAMP",
         "ALTER TABLE daily_bites ADD COLUMN IF NOT EXISTS chunk_ids JSON",
+        # users — identity + device context (July 2026, full-account sync)
+        "ALTER TABLE users ADD COLUMN IF NOT EXISTS username VARCHAR",
+        "ALTER TABLE users ADD COLUMN IF NOT EXISTS avatar_url VARCHAR",
+        "ALTER TABLE users ADD COLUMN IF NOT EXISTS timezone VARCHAR",
+        "ALTER TABLE users ADD COLUMN IF NOT EXISTS locale VARCHAR",
+        "ALTER TABLE users ADD COLUMN IF NOT EXISTS platform VARCHAR",
+        "ALTER TABLE users ADD COLUMN IF NOT EXISTS app_version VARCHAR",
+        "ALTER TABLE users ADD COLUMN IF NOT EXISTS last_seen_at TIMESTAMP",
+        "CREATE UNIQUE INDEX IF NOT EXISTS uq_users_username ON users (username) WHERE username IS NOT NULL",
+        # notes / highlights — one row per (user, book, card). create_all() makes
+        # the tables; these indexes are what stop a retry storm from duplicating
+        # rows, and CREATE INDEX IF NOT EXISTS is safe to re-run every boot.
+        "CREATE UNIQUE INDEX IF NOT EXISTS uq_notes_user_book_card ON notes (user_id, book_id, card_index)",
+        "CREATE UNIQUE INDEX IF NOT EXISTS uq_highlights_user_book_card ON highlights (user_id, book_id, card_index)",
+        # chat / completions — read paths are always scoped to one user+book
+        "CREATE INDEX IF NOT EXISTS ix_chat_messages_user_book ON chat_messages (user_id, book_id)",
+        "CREATE INDEX IF NOT EXISTS ix_completions_user_book ON completions (user_id, book_id)",
     ]
 
     applied, failed = 0, 0

@@ -17,6 +17,20 @@ class User(Base):
     created_at = Column(DateTime, server_default=func.now())
     updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now())
 
+    # ── Identity + device context (July 2026) ────────────────────────────────
+    # Everything here is either user-supplied or a technical attribute of their
+    # own session. Deliberately NOT collected: precise location, contacts,
+    # advertising identifiers, or anything requiring a consent prompt we don't
+    # show — those would change the App Store privacy labels and need a legal
+    # basis we haven't established.
+    username = Column(String, unique=True, nullable=True, index=True)
+    avatar_url = Column(String, nullable=True)     # S3 object KEY (private bucket)
+    timezone = Column(String, nullable=True)       # IANA, e.g. "Europe/Stockholm"
+    locale = Column(String, nullable=True)         # e.g. "en-GB"
+    platform = Column(String, nullable=True)       # 'ios' | 'android'
+    app_version = Column(String, nullable=True)
+    last_seen_at = Column(DateTime, nullable=True)
+
     @property
     def effective_premium(self) -> bool:
         """The single source of truth for tier gating: a real subscription
@@ -46,3 +60,10 @@ class User(Base):
     streak = relationship("Streak", back_populates="user", uselist=False, cascade="all, delete-orphan")
     push_tokens = relationship("PushToken", back_populates="user", cascade="all, delete-orphan")
     bug_reports = relationship("BugReport", back_populates="user", cascade="all, delete-orphan")
+    # Restored wholesale on a new device — see routers/sync.py
+    notes = relationship("Note", back_populates="user", cascade="all, delete-orphan")
+    highlights = relationship("Highlight", back_populates="user", cascade="all, delete-orphan")
+    chat_messages = relationship("ChatMessage", back_populates="user", cascade="all, delete-orphan")
+    completions = relationship("Completion", back_populates="user", cascade="all, delete-orphan")
+    settings = relationship("UserSettings", back_populates="user", uselist=False, cascade="all, delete-orphan")
+    state = relationship("UserState", back_populates="user", uselist=False, cascade="all, delete-orphan")
