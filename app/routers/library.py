@@ -121,6 +121,11 @@ def upload_pdf(
             raise too_large
         chunks.append(chunk)
     file_content = b"".join(chunks)
+    # join() briefly holds TWO full copies of the file; at the 50 MB cap that
+    # is 100 MB of the Railway process's RAM per concurrent upload. Drop the
+    # chunk list immediately so the peak lasts microseconds, not the whole
+    # request.
+    chunks.clear()
     if not file_content:
         raise HTTPException(status_code=400, detail="That file appears to be empty.")
 

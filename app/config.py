@@ -57,7 +57,10 @@ class Settings(BaseSettings):
     premium_bites_per_day: int = 3
     # Upload safety: one unbounded file.read() can OOM the single Railway
     # process, so uploads are hard-capped (and extracted text bounded too).
-    max_pdf_upload_mb: int = 20
+    # Raised 20 → 50 MB on 2026-07-25 (real 25 MB textbooks were being
+    # rejected). The app enforces the same number BEFORE uploading — see
+    # MAX_UPLOAD_MB in nibbler/src/screens/UploadScreen.js; keep them in sync.
+    max_pdf_upload_mb: int = 50
     max_extracted_text_chars: int = 2_000_000
 
     class Config:
