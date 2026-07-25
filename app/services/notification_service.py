@@ -161,6 +161,46 @@ def _reset_streak_if_broken(db, user_id: str, today) -> None:
         logger.info("Streak reset (missed cycle) for user %s", user_id)
 
 
+def _live_unread_query(db: Session, user_id: str):
+    """Unread nibbles the user can actually still open.
+
+    `daily_bites.library_item_id` is a plain nullable String with NO foreign key
+    (app/models/bite.py), and DELETE /library/{id} removes only the item, its
+    Pinecone vectors and its S3 object — so deleting a book leaves its nibbles
+    behind as orphans. An unread orphan is **unreachable**: the Library row it
+    belongs to is gone, so nothing in the app can ever open it and POST
+    /bites/{id}/read. It therefore satisfies a bare `read_at IS NULL` check
+    forever, and all three checks in this module read off that:
+
+      · generation is held permanently → daily nibbles silently stop, with no
+        error and no way for the user to clear it;
+      · the delivery push says "you forgot yesterday's nibble" every day;
+      · the streak alert says "your streak ends in 1 hour" every day.
+
+    Joining to library_items is what makes "unread" mean "unread AND still
+    openable". Deactivated books are deliberately NOT excluded — the user can
+    still open those from the Library, so their unread nibble legitimately
+    holds. (Found 2026-07-25 in an external audit of DATA_PERSISTENCE_WALKTHROUGH.)
+    """
+    from app.models.bite import DailyBite
+    from app.models.library import LibraryItem
+
+    # An inner join also drops rows whose library_item_id is NULL, which is
+    # correct: those are legacy pre-session bites, equally unopenable today.
+    return (
+        db.query(DailyBite)
+        .join(
+            LibraryItem,
+            (LibraryItem.id == DailyBite.library_item_id)
+            & (LibraryItem.user_id == DailyBite.user_id),
+        )
+        .filter(
+            DailyBite.user_id == user_id,
+            DailyBite.read_at.is_(None),
+        )
+    )
+
+
 def _prepare_user_nibbles(db_factory, user_id: str) -> None:
     """
     Blocking (Claude/embeddings) — always call via asyncio.to_thread so it never
@@ -204,11 +244,7 @@ def _prepare_user_nibbles(db_factory, user_id: str) -> None:
         # still "the current session" and must be held, not buried under a
         # fresh scheduled one.
         unread = (
-            db.query(DailyBite)
-            .filter(
-                DailyBite.user_id == user_id,
-                DailyBite.read_at.is_(None),
-            )
+            _live_unread_query(db, user_id)
             .order_by(DailyBite.date.desc())
             .first()
         )
@@ -291,11 +327,7 @@ async def _notify_delivery_slot(db_factory, now) -> None:
             # Origin-agnostic: a session the user generated themselves (manual/
             # prefetched) is still today's session — remind about it the same way.
             unread = (
-                db.query(DailyBite)
-                .filter(
-                    DailyBite.user_id == user_id,
-                    DailyBite.read_at.is_(None),
-                )
+                _live_unread_query(db, user_id)
                 .order_by(DailyBite.date.desc())
                 .first()
             )
@@ -365,12 +397,8 @@ async def _notify_streak_alert_slot(db_factory, now) -> None:
             if streak.last_active_date and streak.last_active_date >= today:
                 continue  # already read today — nothing at risk
             held = (
-                db.query(DailyBite)
-                .filter(
-                    DailyBite.user_id == user_id,
-                    DailyBite.read_at.is_(None),
-                    DailyBite.date < today,
-                )
+                _live_unread_query(db, user_id)
+                .filter(DailyBite.date < today)
                 .first()
             )
             if not held:

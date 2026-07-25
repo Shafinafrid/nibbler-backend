@@ -26,7 +26,15 @@ def get_db():
 
 def create_tables():
     """Create all tables. Called on startup."""
-    from app.models import user, profile, library, bite, streak, push_token  # noqa
+    # Every model module must be listed here. `user_data` and `bug_report` used
+    # to be missing: their tables still got created, but ONLY as a side effect of
+    # main.py importing the routers (which import the models) before lifespan
+    # runs this. A routine import reorder — or lazily importing a router — would
+    # have silently stopped creating six tables on any fresh database, failing
+    # much later as a 500 on the first /sync call instead of loudly at boot.
+    from app.models import (  # noqa
+        user, profile, library, bite, streak, push_token, user_data, bug_report,
+    )
     Base.metadata.create_all(bind=engine)
     _run_migrations()
 
@@ -98,6 +106,16 @@ def _run_migrations():
         # chat / completions — read paths are always scoped to one user+book
         "CREATE INDEX IF NOT EXISTS ix_chat_messages_user_book ON chat_messages (user_id, book_id)",
         "CREATE INDEX IF NOT EXISTS ix_completions_user_book ON completions (user_id, book_id)",
+        # daily_bites / saved_bites — these were applied to PRODUCTION BY HAND on
+        # 2026-07-16 and never declared anywhere in code, so a fresh database
+        # (local dev, a restore, a second environment) silently didn't get them —
+        # and the IntegrityError handling that depends on them
+        # (session_service.generate_session_for_item, POST /bites/{id}/save)
+        # became dead code that could never fire. Re-running them here is a
+        # no-op on prod, where they already exist.
+        "CREATE UNIQUE INDEX IF NOT EXISTS uq_daily_bites_user_item_date "
+        "ON daily_bites (user_id, library_item_id, date) WHERE library_item_id IS NOT NULL",
+        "CREATE UNIQUE INDEX IF NOT EXISTS uq_saved_bites_user_bite ON saved_bites (user_id, bite_id)",
     ]
 
     applied, failed = 0, 0
