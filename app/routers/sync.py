@@ -17,16 +17,18 @@ destroyed on 2026-07-25 by a blob-replace sync):
 """
 
 import base64
+import json
 import logging
 from datetime import datetime
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.database import get_db
 from app.middleware.auth import get_current_user
 from app.models.user import User
+from app.rate_limit import limiter
 from app.models.user_data import (
     ChatMessage, Completion, Highlight, Note, UserSettings, UserState,
 )
@@ -41,6 +43,19 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/sync", tags=["sync"])
 
 MAX_CHAT_PER_BOOK = 200     # generous; the app keeps 40 locally
+
+# Every /sync write used to carry NO rate limit, while every other write path
+# in the API had one — and the outbox retries on every app foreground, so a
+# client-side loop bug would have hammered Postgres and S3 unthrottled. These
+# are keyed by Firebase uid (see app/rate_limit.py) and set far above real
+# usage: a heavy session is tens of writes, not hundreds.
+SYNC_WRITE_LIMIT = "600/hour"
+SYNC_AVATAR_LIMIT = "30/hour"   # each one is a multi-MB body and an S3 PUT
+SYNC_READ_LIMIT = "120/hour"    # /sync/all runs on init, ~hourly per device
+
+# review_state is an opaque client blob, so bound it by serialised size rather
+# than by shape. ReviewScreen's real runs are a few KB.
+MAX_REVIEW_STATE_BYTES = 256_000
 
 
 def _settings_row(user: User, db: Session) -> UserSettings:
@@ -66,7 +81,9 @@ def _state_row(user: User, db: Session) -> UserState:
 # ── Restore ──────────────────────────────────────────────────────────────────
 
 @router.get("/all", response_model=SyncAllOut)
+@limiter.limit(SYNC_READ_LIMIT)
 def sync_all(
+    request: Request,
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
@@ -113,8 +130,10 @@ def sync_all(
 # ── Notes ────────────────────────────────────────────────────────────────────
 
 @router.put("/notes", response_model=NoteOut)
+@limiter.limit(SYNC_WRITE_LIMIT)
 def upsert_note(
     data: NoteIn,
+    request: Request,
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
@@ -157,8 +176,10 @@ def upsert_note(
 
 
 @router.delete("/notes/{note_id}")
+@limiter.limit(SYNC_WRITE_LIMIT)
 def delete_note(
     note_id: str,
+    request: Request,
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
@@ -170,8 +191,10 @@ def delete_note(
 # ── Highlights ───────────────────────────────────────────────────────────────
 
 @router.put("/highlights", response_model=HighlightOut)
+@limiter.limit(SYNC_WRITE_LIMIT)
 def upsert_highlight(
     data: HighlightIn,
+    request: Request,
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
@@ -184,7 +207,15 @@ def upsert_highlight(
         )
         .first()
     )
-    if not row:
+    if row:
+        # Refresh the snapshotted card text, the same way upsert_note does.
+        # This branch used to be a no-op, so a highlight kept the wording of
+        # whichever deck first created it — visibly stale once a session was
+        # regenerated, and inconsistent with notes for no reason.
+        for f in ("book_title", "book_color", "card_eyebrow", "card_title", "card_body"):
+            setattr(row, f, getattr(data, f))
+        db.commit()
+    else:
         payload = {k: v for k, v in data.model_dump().items() if k != "id"}
         row = Highlight(**payload, user_id=current_user.id)
         if data.id:
@@ -210,8 +241,10 @@ def upsert_highlight(
 
 
 @router.delete("/highlights/{highlight_id}")
+@limiter.limit(SYNC_WRITE_LIMIT)
 def delete_highlight(
     highlight_id: str,
+    request: Request,
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
@@ -225,8 +258,10 @@ def delete_highlight(
 # ── Chat ─────────────────────────────────────────────────────────────────────
 
 @router.post("/chat", response_model=ChatMessageOut)
+@limiter.limit(SYNC_WRITE_LIMIT)
 def append_chat(
     data: ChatMessageIn,
+    request: Request,
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
@@ -270,8 +305,10 @@ def append_chat(
 
 
 @router.delete("/chat/{book_id}")
+@limiter.limit(SYNC_WRITE_LIMIT)
 def clear_chat(
     book_id: str,
+    request: Request,
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
@@ -285,8 +322,10 @@ def clear_chat(
 # ── Completions ──────────────────────────────────────────────────────────────
 
 @router.post("/completions", response_model=CompletionOut)
+@limiter.limit(SYNC_WRITE_LIMIT)
 def add_completion(
     data: CompletionIn,
+    request: Request,
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
@@ -314,8 +353,10 @@ def add_completion(
 # ── Settings ─────────────────────────────────────────────────────────────────
 
 @router.patch("/settings", response_model=SettingsOut)
+@limiter.limit(SYNC_WRITE_LIMIT)
 def patch_settings(
     data: SettingsIn,
+    request: Request,
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
@@ -332,13 +373,32 @@ def patch_settings(
 # ── State ────────────────────────────────────────────────────────────────────
 
 @router.patch("/state", response_model=StateOut)
+@limiter.limit(SYNC_WRITE_LIMIT)
 def patch_state(
     data: StateIn,
+    request: Request,
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
     row = _state_row(current_user, db)
     payload = data.model_dump(exclude_unset=True)
+
+    # review_state is an opaque client blob — it can't be schema-validated
+    # without freezing ReviewScreen's internals, but leaving it completely
+    # unbounded means one buggy client can push an arbitrarily large JSON
+    # document into a single row.
+    review = payload.get("review_state")
+    if review is not None:
+        try:
+            size = len(json.dumps(review))
+        except (TypeError, ValueError):
+            raise HTTPException(status_code=400, detail="review_state must be JSON-serialisable.")
+        if size > MAX_REVIEW_STATE_BYTES:
+            raise HTTPException(
+                status_code=413,
+                detail=f"review_state is too large ({size} bytes).",
+            )
+
     # Quiz counters only ever go UP. A device that has been offline holds a
     # stale, lower count; letting it write that back would silently erase
     # answers recorded from another device.
@@ -355,8 +415,10 @@ def patch_state(
 # ── Identity ─────────────────────────────────────────────────────────────────
 
 @router.patch("/identity")
+@limiter.limit(SYNC_WRITE_LIMIT)
 def patch_identity(
     data: IdentityIn,
+    request: Request,
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
@@ -381,8 +443,10 @@ def patch_identity(
 
 
 @router.put("/avatar")
+@limiter.limit(SYNC_AVATAR_LIMIT)
 def put_avatar(
     data: AvatarIn,
+    request: Request,
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
@@ -413,7 +477,9 @@ def put_avatar(
 
 
 @router.delete("/avatar")
+@limiter.limit(SYNC_AVATAR_LIMIT)
 def delete_avatar(
+    request: Request,
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):

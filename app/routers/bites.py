@@ -2,7 +2,7 @@ from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks, Request
 from sqlalchemy.orm import Session, joinedload
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy import or_
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from typing import Optional, List
 from pydantic import BaseModel
 from app.database import get_db
@@ -19,6 +19,11 @@ import uuid
 
 router = APIRouter(prefix="/bites", tags=["bites"])
 settings = get_settings()
+
+# Window the free/premium generation cap is counted over, on the SERVER clock.
+# Matches notification_service.NIBBLE_LOCK_HOURS so the tap path and the
+# scheduler agree on what "one day's worth" means.
+CAP_WINDOW_HOURS = 23
 
 # ── Per-book session generation (July 2026) ───────────────────────────────
 # The generation logic lives in app/services/session_service.py (shared with
@@ -142,9 +147,20 @@ def get_or_create_session(
         if current_user.effective_premium
         else settings.free_bites_per_day
     )
+    # Counted over a rolling window of SERVER-CLOCK generated_at, not over the
+    # row's `date`. `date` comes from the client (_effective_today accepts any
+    # client_date within ±1 day, correctly, so the row is labelled in the
+    # user's own timezone) — but counting on it meant a client sending
+    # TOMORROW's date got a fresh, empty cap bucket. A free user could pull 3
+    # real Claude generations per calendar day instead of 1, and a premium user
+    # 9, just by lying about the date. generated_at is server-set and
+    # unforgeable. 23h rather than 24h for the same reason the scheduler uses
+    # NIBBLE_LOCK_HOURS: an unchanged daily cadence is ~24h apart, and a strict
+    # 24h would block it on ordinary jitter.
+    window_start = datetime.utcnow() - timedelta(hours=CAP_WINDOW_HOURS)
     todays_generations = db.query(DailyBite).filter(
         DailyBite.user_id == current_user.id,
-        DailyBite.date == today,
+        DailyBite.generated_at >= window_start,
     ).count()
     if todays_generations >= cap:
         raise HTTPException(

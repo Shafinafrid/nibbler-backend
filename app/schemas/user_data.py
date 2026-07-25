@@ -1,21 +1,32 @@
 from datetime import date as date_cls, datetime
-from typing import Any, List, Optional
+from typing import Any, List, Literal, Optional
 
 from pydantic import BaseModel, ConfigDict, Field
+
+# Shared bounds. These endpoints take client-supplied strings straight into
+# PostgreSQL, and until 2026-07-25 almost none of them were bounded — a buggy
+# or hostile client could push arbitrarily large rows. Every limit here is far
+# above anything the app can actually produce.
+_ID = Field(default=None, max_length=64)
+_BOOK_ID = Field(max_length=64)
+_TITLE = Field(default=None, max_length=300)
+_COLOR = Field(default=None, max_length=32)
+_CARD_TEXT = Field(default=None, max_length=20_000)
+_CARD_INDEX = Field(ge=0, le=10_000)
 
 
 # ── Notes ────────────────────────────────────────────────────────────────────
 
 class NoteIn(BaseModel):
-    id: Optional[str] = None          # client-generated; server mints one if absent
-    book_id: str
-    book_title: Optional[str] = None
-    book_color: Optional[str] = None
-    card_index: int
-    card_eyebrow: Optional[str] = None
-    card_title: Optional[str] = None
-    card_body: Optional[str] = None
-    text: str
+    id: Optional[str] = _ID           # client-generated; server mints one if absent
+    book_id: str = _BOOK_ID
+    book_title: Optional[str] = _TITLE
+    book_color: Optional[str] = _COLOR
+    card_index: int = _CARD_INDEX
+    card_eyebrow: Optional[str] = _TITLE
+    card_title: Optional[str] = _TITLE
+    card_body: Optional[str] = _CARD_TEXT
+    text: str = Field(max_length=20_000)
 
 
 class NoteOut(BaseModel):
@@ -35,14 +46,14 @@ class NoteOut(BaseModel):
 # ── Highlights ───────────────────────────────────────────────────────────────
 
 class HighlightIn(BaseModel):
-    id: Optional[str] = None
-    book_id: str
-    book_title: Optional[str] = None
-    book_color: Optional[str] = None
-    card_index: int
-    card_eyebrow: Optional[str] = None
-    card_title: Optional[str] = None
-    card_body: Optional[str] = None
+    id: Optional[str] = _ID
+    book_id: str = _BOOK_ID
+    book_title: Optional[str] = _TITLE
+    book_color: Optional[str] = _COLOR
+    card_index: int = _CARD_INDEX
+    card_eyebrow: Optional[str] = _TITLE
+    card_title: Optional[str] = _TITLE
+    card_body: Optional[str] = _CARD_TEXT
 
 
 class HighlightOut(BaseModel):
@@ -61,10 +72,12 @@ class HighlightOut(BaseModel):
 # ── Chat ─────────────────────────────────────────────────────────────────────
 
 class ChatMessageIn(BaseModel):
-    id: Optional[str] = None
-    book_id: str
-    role: str
-    content: str
+    id: Optional[str] = _ID
+    book_id: str = _BOOK_ID
+    # Anything other than these two would render as an unknown bubble in the
+    # app and confuse any future prompt that replays this history.
+    role: Literal["user", "assistant"]
+    content: str = Field(max_length=20_000)
     ts: Optional[int] = None          # client epoch millis
 
 
@@ -80,10 +93,10 @@ class ChatMessageOut(BaseModel):
 # ── Completions ──────────────────────────────────────────────────────────────
 
 class CompletionIn(BaseModel):
-    id: Optional[str] = None
-    book_id: str
+    id: Optional[str] = _ID
+    book_id: str = _BOOK_ID
     completed_date: date_cls
-    read_length: Optional[int] = None
+    read_length: Optional[int] = Field(default=None, ge=1, le=120)
 
 
 class CompletionOut(BaseModel):
@@ -98,16 +111,23 @@ class CompletionOut(BaseModel):
 
 class SettingsIn(BaseModel):
     """Every field optional: the app PATCHes just what changed, so a client
-    that doesn't know about a newer setting can never blank it."""
-    read_length: Optional[int] = None
-    delivery_hour: Optional[int] = None
-    delivery_minute: Optional[int] = None
+    that doesn't know about a newer setting can never blank it.
+
+    NB: `None` and "absent" are different here. `patch_settings` uses
+    `exclude_unset=True`, so an omitted field is untouched — these bounds only
+    apply to fields the client actually sent.
+    """
+    read_length: Optional[int] = Field(default=None, ge=1, le=120)
+    delivery_hour: Optional[int] = Field(default=None, ge=0, le=23)
+    delivery_minute: Optional[int] = Field(default=None, ge=0, le=59)
     daily_quiz: Optional[bool] = None
     streak_alerts: Optional[bool] = None
     dark_mode: Optional[bool] = None
     sound_enabled: Optional[bool] = None
-    active_book_ids: Optional[List[str]] = None
-    inactive_order: Optional[List[str]] = None
+    # An empty list is MEANINGFUL (every source switched off) and must stay
+    # distinguishable from an omitted field — see restoreFromServer.
+    active_book_ids: Optional[List[str]] = Field(default=None, max_length=50)
+    inactive_order: Optional[List[str]] = Field(default=None, max_length=500)
 
 
 class SettingsOut(BaseModel):
@@ -124,9 +144,13 @@ class SettingsOut(BaseModel):
 
 
 class StateIn(BaseModel):
+    # review_state is an opaque client blob (deck order, position, per-card
+    # results). It can't be schema'd without freezing ReviewScreen's internals,
+    # but it MUST be bounded — a runaway client could otherwise push an
+    # unbounded JSON document into a single row. Enforced in patch_state.
     review_state: Optional[Any] = None
-    quiz_attempts: Optional[int] = None
-    quiz_correct: Optional[int] = None
+    quiz_attempts: Optional[int] = Field(default=None, ge=0)
+    quiz_correct: Optional[int] = Field(default=None, ge=0)
 
 
 class StateOut(BaseModel):
