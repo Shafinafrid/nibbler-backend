@@ -11,10 +11,11 @@ suggested status_code) instead of FastAPI HTTPException, so the scheduler can
 use it without a request context.
 """
 
+import re
 import uuid
 import logging
 from datetime import date as date_cls
-from typing import Optional
+from typing import List, Optional
 
 from sqlalchemy.orm import Session
 from sqlalchemy.exc import IntegrityError
@@ -40,6 +41,60 @@ class SessionGenerationError(Exception):
         super().__init__(message)
         self.message = message
         self.status_code = status_code
+
+
+def _slice_words(text: str, start: int, count: int) -> str:
+    """The slice of `text` covering words [start, start+count) — with every
+    space, line break and blank line between them left exactly as written.
+
+    Story progress is stored as a word offset, and the old implementation
+    resolved it with `" ".join(text.split()[a:b])`, which threw away every
+    paragraph break in the book before the text was ever shown to the reader.
+    Word offsets stay valid here: `\\S+` tokenises identically to `str.split()`.
+    """
+    spans = [m.span() for m in re.finditer(r"\S+", text)]
+    if start >= len(spans):
+        return ""
+    end = min(start + count, len(spans))
+    return text[spans[start][0]:spans[end - 1][1]]
+
+
+def _paragraphs(text: str) -> List[str]:
+    """Blank-line-separated paragraphs, each with its internal line breaks
+    (dialogue, verse, lists) intact."""
+    return [p.strip("\n") for p in re.split(r"\n[ \t]*\n", text) if p.strip()]
+
+
+def split_story_cards(excerpt: str, card_target: int) -> List[str]:
+    """Cut today's portion into `card_target` card bodies at paragraph
+    boundaries, balanced by word count. Purely mechanical — no model touches
+    the text, so what the reader sees is byte-for-byte the author's."""
+    paras = _paragraphs(excerpt)
+    if not paras:
+        return []
+    if len(paras) <= card_target:
+        return paras
+
+    counts = [len(p.split()) for p in paras]
+    per_card = sum(counts) / card_target
+    cards: List[str] = []
+    cur: List[str] = []
+    cur_words = 0
+    for i, para in enumerate(paras):
+        cur.append(para)
+        cur_words += counts[i]
+        remaining_paras = len(paras) - i - 1
+        remaining_cards = card_target - len(cards) - 1
+        # Close this card once it has its share — unless the paragraphs left
+        # are only just enough to fill the cards left.
+        if remaining_cards > 0 and (
+            cur_words >= per_card or remaining_paras <= remaining_cards
+        ):
+            cards.append("\n\n".join(cur))
+            cur, cur_words = [], 0
+    if cur:
+        cards.append("\n\n".join(cur))
+    return cards
 
 
 def _profile_query(profile: dict) -> str:
@@ -100,16 +155,39 @@ def generate_session_for_item(
             }
         else:
             n = STORY_WORDS[read_length]
-            excerpt = " ".join(words[progress:progress + n])
+            excerpt = _slice_words(item.content or "", progress, n)
             part_number = progress // n + 1
+            bodies = split_story_cards(excerpt, max(3, card_target - 1))
+            if not bodies:
+                raise SessionGenerationError("No readable text stored for this book.", 422)
+            # The model never carries the prose — it only names what it reads.
+            # Story mode's whole promise is the book itself, so a paraphrase or
+            # a silently reflowed paragraph is a bug, not a style choice.
             try:
-                result = claude.generate_story_session(
+                meta = claude.generate_story_metadata(
                     book_title=item.title, author=item.author,
-                    excerpt=excerpt, card_target=max(3, card_target - 1),
-                    part_number=part_number,
+                    card_bodies=bodies, part_number=part_number,
                 )
             except Exception as e:
-                raise SessionGenerationError(f"Session generation failed: {e}", 502)
+                logger.warning("Story metadata failed (%s) — serving plain headings", e)
+                meta = {}
+            headings = meta.get("headings") or []
+            result = {
+                "title": meta.get("title") or f"{item.title} — part {part_number}",
+                "chapter": f"PART {part_number}",
+                "headline": meta.get("headline") or "Today's portion of your book.",
+                "preview": meta.get("preview") or "",
+                "cards": [
+                    {
+                        "kind": "story",
+                        "eyebrow": "TODAY'S READING" if i == 0 else "THE STORY CONTINUES",
+                        "title": headings[i] if i < len(headings) else "",
+                        "body": body,
+                    }
+                    for i, body in enumerate(bodies)
+                ],
+                "quiz": None,
+            }
             item.story_progress = min(progress + n, len(words))
     else:
         profile = profile or {}

@@ -31,6 +31,9 @@ Card shapes (kind determines shape):
 Deck structure: hook first, summary last, one interaction card (quiz OR prompt per the instruction you
 receive) second-to-last, all remaining cards are insights. Card bodies: 90-160 words, warm, concrete,
 faithful to the source excerpts — never invent facts not present in them. Use \\n\\n between paragraphs.
+Whenever you quote the source (including the "highlight" pull-quote), reproduce it EXACTLY as it appears
+in the excerpt — same words, same punctuation, and keep its paragraph and dialogue line breaks as \\n.
+Never merge two of the author's paragraphs into one run of text.
 
 PERSONALIZATION (critical): the user's growth profile is provided. In EXACTLY ONE insight card, append a
 final short paragraph that explicitly ties the idea to their stated goal or their answer about how they
@@ -43,24 +46,24 @@ Review tab, so questions must stand alone without seeing the cards. Keep quiz qu
 each option ≤ 12 words: they are answered as quick recall taps, not reading exercises. Explanations
 stay 1-2 tight sentences."""
 
-STORY_SYSTEM = """You are Nibbler's story engine. The user reads a book in "story mode": sequential,
-faithful, no personalization — the book itself, served in daily portions.
+STORY_SYSTEM = """You are Nibbler's story engine. The user reads a book in "story mode": sequential and
+faithful — the book itself, served in daily portions.
 
-You receive the next raw excerpt of the book (extracted text, possibly messy). Clean it and split it into
-a card deck. Respond ONLY with valid JSON, no markdown fences:
+The app has ALREADY cut today's portion into cards and will show the author's text verbatim. You never
+reproduce, rewrite, shorten or clean that text; you only name it. You receive each card's text and return
+titling for it.
+
+Respond ONLY with valid JSON, no markdown fences:
 {
   "title": "short evocative title for today's portion (4-8 words)",
-  "chapter": "PART N" (N provided in the instruction),
   "headline": "one line that sets the scene for today's reading (max 16 words)",
   "preview": "1-2 sentence teaser of today's portion (max 35 words)",
-  "cards": [ {"kind":"story","eyebrow":"THE STORY CONTINUES","title":"short section heading","body":"the text"}, ... ]
+  "headings": ["short section heading for card 1", "... one per card, in order ..."]
 }
 
-Rules: preserve the author's actual words and order — you may fix broken hyphenation/whitespace and drop
-page furniture (page numbers, headers), and lightly bridge a cut sentence, but never rewrite, summarize,
-or add commentary. Split into the requested number of cards at natural pauses. First card's eyebrow is
-"TODAY'S READING" instead of "THE STORY CONTINUES". End the last card's body with the sentence where the
-excerpt ends — no cliffhanger text of your own."""
+Rules: exactly one heading per card, 2-6 words each, drawn from what actually happens in that card. Never
+spoil a later card, never add commentary, never mention page numbers or the app. If the book names the
+chapter, you may use it for "title". Write "headings" in the same language as the excerpt."""
 
 
 ASPIRATION_SYSTEM = """You are the onboarding interpreter for Nibbler, a personalized learning app.
@@ -332,32 +335,39 @@ Build today's session JSON now."""
         )
         return response.content[0].text.strip()
 
-    def generate_story_session(
+    def generate_story_metadata(
         self,
         book_title: str,
         author: Optional[str],
-        excerpt: str,
-        card_target: int,
+        card_bodies: list[str],
         part_number: int,
     ) -> dict:
-        """Sequential story-mode portion — faithful text, no personalization."""
+        """Titling for a story portion the app has already cut, verbatim.
+
+        The excerpt used to be sent through the model and echoed back as card
+        bodies — which is how paragraph breaks and dialogue lines disappeared
+        from a reader's book. Now the text never leaves the server: the model
+        sees it only to name each card, and its prose output is discarded.
+        """
+        cards_msg = "\n\n".join(
+            f"--- card {i + 1} ---\n{b[:1200]}" for i, b in enumerate(card_bodies)
+        )
         user_msg = f"""SOURCE: "{book_title}"{f' by {author}' if author else ''}
-This is PART {part_number} of the user's sequential read.
-Split into {card_target} cards.
+This is PART {part_number} of the user's sequential read. There are {len(card_bodies)} cards, so return
+exactly {len(card_bodies)} headings.
 
-RAW EXCERPT:
-{excerpt}
+{cards_msg}
 
-Build today's portion JSON now."""
+Return the titling JSON now."""
 
         response = self.client.messages.create(
             model=self.model,
-            # Story cards carry the excerpt text through: budget ~600 tokens
-            # per card plus headroom (excerpts are 1100-3300 words).
-            max_tokens=min(8000, 2000 + card_target * 600),
+            # Output is only a title, headline, preview and N short headings.
+            max_tokens=300 + len(card_bodies) * 40,
             system=[{"type": "text", "text": STORY_SYSTEM, "cache_control": {"type": "ephemeral"}}],
             messages=[{"role": "user", "content": user_msg}],
         )
         result = self._parse_json(response.content[0].text)
-        result["quiz"] = None
+        headings = result.get("headings")
+        result["headings"] = [str(h) for h in headings] if isinstance(headings, list) else []
         return result

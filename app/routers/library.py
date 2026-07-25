@@ -326,8 +326,7 @@ def process_pdf_embeddings(item_id: str, pdf_bytes: bytes, user_id: str):
     Pinecone. Works straight from the request payload — no S3 round-trip,
     so processing succeeds even when file archival is unavailable."""
     from app.database import SessionLocal
-    import PyPDF2
-    import io
+    from app.services.text_extract import pdf_to_structured_text
 
     db = SessionLocal()
     try:
@@ -348,9 +347,11 @@ def process_pdf_embeddings(item_id: str, pdf_bytes: bytes, user_id: str):
         except Exception as e:
             print(f"[process_pdf_embeddings] S3 archive skipped: {e}")
 
-        reader = PyPDF2.PdfReader(io.BytesIO(pdf_bytes))
-        text = " ".join(page.extract_text() or "" for page in reader.pages)
-        text = text[: settings.max_extracted_text_chars]
+        # Paragraph-preserving extraction: story mode serves this text to the
+        # reader verbatim, so the author's paragraph and dialogue breaks have to
+        # survive. Joining pages with " " (what this used to do) turned every
+        # book into one run-on block.
+        text = pdf_to_structured_text(pdf_bytes, settings.max_extracted_text_chars)
 
         if not text.strip():
             item.processed = False
@@ -413,11 +414,12 @@ def _extract_epub_text(epub_bytes: bytes) -> str:
     except ImportError:
         pass
 
+    from app.services.text_extract import epub_doc_paragraphs
+
     def doc_text(raw: bytes) -> str:
-        soup = BeautifulSoup(raw, "html.parser")
-        for tag in soup(["script", "style", "nav"]):
-            tag.decompose()
-        return soup.get_text(separator="\n", strip=True)
+        # Block-level walk, not get_text(separator="\n"): that separator fires
+        # at every inline <em>/<a> too, chopping single sentences into lines.
+        return "\n\n".join(epub_doc_paragraphs(raw))
 
     with zipfile.ZipFile(io.BytesIO(epub_bytes)) as zf:
         names = set(zf.namelist())
