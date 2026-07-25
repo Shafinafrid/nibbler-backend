@@ -1,12 +1,16 @@
 from fastapi import Depends, HTTPException, Request, status
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 import firebase_admin
 from firebase_admin import auth as firebase_auth, credentials
 from app.database import get_db
 from app.models.user import User
 from app.config import get_settings
+import logging
 import uuid
+
+logger = logging.getLogger(__name__)
 
 settings = get_settings()
 security = HTTPBearer()
@@ -57,7 +61,34 @@ def get_or_create_user(decoded_token: dict, db: Session) -> User:
             display_name=decoded_token.get("name"),
         )
         db.add(user)
-        db.commit()
+        try:
+            db.commit()
+        except IntegrityError:
+            # This check-then-insert isn't atomic, and AppContext.init() fires
+            # several authenticated calls in parallel right after sign-in —
+            # each one independently lands here on a brand-new account, so
+            # more than one can race to create the same row. Previously this
+            # surfaced as a bare, undiagnosable 500 on every endpoint (found
+            # 2026-07-25 chasing what looked like an unrelated upload bug: a
+            # real user had 7 of these racing in two bursts, ~20s apart).
+            db.rollback()
+            existing = db.query(User).filter(User.id == firebase_uid).first()
+            if existing:
+                # A concurrent request for this SAME uid won the race — fine,
+                # use its row.
+                return existing
+            # Not a self-race: a DIFFERENT Firebase uid already owns this
+            # email (e.g. an orphaned row left behind by a Firebase-side
+            # account deletion/recreation that bypassed the app's own
+            # DELETE /auth/me, which cleans up both sides together).
+            logger.error(
+                "get_or_create_user: uid %s can't register — email %r already "
+                "belongs to a different account", firebase_uid, decoded_token.get("email"),
+            )
+            raise HTTPException(
+                status_code=409,
+                detail="This email is already linked to a different Nibbler account. Contact support to sort this out.",
+            )
         db.refresh(user)
 
     return user
