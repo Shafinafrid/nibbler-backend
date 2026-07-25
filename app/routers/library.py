@@ -414,7 +414,7 @@ def _extract_epub_text(epub_bytes: bytes) -> str:
     except ImportError:
         pass
 
-    from app.services.text_extract import epub_doc_paragraphs
+    from app.services.text_extract import epub_doc_paragraphs, strip_front_matter
 
     def doc_text(raw: bytes) -> str:
         # Block-level walk, not get_text(separator="\n"): that separator fires
@@ -452,7 +452,9 @@ def _extract_epub_text(epub_bytes: bytes) -> str:
                     parts.append(t)
             except Exception:
                 continue
-        return "\n\n".join(parts)
+        # Drop the cover blurb / praise pages / imprint page / contents so a
+        # story-mode reader's first day is the book, not its copyright notice.
+        return strip_front_matter("\n\n".join(parts))
 
 
 def process_epub_embeddings(item_id: str, epub_bytes: bytes, user_id: str):

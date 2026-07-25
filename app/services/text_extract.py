@@ -147,7 +147,93 @@ def pdf_to_structured_text(pdf_bytes: bytes, max_chars: int) -> str:
         if sum(len(p) + 2 for p in out) >= max_chars:
             break
 
-    return '\n\n'.join(out)[:max_chars]
+    return '\n\n'.join(out[find_body_start(out):])[:max_chars]
+
+
+# ── Front matter ─────────────────────────────────────────────────────────────
+# Every book file opens with material nobody wants served as their daily read:
+# a cover blurb, pages of press quotes, the title page, the imprint/copyright
+# page, a table of contents. Story mode reads from word 0, so without this the
+# first few days of a book are its copyright page.
+
+# Legal boilerplate that only ever appears on a copyright page. Counts as front
+# matter however long the paragraph is.
+_LEGAL = re.compile(
+    r'all rights reserved|no part of this publication|supports copyright'
+    r'|limit of liability|disclaimer of warrant|moral right of the author'
+    r'|a cip catalogue|british library cataloguing|without the prior permission',
+    re.I,
+)
+
+# Weaker hints. A book's own prose says "first published in 1997" or names its
+# publisher all the time, so these only count on a SHORT line — the shape front
+# matter actually has. Counting them anywhere dragged the start 100 paragraphs
+# into an author's introduction.
+_FRONT_HINT = re.compile(
+    r'copyright ©|©\s*\d{4}|isbn|first published|typeset by|printed and bound'
+    r'|imprint of|published by|random house|bloomsbury|digital edition'
+    r'|trademark|^contents$|^table of contents$|^copyright$|^title page$',
+    re.I,
+)
+
+
+def _is_front_matter(para: str) -> bool:
+    if _LEGAL.search(para):
+        return True
+    return len(para.split()) < PROSE_WORDS and bool(_FRONT_HINT.search(para))
+
+_CHAPTER_RE = re.compile(
+    r'^(chapter\s+\S{1,12}|prologue|preface|foreword|introduction(\s*[:—-].{0,60})?'
+    r'|part\s+(one|two|three|four|five|\d{1,2}|[ivxlc]{1,5}))\s*$',
+    re.I,
+)
+
+PROSE_WORDS = 45           # what a real body paragraph looks like
+FRONT_MATTER_LIMIT = 0.15  # refuse to skip more than this much of the book
+FRONT_MATTER_MAX = 150     # ...and never more than this many paragraphs. A long
+                           # book mentions publishers and ISBNs in its own text;
+                           # without an absolute cap, one footnote about a
+                           # publisher dragged the start 38% into the book.
+
+
+def find_body_start(paras: List[str]) -> int:
+    """Index of the paragraph where the book actually begins.
+
+    Deliberately conservative — it only skips anything when the text carries an
+    unmistakable front-matter signal (a copyright/imprint line), and it gives up
+    rather than skip a large fraction of the file. Serving a page of front
+    matter is a bad day; swallowing the first chapter is a much worse one.
+    """
+    if not paras:
+        return 0
+
+    limit = min(len(paras), max(20, int(len(paras) * FRONT_MATTER_LIMIT)), FRONT_MATTER_MAX)
+    last_signal = -1
+    for i in range(limit):
+        if _is_front_matter(paras[i]):
+            last_signal = i
+    if last_signal < 0:
+        return 0          # no imprint page — not a published book, leave it alone
+
+    for i in range(last_signal + 1, limit):
+        para = paras[i]
+        if _is_front_matter(para):
+            continue      # still inside the front matter
+        # A chapter heading counts only when real prose follows it — otherwise
+        # every line of the table of contents looks like one.
+        if _CHAPTER_RE.match(para) and any(
+            len(paras[j].split()) >= PROSE_WORDS
+            for j in range(i + 1, min(i + 3, len(paras)))
+        ):
+            return i
+        if len(para.split()) >= PROSE_WORDS:
+            return i
+    return 0
+
+
+def strip_front_matter(text: str) -> str:
+    paras = [p for p in re.split(r"\n[ \t]*\n", text) if p.strip()]
+    return "\n\n".join(paras[find_body_start(paras):])
 
 
 # ── EPUB ─────────────────────────────────────────────────────────────────────
