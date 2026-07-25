@@ -10,8 +10,10 @@ from app.services.s3_service import S3Service
 from app.services.embedding_service import EmbeddingService, EmbeddingError
 from app.services.url_safety import UnsafeUrlError, validate_public_url, fetch_public_url
 from app.config import get_settings
+import logging
 import uuid
 
+logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/library", tags=["library"])
 settings = get_settings()
 
@@ -107,49 +109,62 @@ def upload_pdf(
         status_code=413,
         detail=f"Files up to {settings.max_pdf_upload_mb} MB are supported — this file is larger.",
     )
-    # Fast reject on the declared size, then enforce for real while reading in
-    # chunks — one unbounded read() of a huge file can OOM the whole server.
-    if file.size and file.size > max_bytes:
-        raise too_large
 
-    chunks, size = [], 0
-    # Sync handler (runs in FastAPI's threadpool) — read the spooled temp file
-    # via the underlying file object.
-    while chunk := file.file.read(1024 * 1024):
-        size += len(chunk)
-        if size > max_bytes:
+    # Everything below used to be able to fail as a bare, undiagnosable 500
+    # (Starlette's default handler returns plain text, not JSON — the app has
+    # no `detail` to show, so it fell back to a generic "Upload failed" with
+    # the real cause thrown away). Found 2026-07-25 after a repeatable EPUB
+    # upload failure that couldn't be diagnosed without this.
+    try:
+        # Fast reject on the declared size, then enforce for real while reading
+        # in chunks — one unbounded read() of a huge file can OOM the server.
+        if file.size and file.size > max_bytes:
             raise too_large
-        chunks.append(chunk)
-    file_content = b"".join(chunks)
-    # join() briefly holds TWO full copies of the file; at the 50 MB cap that
-    # is 100 MB of the Railway process's RAM per concurrent upload. Drop the
-    # chunk list immediately so the peak lasts microseconds, not the whole
-    # request.
-    chunks.clear()
-    if not file_content:
-        raise HTTPException(status_code=400, detail="That file appears to be empty.")
 
-    # Respond as soon as the bytes have arrived — S3 archival AND text
-    # extraction/embedding all happen in the background task, so the app
-    # never waits on Claude, Pinecone, or a slow/broken AWS setup.
-    import re as _re
-    clean_title = _re.sub(r"\.(pdf|epub)$", "", file.filename or "", flags=_re.IGNORECASE)
-    item = LibraryItem(
-        id=str(uuid.uuid4()),
-        user_id=current_user.id,
-        title=(title or clean_title).strip(),
-        type="epub" if is_epub else "pdf",
-        file_url=None,
-        file_size=len(file_content),
-        mode=mode or "wisdom",
-        kind=kind or "book",
-        author=author,
-        growth_profile_name=growth_profile_name if (mode or "wisdom") == "wisdom" else None,
-        processed=False,
-    )
-    db.add(item)
-    db.commit()
-    db.refresh(item)
+        chunks, size = [], 0
+        # Sync handler (runs in FastAPI's threadpool) — read the spooled temp
+        # file via the underlying file object.
+        while chunk := file.file.read(1024 * 1024):
+            size += len(chunk)
+            if size > max_bytes:
+                raise too_large
+            chunks.append(chunk)
+        file_content = b"".join(chunks)
+        # join() briefly holds TWO full copies of the file; at the 50 MB cap
+        # that is 100 MB of the Railway process's RAM per concurrent upload.
+        # Drop the chunk list immediately so the peak lasts microseconds, not
+        # the whole request.
+        chunks.clear()
+        if not file_content:
+            raise HTTPException(status_code=400, detail="That file appears to be empty.")
+
+        # Respond as soon as the bytes have arrived — S3 archival AND text
+        # extraction/embedding all happen in the background task, so the app
+        # never waits on Claude, Pinecone, or a slow/broken AWS setup.
+        import re as _re
+        clean_title = _re.sub(r"\.(pdf|epub)$", "", file.filename or "", flags=_re.IGNORECASE)
+        item = LibraryItem(
+            id=str(uuid.uuid4()),
+            user_id=current_user.id,
+            title=(title or clean_title).strip(),
+            type="epub" if is_epub else "pdf",
+            file_url=None,
+            file_size=len(file_content),
+            mode=mode or "wisdom",
+            kind=kind or "book",
+            author=author,
+            growth_profile_name=growth_profile_name if (mode or "wisdom") == "wisdom" else None,
+            processed=False,
+        )
+        db.add(item)
+        db.commit()
+        db.refresh(item)
+    except HTTPException:
+        raise
+    except Exception as e:
+        db.rollback()
+        logger.exception("upload_pdf: unexpected failure for user %s (%s)", current_user.id, fname)
+        raise HTTPException(status_code=500, detail=f"Upload failed: {str(e)[:300]}") from e
 
     task = process_epub_embeddings if is_epub else process_pdf_embeddings
     background_tasks.add_task(task, item.id, file_content, current_user.id)
