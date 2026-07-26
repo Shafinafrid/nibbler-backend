@@ -2,7 +2,7 @@ from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks, Request
 from sqlalchemy.orm import Session, joinedload
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy import or_
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from typing import Optional, List
 from pydantic import BaseModel
 from app.database import get_db
@@ -23,10 +23,54 @@ import uuid
 router = APIRouter(prefix="/bites", tags=["bites"])
 settings = get_settings()
 
-# Window the free/premium generation cap is counted over, on the SERVER clock.
-# Matches notification_service.NIBBLE_LOCK_HOURS so the tap path and the
-# scheduler agree on what "one day's worth" means.
+# Fallback window for the free/premium generation cap, on the SERVER clock, used
+# only when the user's timezone is unknown. Matches
+# notification_service.NIBBLE_LOCK_HOURS so the tap path and the scheduler agree.
 CAP_WINDOW_HOURS = 23
+
+
+def _cap_window(user: User):
+    """(window_start_utc, resets_at_utc) for this user's generation allowance.
+
+    Counting must use the SERVER clock — `date` comes from the client, so
+    bucketing on it let anyone claim tomorrow and get a fresh allowance. But a
+    flat rolling window has its own problem: it turns "1 per day" into "1 per
+    23 hours", so a free user who reads at 22:00 is refused at 09:00 the next
+    morning — on a day they haven't used at all.
+
+    `users.timezone` is recorded on every launch (PATCH /sync/identity), so when
+    it's known the cap is bucketed by the user's real local day: unforgeable
+    (still server-computed) *and* correct. Falls back to the rolling window when
+    the timezone is missing or unrecognised.
+    """
+    now = datetime.utcnow()
+    if user.timezone:
+        try:
+            from zoneinfo import ZoneInfo
+            tz = ZoneInfo(user.timezone)
+            local_now = datetime.now(tz)
+            local_midnight = local_now.replace(hour=0, minute=0, second=0, microsecond=0)
+            next_midnight = local_midnight + timedelta(days=1)
+            return (
+                local_midnight.astimezone(timezone.utc).replace(tzinfo=None),
+                next_midnight.astimezone(timezone.utc).replace(tzinfo=None),
+            )
+        except Exception:
+            pass   # unknown/invalid zone name, or no tzdata on the image
+    return now - timedelta(hours=CAP_WINDOW_HOURS), now + timedelta(hours=CAP_WINDOW_HOURS)
+
+
+def _cap_message(cap: int, resets_at: datetime) -> str:
+    """Say when the allowance actually lifts.
+
+    The old copy said "Come back tomorrow!" unconditionally, which was wrong
+    under a rolling window — a user refused at 09:00 was being told to wait a
+    day when the real answer was a few hours.
+    """
+    hours = max(1, round((resets_at - datetime.utcnow()).total_seconds() / 3600))
+    when = "tomorrow" if hours >= 12 else f"in about {hours} hour{'s' if hours != 1 else ''}"
+    unit = "bites" if cap > 1 else "bite"
+    return f"You've used today's {cap} {unit}. Come back {when}."
 
 # ── Per-book session generation (July 2026) ───────────────────────────────
 # The generation logic lives in app/services/session_service.py (shared with
@@ -48,7 +92,6 @@ class SessionRequest(BaseModel):
     library_item_id: str
     read_length: int = 5
     growth_profile: Optional[SessionProfile] = None
-    force_new: bool = False
     # The user's LOCAL date (YYYY-MM-DD) — the server day flips at UTC
     # midnight, which is mid-evening for the Americas. Accepted within ±1
     # day of the server date.
@@ -135,16 +178,19 @@ def get_or_create_session(
         DailyBite.library_item_id == item.id,
         DailyBite.date == today,
     ).first()
-    if existing and existing.cards and not data.force_new:
+    if existing and existing.cards:
         return _bite_to_session(existing)
-    if existing and data.force_new:
-        db.delete(existing)
-        db.commit()
+    # `force_new` used to live here: it hard-DELETED the existing row before
+    # regenerating, which freed its own quota slot (so the cap could be spent
+    # repeatedly), cascaded away any saved_bites row pointing at it, orphaned
+    # notes/highlights that referenced the bite id, and for story mode skipped
+    # content outright — story_progress had already advanced at generation time
+    # and was never rewound. Nothing in the app ever sent it. Removed rather
+    # than kept as a public field on an authenticated endpoint.
 
     # Daily generation caps (free 1 / premium 3, from config — previously
     # defined but never enforced). Re-opening today's existing sessions
-    # returns above without counting; force_new regenerates in place because
-    # the delete above already freed its slot.
+    # returns above without counting.
     cap = (
         settings.premium_bites_per_day
         if current_user.effective_premium
@@ -160,19 +206,22 @@ def get_or_create_session(
     # unforgeable. 23h rather than 24h for the same reason the scheduler uses
     # NIBBLE_LOCK_HOURS: an unchanged daily cadence is ~24h apart, and a strict
     # 24h would block it on ordinary jitter.
-    window_start = datetime.utcnow() - timedelta(hours=CAP_WINDOW_HOURS)
+    window_start, resets_at = _cap_window(current_user)
     todays_generations = db.query(DailyBite).filter(
         DailyBite.user_id == current_user.id,
         DailyBite.generated_at >= window_start,
+        # A deck that failed to generate shouldn't cost the user a slot.
+        DailyBite.cards.isnot(None),
     ).count()
     if todays_generations >= cap:
         raise HTTPException(
             status_code=403,
             detail={
                 "code": "daily_limit_reached",
-                "message": f"You've used today's {cap} {'bites' if cap > 1 else 'bite'}. Come back tomorrow!",
+                "message": _cap_message(cap, resets_at),
                 "limit": cap,
                 "is_premium": current_user.effective_premium,
+                "resets_at": resets_at.isoformat() + "Z",
             },
         )
 
@@ -208,7 +257,12 @@ def get_daily_nibbles(
         db.query(DailyBite)
         .filter(
             DailyBite.user_id == current_user.id,
-            DailyBite.origin == "scheduled",
+            # Origin-AGNOSTIC, matching the scheduler's hold rule. This used to
+            # require origin == "scheduled", which disagreed with
+            # notification_service._live_unread_query: an unread MANUAL or
+            # prefetched session held all future generation while never being
+            # returned here, so Home couldn't show the very row that was
+            # blocking it and the user had no way to clear the hold.
             or_(DailyBite.read_at.is_(None), DailyBite.date == today),
         )
         .order_by(DailyBite.date.desc(), DailyBite.generated_at.asc())

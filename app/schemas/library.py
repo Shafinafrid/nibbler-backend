@@ -33,6 +33,9 @@ class LibraryItemResponse(BaseModel):
     processed: bool
     chunk_count: int
     processing_error: Optional[str]
+    # Whether the ORIGINAL uploaded file reached S3: stored | failed | None
+    # (None = added before this was tracked). `processed` never meant this.
+    archive_status: Optional[str] = None
     mode: Optional[str] = "wisdom"
     kind: Optional[str] = "book"
     author: Optional[str] = None

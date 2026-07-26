@@ -4,6 +4,8 @@ from app.database import get_db
 from app.middleware.auth import get_current_user
 from app.models.user import User
 from app.models.library import LibraryItem
+from app.models.bite import DailyBite, SavedBite
+from app.models.user_data import ChatMessage, Completion, Highlight, Note
 from app.rate_limit import limiter
 from app.schemas.library import LibraryItemCreate, LibraryItemResponse, LibraryItemList, LibraryItemUrlCreate, SetActiveRequest
 from app.services.s3_service import S3Service
@@ -18,6 +20,25 @@ router = APIRouter(prefix="/library", tags=["library"])
 settings = get_settings()
 
 MAX_ACTIVE_SOURCES = 5  # mirrors MAX_ACTIVE_BOOKS in nibbler/src/data/sessionStore.js
+
+
+def _should_start_active(db: Session, user_id: str) -> bool:
+    """Whether a NEWLY added item should feed nibbles straight away.
+
+    `LibraryItem.is_active` defaults to True and no upload path used to set it,
+    while the 5-source cap was enforced only when toggling a book ON. So a user
+    with 8 uploads had 8 rows flagged active server-side, while the Library UI
+    (which seeds its list from the server once and slices to 5) showed five on
+    and three off. The scheduler reads the flag, so it kept generating nibbles
+    from books the user could see were switched off.
+
+    A new upload now joins the line-up only if there is room in it.
+    """
+    active_count = db.query(LibraryItem).filter(
+        LibraryItem.user_id == user_id,
+        LibraryItem.is_active.is_(True),
+    ).count()
+    return active_count < MAX_ACTIVE_SOURCES
 
 
 def check_upload_limit(user: User, db: Session):
@@ -73,6 +94,7 @@ def add_library_item(
         author=data.author,
         growth_profile_name=data.growth_profile_name if (data.mode or "wisdom") == "wisdom" else None,
         processed=False,
+        is_active=_should_start_active(db, current_user.id),
     )
     db.add(item)
     db.commit()
@@ -155,6 +177,7 @@ def upload_pdf(
             author=author,
             growth_profile_name=growth_profile_name if (mode or "wisdom") == "wisdom" else None,
             processed=False,
+            is_active=_should_start_active(db, current_user.id),
         )
         db.add(item)
         db.commit()
@@ -201,6 +224,7 @@ def add_url(
         kind=data.kind or "article",
         growth_profile_name=data.growth_profile_name if (data.mode or "wisdom") == "wisdom" else None,
         processed=False,
+        is_active=_should_start_active(db, current_user.id),
     )
     db.add(item)
     db.commit()
@@ -265,15 +289,74 @@ def delete_library_item(
         raise HTTPException(status_code=404, detail="Item not found.")
 
     embedding_svc = EmbeddingService()
-    embedding_svc.delete_item_vectors(item_id, user_id=current_user.id)
+    vectors_cleared = embedding_svc.delete_item_vectors(item_id, user_id=current_user.id)
 
+    file_cleared = True
     if item.file_url:
-        s3 = S3Service()
-        s3.delete_file(item.file_url)
+        file_cleared = S3Service().delete_file(item.file_url)
+
+    # Everything derived from this book goes with it, in the same transaction.
+    #
+    # None of these tables has a foreign key to library_items — daily_bites
+    # carries a plain `library_item_id` string, and notes/highlights/chats/
+    # completions carry a bare `book_id` — so nothing cascaded and every one of
+    # them survived the delete. The consequences were real: notes and highlights
+    # for books that no longer exist were restored onto every new device
+    # forever with nothing behind them, orphaned decks kept their full cards and
+    # quizzes indefinitely, and `GET /bites/sessions` happily served them back.
+    # The app's own confirmation copy promises the book goes "along with its
+    # stored content", so hard delete is the behaviour that matches the promise.
+    # saved_bites has a real FK to daily_bites with ON DELETE CASCADE, but that
+    # is enforced by the DATABASE — and relying on it would make this behaviour
+    # depend on engine settings rather than on this code. Deleted explicitly so
+    # it is true everywhere and provable in a test.
+    bite_ids = [
+        r[0] for r in db.query(DailyBite.id).filter(
+            DailyBite.user_id == current_user.id,
+            DailyBite.library_item_id == item_id,
+        ).all()
+    ]
+    removed = {
+        "saved_bites": (
+            db.query(SavedBite).filter(
+                SavedBite.user_id == current_user.id,
+                SavedBite.bite_id.in_(bite_ids),
+            ).delete(synchronize_session=False) if bite_ids else 0
+        ),
+        "daily_bites": db.query(DailyBite).filter(
+            DailyBite.user_id == current_user.id,
+            DailyBite.library_item_id == item_id,
+        ).delete(synchronize_session=False),
+        "notes": db.query(Note).filter(
+            Note.user_id == current_user.id, Note.book_id == item_id,
+        ).delete(synchronize_session=False),
+        "highlights": db.query(Highlight).filter(
+            Highlight.user_id == current_user.id, Highlight.book_id == item_id,
+        ).delete(synchronize_session=False),
+        "chat_messages": db.query(ChatMessage).filter(
+            ChatMessage.user_id == current_user.id, ChatMessage.book_id == item_id,
+        ).delete(synchronize_session=False),
+        "completions": db.query(Completion).filter(
+            Completion.user_id == current_user.id, Completion.book_id == item_id,
+        ).delete(synchronize_session=False),
+    }
 
     db.delete(item)
     db.commit()
-    return {"message": "Item deleted successfully"}
+
+    if not (vectors_cleared and file_cleared):
+        # The row is gone either way — but say so, rather than reporting a clean
+        # delete while objects or vectors are still out there.
+        logger.error(
+            "Library delete incomplete for item %s (user %s): pinecone_ok=%s s3_ok=%s. "
+            "Manual cleanup required.", item_id, current_user.id, vectors_cleared, file_cleared,
+        )
+
+    return {
+        "message": "Item deleted successfully",
+        "removed": removed,
+        "external_cleanup_complete": bool(vectors_cleared and file_cleared),
+    }
 
 
 # ── Background tasks ───────────────────────────────────────────────────────────
