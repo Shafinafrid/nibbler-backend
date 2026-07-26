@@ -14,7 +14,10 @@ from app.schemas.profile import (
     GrowthStateUpdate,
 )
 from app.services.claude import ClaudeService
+import logging
 import uuid
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/profile", tags=["profile"])
 
@@ -70,6 +73,25 @@ def update_growth_state(
             status_code=409,
             detail="Refusing to overwrite an existing growth profile with an empty one.",
         )
+
+    # Last-writer-wins by timestamp, so a device that has been offline can't
+    # push a stale profile over newer edits made elsewhere. Before this there
+    # was no version field at all: outside the special "unreconciled" path in
+    # AppContext.init(), whichever device saved last simply won, however old
+    # its copy was.
+    #
+    # Returned as a normal 200 rather than a 409 — the client's push is
+    # correctly a no-op, not an error, and a 4xx here would make the outbox
+    # treat it as permanently rejected. Only applied when BOTH sides carry a
+    # timestamp, so older clients keep working unchanged.
+    incoming_at = data.growth_state.get("updatedAt")
+    stored_at = (profile.growth_state or {}).get("updatedAt")
+    if incoming_at and stored_at and str(incoming_at) < str(stored_at):
+        logger.info(
+            "growth push ignored for %s: incoming %s is older than stored %s",
+            current_user.id, incoming_at, stored_at,
+        )
+        return profile
 
     profile.growth_state = data.growth_state
     person_name = ((data.growth_state.get("person") or {}).get("name") or "").strip()

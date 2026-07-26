@@ -109,6 +109,13 @@ def delete_account(
     5. Analytics event
     """
     user_id = current_user.id
+    # Which external systems were genuinely cleared. Previously every step was
+    # reported as successful no matter what: S3Service.delete_file() and the
+    # EmbeddingService delete methods swallowed their own exceptions, so the
+    # try/except blocks here never saw a failure and this endpoint returned
+    # "permanently deleted" while objects and vectors could still exist. For a
+    # GDPR erasure path that is the one thing it must not do.
+    erased = {"s3": True, "pinecone": True, "postgres": False, "firebase": True}
 
     # ── 1. Delete S3 files ────────────────────────────────────────────────────
     try:
@@ -118,29 +125,34 @@ def delete_account(
             LibraryItem.file_url.isnot(None),
         ).all()
         for item in library_items:
-            s3.delete_file(item.file_url)
+            if not s3.delete_file(item.file_url):
+                erased["s3"] = False
         # The profile photo lives at its own key ({uid}/avatar.jpg) and is NOT
         # a library item, so the loop above never touched it — it would have
         # survived account deletion, which is exactly what GDPR erasure must
         # not leave behind.
-        if current_user.avatar_url:
-            s3.delete_file(current_user.avatar_url)
-        logger.info("Deleted %d S3 files for user %s", len(library_items), user_id)
+        if current_user.avatar_url and not s3.delete_file(current_user.avatar_url):
+            erased["s3"] = False
+        logger.info("Deleted %d S3 files for user %s (ok=%s)",
+                    len(library_items), user_id, erased["s3"])
     except Exception as e:
+        erased["s3"] = False
         logger.error("S3 deletion failed for user %s: %s", user_id, e)
         # Continue — partial failure should not block account deletion
 
     # ── 2. Delete Pinecone vectors ────────────────────────────────────────────
     try:
         embeddings = EmbeddingService()
-        embeddings.delete_user_namespace(user_id)
-        logger.info("Deleted Pinecone namespace for user %s", user_id)
+        erased["pinecone"] = embeddings.delete_user_namespace(user_id)
+        logger.info("Deleted Pinecone namespace for user %s (ok=%s)", user_id, erased["pinecone"])
     except Exception as e:
+        erased["pinecone"] = False
         logger.error("Pinecone deletion failed for user %s: %s", user_id, e)
 
     # ── 3. Delete from PostgreSQL (CASCADE handles all child tables) ──────────
     db.delete(current_user)
     db.commit()
+    erased["postgres"] = True
     logger.info("Deleted PostgreSQL records for user %s", user_id)
 
     # ── 4. Delete Firebase Auth account ──────────────────────────────────────
@@ -149,9 +161,28 @@ def delete_account(
         firebase_auth.delete_user(user_id)
         logger.info("Deleted Firebase account for user %s", user_id)
     except Exception as e:
+        erased["firebase"] = False
+        # Worth calling out: the Postgres row is already gone at this point, so
+        # a surviving Firebase identity can sign back in and auto-create a
+        # fresh, empty account via get_or_create_user.
         logger.error("Firebase account deletion failed for user %s: %s", user_id, e)
 
     # ── 5. Track analytics (async task — runs on the loop after the response) ─
     background_tasks.add_task(mixpanel_service.track, "account_deleted", user_id)
 
-    return {"message": "Account and all associated data have been permanently deleted."}
+    incomplete = [k for k, ok in erased.items() if not ok]
+    if incomplete:
+        # Loud, greppable, and carries the user id — this is the signal that a
+        # manual cleanup is owed. Deliberately NOT an error response: the
+        # account IS gone from our database, and telling the user their
+        # deletion failed would be both alarming and inaccurate.
+        logger.error(
+            "ERASURE INCOMPLETE for user %s — these systems were not cleared: %s. "
+            "Manual cleanup required.", user_id, ", ".join(incomplete),
+        )
+
+    return {
+        "message": "Account and all associated data have been permanently deleted.",
+        "erased": erased,
+        "complete": not incomplete,
+    }

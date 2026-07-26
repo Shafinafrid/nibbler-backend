@@ -30,12 +30,16 @@ from app.database import get_db
 from app.middleware.auth import get_current_user
 from app.models.user import User
 from app.rate_limit import limiter
+from app.models.bite import DailyBite
+from app.models.streak import Streak
 from app.models.user_data import (
     ChatMessage, Completion, Highlight, Note, UserSettings, UserState,
 )
+from app.routers.streak import apply_checkin
 from app.schemas.user_data import (
     AvatarIn, ChatMessageIn, ChatMessageOut, CompletionIn, CompletionOut,
-    HighlightIn, HighlightOut, IdentityIn, NoteIn, NoteOut, SettingsIn,
+    HighlightIn, HighlightOut, IdentityIn, NoteIn, NoteOut,
+    SessionCompleteIn, SessionCompleteOut, SettingsIn,
     SettingsOut, StateIn, StateOut, SyncAllOut,
 )
 from app.services.s3_service import S3Service
@@ -377,6 +381,98 @@ def add_completion(
     db.commit()
     db.refresh(row)
     return row
+
+
+# ── Session completion (read receipt + completion + streak, atomically) ──────
+
+@router.post("/session-complete", response_model=SessionCompleteOut)
+@limiter.limit(SYNC_WRITE_LIMIT)
+def session_complete(
+    data: SessionCompleteIn,
+    request: Request,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Finishing a nibble session — the whole thing, once.
+
+    Replaces three separate calls the app used to make, only one of which was
+    durable: the completion row went through the outbox, while `markRead` was
+    fire-and-forget and `streak/checkin` was a direct call. Finish a session on
+    a plane and the streak was silently never credited, and `read_at` stayed
+    NULL — which the scheduler reads as "still unread", so it kept holding that
+    nibble and never prepared the next one.
+
+    **Idempotent by the client-generated `id`.** The outbox retries on every
+    foreground, so this WILL be replayed; a replay returns the current progress
+    and changes nothing.
+
+    One deliberate imprecision, stated rather than hidden: the streak is
+    credited when this operation is PROCESSED, not at `completed_date`. An op
+    queued offline for two days credits the streak on arrival. Reconstructing
+    historical streak state from late arrivals is a much larger change, and
+    crediting late is generous rather than harmful — the idempotency key is
+    what stops it being counted twice.
+    """
+    existing = db.query(Completion).filter(
+        Completion.user_id == current_user.id, Completion.id == data.id
+    ).first()
+
+    streak = db.query(Streak).filter(Streak.user_id == current_user.id).first()
+    if existing:
+        return SessionCompleteOut(
+            already_applied=True,
+            bite_marked_read=True,
+            current_streak=streak.current_streak if streak else 0,
+            longest_streak=streak.longest_streak if streak else 0,
+            total_bites_read=streak.total_bites_read if streak else 0,
+        )
+
+    db.add(Completion(
+        id=data.id,
+        user_id=current_user.id,
+        book_id=data.book_id,
+        completed_date=data.completed_date,
+        read_length=data.read_length,
+    ))
+
+    # Release the scheduler's hold on this nibble. Ownership-scoped, so a
+    # client can't mark someone else's bite read.
+    marked = False
+    if data.daily_bite_id:
+        bite = db.query(DailyBite).filter(
+            DailyBite.id == data.daily_bite_id,
+            DailyBite.user_id == current_user.id,
+        ).first()
+        if bite:
+            if bite.read_at is None:
+                bite.read_at = datetime.utcnow()
+            marked = True
+
+    streak = apply_checkin(db, current_user.id)
+
+    try:
+        db.commit()
+    except IntegrityError:
+        # Two devices replayed the same completion at once — whoever lost the
+        # race still sees a correct, already-applied result.
+        db.rollback()
+        streak = db.query(Streak).filter(Streak.user_id == current_user.id).first()
+        return SessionCompleteOut(
+            already_applied=True,
+            bite_marked_read=True,
+            current_streak=streak.current_streak if streak else 0,
+            longest_streak=streak.longest_streak if streak else 0,
+            total_bites_read=streak.total_bites_read if streak else 0,
+        )
+
+    db.refresh(streak)
+    return SessionCompleteOut(
+        already_applied=False,
+        bite_marked_read=marked,
+        current_streak=streak.current_streak,
+        longest_streak=streak.longest_streak,
+        total_bites_read=streak.total_bites_read,
+    )
 
 
 # ── Settings ─────────────────────────────────────────────────────────────────

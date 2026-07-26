@@ -1,8 +1,12 @@
 import boto3
 from botocore.exceptions import ClientError
+import logging
 from app.config import get_settings
 
 settings = get_settings()
+
+
+logger = logging.getLogger(__name__)
 
 
 class S3Service:
@@ -36,12 +40,20 @@ class S3Service:
         response = self.client.get_object(Bucket=self.bucket, Key=self._key_from(ref))
         return response["Body"].read()
 
-    def delete_file(self, ref: str):
-        """Delete a file from S3 by key or legacy URL."""
+    def delete_file(self, ref: str) -> bool:
+        """Delete a file from S3 by key or legacy URL. True when it succeeded.
+
+        This used to swallow ClientError entirely, which meant the GDPR
+        erasure path in DELETE /auth/me reported "permanently deleted" even
+        when the objects were still sitting in the bucket. Callers that care
+        must check the return value.
+        """
         try:
             self.client.delete_object(Bucket=self.bucket, Key=self._key_from(ref))
-        except ClientError:
-            pass
+            return True
+        except ClientError as e:
+            logger.error("S3 delete failed for %r: %s", ref, e)
+            return False
 
     def generate_presigned_url(self, key: str, expiry: int = 3600) -> str:
         """Generate a temporary presigned URL for private file access."""

@@ -11,7 +11,10 @@ from app.rate_limit import limiter
 from app.models.user import User
 from app.models.bite import DailyBite, SavedBite
 from app.models.library import LibraryItem
-from app.schemas.bite import BiteResponse, SavedBiteResponse, BiteHistoryResponse
+from app.schemas.bite import (
+    BiteResponse, SavedBiteResponse, BiteHistoryResponse,
+    SessionHistoryItem, SessionHistoryResponse,
+)
 from app.services import mixpanel_service
 from app.services.session_service import generate_session_for_item, SessionGenerationError, CARD_TARGETS
 from app.config import get_settings
@@ -283,6 +286,43 @@ def get_bite_history(
         bites=[_bite_to_response(b, saved_ids) for b in bites],
         total=len(bites),
     )
+
+
+@router.get("/sessions", response_model=SessionHistoryResponse)
+@limiter.limit("60/hour")
+def get_session_history(
+    request: Request,
+    limit: int = 60,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Past sessions WITH their full card decks and quizzes.
+
+    This is what makes the Review tab survive a reinstall. `ReviewScreen`
+    builds its flashcards exclusively from the local `SESSION_CACHE`, which
+    keeps 7 days and is deliberately not synced — on the grounds that it
+    "rebuilds from daily_bites on demand". Nothing rebuilt it: `GET
+    /bites/history` returns the legacy `BiteResponse` shape, which has no
+    `cards` and no `quiz`, and nothing in the app called it anyway. So every
+    quiz stayed safely in PostgreSQL with no path back to the screen.
+
+    Free users keep the documented 7-day history window; premium gets the
+    archive, newest first.
+    """
+    query = db.query(DailyBite).filter(DailyBite.user_id == current_user.id)
+
+    if not current_user.effective_premium:
+        cutoff = date.today() - timedelta(days=7)
+        query = query.filter(DailyBite.date >= cutoff)
+
+    rows = (
+        query.order_by(DailyBite.date.desc(), DailyBite.generated_at.desc())
+        .limit(max(1, min(limit, 200)))
+        .all()
+    )
+    # Decks with no cards are useless to the client and only cost bandwidth.
+    rows = [r for r in rows if r.cards]
+    return SessionHistoryResponse(sessions=rows, total=len(rows))
 
 
 @router.post("/{bite_id}/save", response_model=dict)

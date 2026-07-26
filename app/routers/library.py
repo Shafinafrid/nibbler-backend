@@ -363,9 +363,16 @@ def process_pdf_embeddings(item_id: str, pdf_bytes: bytes, user_id: str):
                 filename=f"{user_id}/{item_id}.pdf",
                 content_type="application/pdf",
             )
+            item.archive_status = "stored"
             db.commit()
         except Exception as e:
-            print(f"[process_pdf_embeddings] S3 archive skipped: {e}")
+            # Recorded rather than only printed. `processed` alone conflates
+            # three independent things — archived, extracted, indexed — so a
+            # silent S3 failure left a row that looked completely fine while
+            # the user's original file did not exist anywhere.
+            item.archive_status = "failed"
+            db.commit()
+            logger.error("[process_pdf_embeddings] S3 archive FAILED for %s: %s", item_id, e)
 
         # Paragraph-preserving extraction: story mode serves this text to the
         # reader verbatim, so the author's paragraph and dialogue breaks have to
@@ -496,9 +503,12 @@ def process_epub_embeddings(item_id: str, epub_bytes: bytes, user_id: str):
                 filename=f"{user_id}/{item_id}.epub",
                 content_type="application/epub+zip",
             )
+            item.archive_status = "stored"
             db.commit()
         except Exception as e:
-            print(f"[process_epub_embeddings] S3 archive skipped: {e}")
+            item.archive_status = "failed"
+            db.commit()
+            logger.error("[process_epub_embeddings] S3 archive FAILED for %s: %s", item_id, e)
 
         text = _extract_epub_text(epub_bytes)
         text = text[: settings.max_extracted_text_chars]

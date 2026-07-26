@@ -32,6 +32,37 @@ class BiteHistoryResponse(BaseModel):
     total: int
 
 
+class SessionHistoryItem(BaseModel):
+    """A past session WITH its deck — enough to rebuild the local cache.
+
+    `BiteResponse` deliberately omits `cards` and `quiz` (it serves the legacy
+    single-insight shape), which is why the Review screen could not be rebuilt
+    after a reinstall: the quizzes were sitting in `daily_bites` the whole time
+    with no route that returned them.
+    """
+    id: str
+    library_item_id: Optional[str] = None
+    date: date
+    mode: Optional[str] = None
+    read_length: Optional[int] = None
+    title: str
+    chapter: Optional[str] = None
+    headline: Optional[str] = None
+    preview: Optional[str] = None
+    cards: List = []
+    quiz: Optional[List] = None
+    goal_passage: Optional[str] = None
+    read_at: Optional[datetime] = None
+
+    class Config:
+        from_attributes = True
+
+
+class SessionHistoryResponse(BaseModel):
+    sessions: List[SessionHistoryItem]
+    total: int
+
+
 class StreakResponse(BaseModel):
     current_streak: int
     longest_streak: int

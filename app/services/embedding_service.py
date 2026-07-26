@@ -346,10 +346,10 @@ class EmbeddingService:
             print(f"[EmbeddingService] fetch_chunks error: {e}")
             return []
 
-    def delete_item_vectors(self, item_id: str, user_id: str = None):
-        """Delete all vectors for a given library item."""
+    def delete_item_vectors(self, item_id: str, user_id: str = None) -> bool:
+        """Delete all vectors for a given library item. True when it succeeded."""
         if not self.pinecone_available:
-            return
+            return True
         try:
             if user_id:
                 self.index.delete(
@@ -358,14 +358,24 @@ class EmbeddingService:
                 )
             else:
                 self.index.delete(filter={"item_id": {"$eq": item_id}})
+            return True
         except Exception as e:
             print(f"[EmbeddingService] Delete error: {e}")
+            return False
 
-    def delete_user_namespace(self, user_id: str):
-        """Delete ALL vectors for a user (entire namespace). Used on account deletion."""
+    def delete_user_namespace(self, user_id: str) -> bool:
+        """Delete ALL vectors for a user (entire namespace). Used on account deletion.
+
+        Returns True only when the vectors are genuinely gone. Swallowing this
+        made DELETE /auth/me claim a complete erasure while a user's whole
+        namespace could still be in Pinecone.
+        """
         if not self.pinecone_available:
-            return
+            # Nothing was indexed, so nothing is orphaned — a real success.
+            return True
         try:
             self.index.delete(delete_all=True, namespace=user_id)
+            return True
         except Exception as e:
             print(f"[EmbeddingService] Namespace delete error: {e}")
+            return False

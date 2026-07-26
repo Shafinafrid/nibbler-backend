@@ -113,6 +113,29 @@ class CompletionOut(BaseModel):
     read_length: Optional[int] = None
 
 
+class SessionCompleteIn(BaseModel):
+    """Finishing a session: one operation, three effects.
+
+    Previously the app queued only the completion row durably, then fired
+    `POST /bites/{id}/read` fire-and-forget and called `POST /streak/checkin`
+    directly. Offline, both were lost with no retry: the streak wasn't
+    credited, and `read_at` stayed NULL so the server kept holding that nibble.
+    """
+    id: str = Field(max_length=64)              # client-generated; the idempotency key
+    book_id: str = _BOOK_ID
+    daily_bite_id: Optional[str] = _ID          # absent for demo/legacy sessions
+    completed_date: date_cls
+    read_length: Optional[int] = Field(default=None, ge=1, le=120)
+
+
+class SessionCompleteOut(BaseModel):
+    already_applied: bool                       # true when this op was replayed
+    bite_marked_read: bool
+    current_streak: int
+    longest_streak: int
+    total_bites_read: int
+
+
 # ── Settings / state ─────────────────────────────────────────────────────────
 
 class SettingsIn(BaseModel):

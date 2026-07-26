@@ -78,25 +78,26 @@ def get_streak(
     return streak
 
 
-@router.post("/checkin", response_model=StreakResponse)
-def checkin(
-    current_user: User = Depends(get_current_user),
-    db: Session = Depends(get_db),
-):
-    """Called when the user COMPLETES a nibble session. Counts once per day.
+def apply_checkin(db: Session, user_id: str) -> Streak:
+    """Credit one completed session to the user's streak. Does NOT commit.
+
+    Extracted from the endpoint so POST /sync/session-complete can run the
+    same rules inside its own transaction — the streak, the read receipt and
+    the completion row have to move together or not at all.
 
     Continuation rule: if the streak is still alive at completion time (no
     full cycle has passed without a read — e.g. finishing yesterday's held
     nibble during the final hour before the next delivery), increment.
-    Otherwise the streak restarts from 1."""
+    Otherwise the streak restarts from 1.
+    """
     today = date.today()
     now = datetime.utcnow()
-    streak = db.query(Streak).filter(Streak.user_id == current_user.id).first()
+    streak = db.query(Streak).filter(Streak.user_id == user_id).first()
 
     if not streak:
         streak = Streak(
             id=str(uuid.uuid4()),
-            user_id=current_user.id,
+            user_id=user_id,
             current_streak=1,
             longest_streak=1,
             last_active_date=today,
@@ -108,7 +109,7 @@ def checkin(
         streak.total_bites_read += 1   # extra sessions same day still count as reads
         streak.last_completed_at = now
     else:
-        if _streak_is_broken(streak, db, current_user.id):
+        if _streak_is_broken(streak, db, user_id):
             streak.current_streak = 0
         streak.current_streak = streak.current_streak + 1 if streak.current_streak > 0 else 1
         streak.longest_streak = max(streak.current_streak, streak.longest_streak)
@@ -116,6 +117,21 @@ def checkin(
         streak.last_completed_at = now
         streak.total_bites_read += 1
 
+    return streak
+
+
+@router.post("/checkin", response_model=StreakResponse)
+def checkin(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Called when the user COMPLETES a nibble session. Counts once per day.
+
+    Kept for older app builds. Newer ones send POST /sync/session-complete,
+    which does this plus the read receipt and the completion row atomically
+    and idempotently — see the note there.
+    """
+    streak = apply_checkin(db, current_user.id)
     db.commit()
     db.refresh(streak)
     return streak

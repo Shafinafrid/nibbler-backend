@@ -66,6 +66,8 @@ def _run_migrations():
         "ALTER TABLE library_items ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT now()",
         # library_items — active nibble sources (July 2026)
         "ALTER TABLE library_items ADD COLUMN IF NOT EXISTS is_active BOOLEAN DEFAULT TRUE",
+        # Did the ORIGINAL file reach S3? `processed` never meant that.
+        "ALTER TABLE library_items ADD COLUMN IF NOT EXISTS archive_status VARCHAR",
         # daily_bites — per-book card-deck sessions (July 2026)
         "ALTER TABLE daily_bites ADD COLUMN IF NOT EXISTS library_item_id VARCHAR",
         "ALTER TABLE daily_bites ADD COLUMN IF NOT EXISTS cards JSON",

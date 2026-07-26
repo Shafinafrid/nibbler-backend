@@ -17,6 +17,14 @@ class LibraryItem(Base):
     processed = Column(Boolean, default=False)
     chunk_count = Column(Integer, default=0)      # number of Pinecone vectors
     processing_error = Column(String, nullable=True)  # error message if processing failed
+    # Whether the ORIGINAL uploaded file actually reached S3. `processed` only
+    # ever meant "text extracted + indexing attempted", but it was being read
+    # as if it also implied the file was archived — so a silent S3 failure left
+    # a row that looked healthy with no original behind it.
+    #   None    → pre-2026-07-26 row, unknown
+    #   stored  → the original is in S3 at file_url
+    #   failed  → archival failed; file_url is NULL and nothing retried
+    archive_status = Column(String, nullable=True)
     # ── Nibble-session fields (July 2026) ──
     mode = Column(String, default="wisdom")            # wisdom | story
     kind = Column(String, default="book")              # book | article | paper
