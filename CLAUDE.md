@@ -29,6 +29,9 @@ app/services/            → claude, embedding_service, s3_service, url_safety, 
 app/rate_limit.py        → slowapi limiter keyed by Firebase uid (IP pre-auth)
 ```
 
+### Tests
+`tests/` holds runnable persistence suites — plain scripts, no pytest/CI: `for t in tests/test_*.py; do .venv/bin/python "$t"; done`. Each uses a throwaway SQLite DB with its own env vars, so the real `.env` is never loaded. **SQLite doesn't enforce FKs by default**, which is why `DELETE /library/{id}` deletes child rows explicitly instead of relying on `ON DELETE CASCADE`.
+
 ### Migrations are manual, not Alembic
 Alembic is in requirements but **not used**. `create_tables()` runs `Base.metadata.create_all()` on startup, then `_run_migrations()` in `app/database.py` executes a hand-maintained list of `ALTER TABLE ... ADD COLUMN IF NOT EXISTS` statements. **When you add a column to a model, you must also append the matching ALTER to that list** so Railway applies it on deploy.
 
