@@ -1,5 +1,6 @@
 import json
 import logging
+import random
 import re
 from typing import Optional
 import anthropic
@@ -225,6 +226,24 @@ class ClaudeService:
             clean = clean[start:end + 1]
         return json.loads(clean)
 
+    @staticmethod
+    def _shuffle_quiz_options(session: dict) -> dict:
+        """Claude has a well-documented bias toward placing the correct
+        multiple-choice answer in the same slot (users reported ~8/9 landing
+        in B) — a property of the model's generation, not something the
+        prompt reliably controls. Shuffle each question's options right after
+        parsing so the correct answer's position is genuinely randomized, for
+        both the embedded quiz card (same-day nibble) and the standalone quiz
+        array (replayed the next day in the Review tab) — both come from this
+        one generation, so shuffling here fixes both surfaces at once."""
+        for card in session.get("cards") or []:
+            if card.get("kind") == "quiz" and card.get("options"):
+                random.shuffle(card["options"])
+        for q in session.get("quiz") or []:
+            if q.get("options"):
+                random.shuffle(q["options"])
+        return session
+
     def generate_wisdom_session(
         self,
         book_title: str,
@@ -286,7 +305,7 @@ Build today's session JSON now."""
             system=[{"type": "text", "text": SESSION_SYSTEM, "cache_control": {"type": "ephemeral"}}],
             messages=[{"role": "user", "content": user_msg}],
         )
-        return self._parse_json(response.content[0].text)
+        return self._shuffle_quiz_options(self._parse_json(response.content[0].text))
 
     def chat_with_book(
         self,
