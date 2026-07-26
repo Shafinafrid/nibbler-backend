@@ -33,18 +33,38 @@ def _uuid() -> str:
     return str(uuid.uuid4())
 
 
+# ── Note/highlight identity — read this before changing the keys ────────────
+#
+# Originally keyed (user_id, book_id, card_index). `card_index` is a card's
+# ZERO-BASED POSITION WITHIN ONE DECK (LessonPlayer's `useState(0)`), and every
+# daily session for a book reuses 0, 1, 2… So a note on today's card 0 of a
+# book OVERWROTE the note on yesterday's card 0 — and the unique constraint
+# ENFORCED that collision rather than catching it. Found in the 2026-07-25
+# external audit; it pre-dated the sync work (the server faithfully reproduced
+# the key the app already used locally, so notes had been quietly eating each
+# other on-device long before any of this).
+#
+# Fixed by adding `daily_bite_id`, which is what actually pins a card to one
+# session. Rows written from 2026-07-26 carry it; rows written before cannot
+# be attributed to a session after the fact, so they keep the old key and are
+# left completely untouched. That means TWO partial unique indexes per table,
+# declared in database.py:_run_migrations() rather than here — SQLAlchemy's
+# UniqueConstraint can't express a WHERE clause, and declaring an
+# unconditional one here would recreate the very bug this fixes.
+#
+#   ... WHERE daily_bite_id IS NOT NULL  → (user_id, daily_bite_id, card_index)
+#   ... WHERE daily_bite_id IS NULL      → (user_id, book_id, card_index)
+
+
 class Note(Base):
     """A note the user typed against one card of one session."""
     __tablename__ = "notes"
-    __table_args__ = (
-        # The app keys a note by (book, card) — one note per card. Without this
-        # a flaky network + retry would create duplicates on every re-push.
-        UniqueConstraint("user_id", "book_id", "card_index", name="uq_notes_user_book_card"),
-    )
 
     id = Column(String, primary_key=True, default=_uuid)   # client-generated id
     user_id = Column(String, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
     book_id = Column(String, nullable=False, index=True)
+    # NULL only for rows written before 2026-07-26 — see the note above.
+    daily_bite_id = Column(String, nullable=True, index=True)
     book_title = Column(String, nullable=True)
     book_color = Column(String, nullable=True)
     card_index = Column(Integer, nullable=False)
@@ -60,13 +80,12 @@ class Note(Base):
 class Highlight(Base):
     """A card the user favourited during a session."""
     __tablename__ = "highlights"
-    __table_args__ = (
-        UniqueConstraint("user_id", "book_id", "card_index", name="uq_highlights_user_book_card"),
-    )
 
     id = Column(String, primary_key=True, default=_uuid)
     user_id = Column(String, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
     book_id = Column(String, nullable=False, index=True)
+    # Same identity story as Note — see the block comment above.
+    daily_bite_id = Column(String, nullable=True, index=True)
     book_title = Column(String, nullable=True)
     book_color = Column(String, nullable=True)
     card_index = Column(Integer, nullable=False)

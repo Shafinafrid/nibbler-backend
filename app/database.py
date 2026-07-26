@@ -98,11 +98,36 @@ def _run_migrations():
         "ALTER TABLE users ADD COLUMN IF NOT EXISTS app_version VARCHAR",
         "ALTER TABLE users ADD COLUMN IF NOT EXISTS last_seen_at TIMESTAMP",
         "CREATE UNIQUE INDEX IF NOT EXISTS uq_users_username ON users (username) WHERE username IS NOT NULL",
-        # notes / highlights — one row per (user, book, card). create_all() makes
-        # the tables; these indexes are what stop a retry storm from duplicating
-        # rows, and CREATE INDEX IF NOT EXISTS is safe to re-run every boot.
-        "CREATE UNIQUE INDEX IF NOT EXISTS uq_notes_user_book_card ON notes (user_id, book_id, card_index)",
-        "CREATE UNIQUE INDEX IF NOT EXISTS uq_highlights_user_book_card ON highlights (user_id, book_id, card_index)",
+        # ── notes / highlights identity (rewritten 2026-07-26) ────────────────
+        # See the block comment in app/models/user_data.py. The old key
+        # (user_id, book_id, card_index) collided across daily sessions, because
+        # card_index is a position within ONE deck and every deck restarts at 0.
+        #
+        # ORDER MATTERS HERE: add the column, drop the old unconditional key,
+        # THEN create the two partial ones. Leaving the old key in place would
+        # keep enforcing the collision no matter what the new indexes say.
+        "ALTER TABLE notes ADD COLUMN IF NOT EXISTS daily_bite_id VARCHAR",
+        "ALTER TABLE highlights ADD COLUMN IF NOT EXISTS daily_bite_id VARCHAR",
+        # create_all() originally declared these as CONSTRAINTS (via
+        # UniqueConstraint), which a DROP INDEX cannot remove — but on a
+        # database built after that declaration was removed they may exist as
+        # plain indexes instead. Both forms are attempted; each is a harmless
+        # no-op when the other applies.
+        "ALTER TABLE notes DROP CONSTRAINT IF EXISTS uq_notes_user_book_card",
+        "ALTER TABLE highlights DROP CONSTRAINT IF EXISTS uq_highlights_user_book_card",
+        "DROP INDEX IF EXISTS uq_notes_user_book_card",
+        "DROP INDEX IF EXISTS uq_highlights_user_book_card",
+        # Rows written from 2026-07-26 on: scoped to the session they belong to.
+        "CREATE UNIQUE INDEX IF NOT EXISTS uq_notes_user_bite_card "
+        "ON notes (user_id, daily_bite_id, card_index) WHERE daily_bite_id IS NOT NULL",
+        "CREATE UNIQUE INDEX IF NOT EXISTS uq_highlights_user_bite_card "
+        "ON highlights (user_id, daily_bite_id, card_index) WHERE daily_bite_id IS NOT NULL",
+        # Rows written before it: cannot be attributed to a session after the
+        # fact, so they keep the old key and are left exactly as they are.
+        "CREATE UNIQUE INDEX IF NOT EXISTS uq_notes_user_book_card_legacy "
+        "ON notes (user_id, book_id, card_index) WHERE daily_bite_id IS NULL",
+        "CREATE UNIQUE INDEX IF NOT EXISTS uq_highlights_user_book_card_legacy "
+        "ON highlights (user_id, book_id, card_index) WHERE daily_bite_id IS NULL",
         # chat / completions — read paths are always scoped to one user+book
         "CREATE INDEX IF NOT EXISTS ix_chat_messages_user_book ON chat_messages (user_id, book_id)",
         "CREATE INDEX IF NOT EXISTS ix_completions_user_book ON completions (user_id, book_id)",

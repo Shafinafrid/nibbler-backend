@@ -20,6 +20,9 @@ _CARD_INDEX = Field(ge=0, le=10_000)
 class NoteIn(BaseModel):
     id: Optional[str] = _ID           # client-generated; server mints one if absent
     book_id: str = _BOOK_ID
+    # Which SESSION this card belongs to. NULL only on rows written before
+    # 2026-07-26 — see app/models/user_data.py for why the key changed.
+    daily_bite_id: Optional[str] = _ID
     book_title: Optional[str] = _TITLE
     book_color: Optional[str] = _COLOR
     card_index: int = _CARD_INDEX
@@ -33,6 +36,7 @@ class NoteOut(BaseModel):
     model_config = ConfigDict(from_attributes=True)
     id: str
     book_id: str
+    daily_bite_id: Optional[str] = None
     book_title: Optional[str] = None
     book_color: Optional[str] = None
     card_index: int
@@ -48,6 +52,7 @@ class NoteOut(BaseModel):
 class HighlightIn(BaseModel):
     id: Optional[str] = _ID
     book_id: str = _BOOK_ID
+    daily_bite_id: Optional[str] = _ID
     book_title: Optional[str] = _TITLE
     book_color: Optional[str] = _COLOR
     card_index: int = _CARD_INDEX
@@ -60,6 +65,7 @@ class HighlightOut(BaseModel):
     model_config = ConfigDict(from_attributes=True)
     id: str
     book_id: str
+    daily_bite_id: Optional[str] = None
     book_title: Optional[str] = None
     book_color: Optional[str] = None
     card_index: int

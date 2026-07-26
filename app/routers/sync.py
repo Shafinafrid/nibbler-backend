@@ -20,6 +20,7 @@ import base64
 import json
 import logging
 from datetime import datetime
+from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from sqlalchemy.exc import IntegrityError
@@ -56,6 +57,30 @@ SYNC_READ_LIMIT = "120/hour"    # /sync/all runs on init, ~hourly per device
 # review_state is an opaque client blob, so bound it by serialised size rather
 # than by shape. ReviewScreen's real runs are a few KB.
 MAX_REVIEW_STATE_BYTES = 256_000
+
+
+def _card_scope(model, user_id: str, book_id: str, daily_bite_id, card_index: int):
+    """Filters identifying ONE card of ONE session, for notes or highlights.
+
+    `card_index` alone is a position within a single deck (every deck restarts
+    at 0), so it only identifies a card once paired with the session it belongs
+    to. Rows written before 2026-07-26 have no `daily_bite_id` and cannot be
+    attributed to a session after the fact, so they keep the old book-scoped
+    key — the `IS NULL` branch is what keeps those rows reachable and stops a
+    new session-scoped row from being mistaken for one of them.
+    """
+    if daily_bite_id:
+        return (
+            model.user_id == user_id,
+            model.daily_bite_id == daily_bite_id,
+            model.card_index == card_index,
+        )
+    return (
+        model.user_id == user_id,
+        model.book_id == book_id,
+        model.daily_bite_id.is_(None),
+        model.card_index == card_index,
+    )
 
 
 def _settings_row(user: User, db: Session) -> UserSettings:
@@ -137,15 +162,8 @@ def upsert_note(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    row = (
-        db.query(Note)
-        .filter(
-            Note.user_id == current_user.id,
-            Note.book_id == data.book_id,
-            Note.card_index == data.card_index,
-        )
-        .first()
-    )
+    scope = _card_scope(Note, current_user.id, data.book_id, data.daily_bite_id, data.card_index)
+    row = db.query(Note).filter(*scope).first()
     if row:
         for f in ("book_title", "book_color", "card_eyebrow", "card_title", "card_body", "text"):
             setattr(row, f, getattr(data, f))
@@ -160,15 +178,7 @@ def upsert_note(
     except IntegrityError:
         # Concurrent write from another device won the unique index — take theirs.
         db.rollback()
-        row = (
-            db.query(Note)
-            .filter(
-                Note.user_id == current_user.id,
-                Note.book_id == data.book_id,
-                Note.card_index == data.card_index,
-            )
-            .first()
-        )
+        row = db.query(Note).filter(*scope).first()
         if not row:
             raise
     db.refresh(row)
@@ -180,12 +190,32 @@ def upsert_note(
 def delete_note(
     note_id: str,
     request: Request,
+    book_id: Optional[str] = None,
+    card_index: Optional[int] = None,
+    daily_bite_id: Optional[str] = None,
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    db.query(Note).filter(Note.user_id == current_user.id, Note.id == note_id).delete()
+    """Delete by id, falling back to the card's natural key.
+
+    Rows are UPSERTED by natural key but were only ever DELETED by id, and the
+    two disagree across devices: if two devices independently create a note for
+    the same card, device A's id owns the row, and device B's later
+    `DELETE /sync/notes/<B-id>` matched nothing, returned `{"ok": true}`, and
+    the note quietly came back on the next restore. The optional natural-key
+    parameters let the delete find the row whoever created it. Older clients
+    send only the id and keep the previous behaviour.
+    """
+    deleted = db.query(Note).filter(
+        Note.user_id == current_user.id, Note.id == note_id
+    ).delete()
+
+    if not deleted and book_id is not None and card_index is not None:
+        scope = _card_scope(Note, current_user.id, book_id, daily_bite_id, card_index)
+        deleted = db.query(Note).filter(*scope).delete()
+
     db.commit()
-    return {"ok": True}
+    return {"ok": True, "deleted": bool(deleted)}
 
 
 # ── Highlights ───────────────────────────────────────────────────────────────
@@ -198,15 +228,8 @@ def upsert_highlight(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    row = (
-        db.query(Highlight)
-        .filter(
-            Highlight.user_id == current_user.id,
-            Highlight.book_id == data.book_id,
-            Highlight.card_index == data.card_index,
-        )
-        .first()
-    )
+    scope = _card_scope(Highlight, current_user.id, data.book_id, data.daily_bite_id, data.card_index)
+    row = db.query(Highlight).filter(*scope).first()
     if row:
         # Refresh the snapshotted card text, the same way upsert_note does.
         # This branch used to be a no-op, so a highlight kept the wording of
@@ -225,15 +248,7 @@ def upsert_highlight(
             db.commit()
         except IntegrityError:
             db.rollback()
-            row = (
-                db.query(Highlight)
-                .filter(
-                    Highlight.user_id == current_user.id,
-                    Highlight.book_id == data.book_id,
-                    Highlight.card_index == data.card_index,
-                )
-                .first()
-            )
+            row = db.query(Highlight).filter(*scope).first()
             if not row:
                 raise
     db.refresh(row)
@@ -245,14 +260,28 @@ def upsert_highlight(
 def delete_highlight(
     highlight_id: str,
     request: Request,
+    book_id: Optional[str] = None,
+    card_index: Optional[int] = None,
+    daily_bite_id: Optional[str] = None,
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    db.query(Highlight).filter(
+    """Delete by id, falling back to the card's natural key — see delete_note.
+
+    This matters more for highlights than for notes: `toggleHighlight` mints a
+    fresh `hl-…` id every time a card is favourited, so two devices favouriting
+    the same card produce two different ids for what is logically one row.
+    """
+    deleted = db.query(Highlight).filter(
         Highlight.user_id == current_user.id, Highlight.id == highlight_id
     ).delete()
+
+    if not deleted and book_id is not None and card_index is not None:
+        scope = _card_scope(Highlight, current_user.id, book_id, daily_bite_id, card_index)
+        deleted = db.query(Highlight).filter(*scope).delete()
+
     db.commit()
-    return {"ok": True}
+    return {"ok": True, "deleted": bool(deleted)}
 
 
 # ── Chat ─────────────────────────────────────────────────────────────────────
