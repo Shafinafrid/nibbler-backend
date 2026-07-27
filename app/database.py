@@ -143,6 +143,10 @@ def _run_migrations():
         "CREATE UNIQUE INDEX IF NOT EXISTS uq_daily_bites_user_item_date "
         "ON daily_bites (user_id, library_item_id, date) WHERE library_item_id IS NOT NULL",
         "CREATE UNIQUE INDEX IF NOT EXISTS uq_saved_bites_user_bite ON saved_bites (user_id, bite_id)",
+        # user_settings — 3-way appearance (July 2026): light / dark / black.
+        # `dark_mode` (bool) stays as-is for older clients still writing it;
+        # `theme_mode` is the new source of truth once a client has sent it.
+        "ALTER TABLE user_settings ADD COLUMN IF NOT EXISTS theme_mode VARCHAR",
     ]
 
     applied, failed = 0, 0

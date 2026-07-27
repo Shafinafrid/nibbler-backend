@@ -152,6 +152,7 @@ class SettingsIn(BaseModel):
     daily_quiz: Optional[bool] = None
     streak_alerts: Optional[bool] = None
     dark_mode: Optional[bool] = None
+    theme_mode: Optional[Literal['light', 'dark', 'black']] = None
     sound_enabled: Optional[bool] = None
     # An empty list is MEANINGFUL (every source switched off) and must stay
     # distinguishable from an omitted field — see restoreFromServer.
@@ -167,6 +168,7 @@ class SettingsOut(BaseModel):
     daily_quiz: Optional[bool] = None
     streak_alerts: Optional[bool] = None
     dark_mode: Optional[bool] = None
+    theme_mode: Optional[str] = None
     sound_enabled: Optional[bool] = None
     active_book_ids: Optional[List[str]] = None
     inactive_order: Optional[List[str]] = None

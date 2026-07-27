@@ -145,7 +145,8 @@ class UserSettings(Base):
     delivery_minute = Column(Integer, nullable=True)
     daily_quiz = Column(Boolean, default=False)
     streak_alerts = Column(Boolean, default=True)
-    dark_mode = Column(Boolean, nullable=True)           # null → follow system
+    dark_mode = Column(Boolean, nullable=True)           # legacy — kept for older clients
+    theme_mode = Column(String, nullable=True)            # 'light' | 'dark' | 'black'; null → dark_mode/system
     sound_enabled = Column(Boolean, nullable=True)
     active_book_ids = Column(JSON, nullable=True)        # ordered [bookId] — rank 1 first
     inactive_order = Column(JSON, nullable=True)         # ordered [bookId] — switch-off order
