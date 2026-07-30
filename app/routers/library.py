@@ -7,7 +7,7 @@ from app.models.library import LibraryItem
 from app.models.bite import DailyBite, SavedBite
 from app.models.user_data import ChatMessage, Completion, Highlight, Note
 from app.rate_limit import limiter
-from app.schemas.library import LibraryItemCreate, LibraryItemResponse, LibraryItemList, LibraryItemUrlCreate, SetActiveRequest
+from app.schemas.library import LibraryItemCreate, LibraryItemResponse, LibraryItemList, LibraryItemUrlCreate, SetActiveRequest, RenameItemRequest
 from app.services.s3_service import S3Service
 from app.services.embedding_service import EmbeddingService, EmbeddingError
 from app.services.url_safety import UnsafeUrlError, validate_public_url, fetch_public_url
@@ -272,6 +272,39 @@ def set_item_active(
     db.refresh(item)
     return item
 
+
+# ── PATCH /library/{item_id} ──────────────────────────────────────────────────
+@router.patch("/{item_id}", response_model=LibraryItemResponse)
+def rename_library_item(
+    item_id: str,
+    data: RenameItemRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Rename a source.
+
+    Title only, on purpose. Everything that makes the item usable — extracted
+    text, chunks, embeddings, Pinecone vectors, past nibbles — is keyed by item
+    id, so a rename touches none of it and needs no reprocessing.
+
+    Ownership is enforced by the same user_id filter every other route here
+    uses: a valid token for account A can never rename account B's book.
+    """
+    item = db.query(LibraryItem).filter(
+        LibraryItem.id == item_id,
+        LibraryItem.user_id == current_user.id,
+    ).first()
+    if not item:
+        raise HTTPException(status_code=404, detail="Item not found.")
+
+    title = data.title.strip()
+    if not title:
+        raise HTTPException(status_code=400, detail="A title cannot be blank.")
+
+    item.title = title
+    db.commit()
+    db.refresh(item)
+    return item
 
 # ── DELETE /library/{item_id} ──────────────────────────────────────────────────
 @router.delete("/{item_id}")

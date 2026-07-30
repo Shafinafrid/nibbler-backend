@@ -52,6 +52,13 @@ class SetActiveRequest(BaseModel):
     active: bool
 
 
+class RenameItemRequest(BaseModel):
+    """Rename a source. Title only — nothing else about a library item is
+    user-editable, and the extracted text, embeddings and Pinecone vectors are
+    keyed by item id, so a rename never invalidates any of them."""
+    title: str = Field(min_length=1, max_length=300)
+
+
 class LibraryItemList(BaseModel):
     items: list[LibraryItemResponse]
     total: int
