@@ -1,4 +1,4 @@
-from sqlalchemy import Column, String, ForeignKey, DateTime, Boolean, Integer, Text, func
+from sqlalchemy import Column, String, ForeignKey, DateTime, Boolean, Integer, Text, JSON, func
 from sqlalchemy.orm import relationship
 from app.database import Base
 
@@ -9,6 +9,9 @@ class LibraryItem(Base):
     id = Column(String, primary_key=True)
     user_id = Column(String, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
     title = Column(String, nullable=False)
+    # Figures extracted from the source at upload — see services/image_extract.
+    # [{ref, page, w, h, context}]; empty for books with no usable pictures.
+    images = Column(JSON, nullable=True)
     type = Column(String, nullable=False)       # pdf | url | text | note
     content = Column(Text, nullable=True)         # raw text or pasted content
     file_url = Column(String, nullable=True)      # S3 object key (pre-July-2026 rows hold full public URLs)

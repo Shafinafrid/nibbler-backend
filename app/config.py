@@ -6,6 +6,14 @@ class Settings(BaseSettings):
     # Database
     database_url: str
 
+    # Image generation for nibble cards. INERT until openai_api_key is set —
+    # see services/image_gen.py. Cheapest tier by default because every image
+    # is a real charge (~$0.011 at gpt-image-1 low quality).
+    openai_api_key: str = ""
+    image_model: str = "gpt-image-1"
+    image_quality: str = "low"
+    image_generation_enabled: bool = True
+
     # Claude
     claude_api_key: str
     claude_model_free: str = "claude-haiku-4-5"

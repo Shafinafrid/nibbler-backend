@@ -58,6 +58,8 @@ def _run_migrations():
         # library_items — nibble sessions (July 2026)
         "ALTER TABLE library_items ADD COLUMN IF NOT EXISTS mode VARCHAR DEFAULT 'wisdom'",
         "ALTER TABLE library_items ADD COLUMN IF NOT EXISTS kind VARCHAR DEFAULT 'book'",
+        # library_items — pictures pulled out of the book at upload (July 2026)
+        "ALTER TABLE library_items ADD COLUMN IF NOT EXISTS images JSON",
         "ALTER TABLE library_items ADD COLUMN IF NOT EXISTS author VARCHAR",
         "ALTER TABLE library_items ADD COLUMN IF NOT EXISTS growth_profile_name VARCHAR",
         "ALTER TABLE library_items ADD COLUMN IF NOT EXISTS story_progress INTEGER DEFAULT 0",

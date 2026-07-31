@@ -16,6 +16,8 @@ httpx==0.27.2
 apscheduler==3.10.4
 tiktoken==0.7.0
 pypdf==5.1.0
+# Decodes embedded book figures so image_extract can size and filter them.
+pillow==11.0.0
 beautifulsoup4==4.12.3
 requests==2.32.3
 voyageai==0.2.3
