@@ -7,7 +7,7 @@ from app.models.library import LibraryItem
 from app.models.bite import DailyBite, SavedBite
 from app.models.user_data import ChatMessage, Completion, Highlight, Note
 from app.rate_limit import limiter
-from app.schemas.library import LibraryItemCreate, LibraryItemResponse, LibraryItemList, LibraryItemUrlCreate, SetActiveRequest, RenameItemRequest
+from app.schemas.library import LibraryItemCreate, LibraryItemResponse, LibraryItemList, LibraryItemUrlCreate, SetActiveRequest, UpdateItemRequest
 from app.services.s3_service import S3Service
 from app.services.embedding_service import EmbeddingService, EmbeddingError
 from app.services.url_safety import UnsafeUrlError, validate_public_url, fetch_public_url
@@ -277,15 +277,16 @@ def set_item_active(
 @router.patch("/{item_id}", response_model=LibraryItemResponse)
 def rename_library_item(
     item_id: str,
-    data: RenameItemRequest,
+    data: UpdateItemRequest,
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    """Rename a source.
+    """Edit a source: title, mode, or growth profile.
 
-    Title only, on purpose. Everything that makes the item usable — extracted
-    text, chunks, embeddings, Pinecone vectors, past nibbles — is keyed by item
-    id, so a rename touches none of it and needs no reprocessing.
+    Everything that makes the item usable — extracted text, chunks, embeddings,
+    Pinecone vectors, past nibbles — is keyed by item id and independent of all
+    three fields, so none of this needs reprocessing. That matters most for a
+    book that had to be OCR'd: getting the mode wrong no longer costs a re-run.
 
     Ownership is enforced by the same user_id filter every other route here
     uses: a valid token for account A can never rename account B's book.
@@ -297,11 +298,25 @@ def rename_library_item(
     if not item:
         raise HTTPException(status_code=404, detail="Item not found.")
 
-    title = data.title.strip()
-    if not title:
-        raise HTTPException(status_code=400, detail="A title cannot be blank.")
+    if data.title is not None:
+        title = data.title.strip()
+        if not title:
+            raise HTTPException(status_code=400, detail="A title cannot be blank.")
+        item.title = title
 
-    item.title = title
+    if data.mode is not None:
+        if data.mode not in ("wisdom", "story"):
+            raise HTTPException(status_code=400, detail="Mode must be wisdom or story.")
+        # Switching INTO story starts the book at page one: a book that has
+        # been in wisdom mode has no meaningful sequential position, and
+        # carrying over a stale offset would drop the reader mid-chapter.
+        if data.mode == "story" and item.mode != "story":
+            item.story_progress = 0
+        item.mode = data.mode
+
+    if data.growth_profile_name is not None:
+        item.growth_profile_name = data.growth_profile_name or None
+
     db.commit()
     db.refresh(item)
     return item

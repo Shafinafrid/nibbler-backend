@@ -55,11 +55,25 @@ class SetActiveRequest(BaseModel):
     active: bool
 
 
-class RenameItemRequest(BaseModel):
-    """Rename a source. Title only — nothing else about a library item is
-    user-editable, and the extracted text, embeddings and Pinecone vectors are
-    keyed by item id, so a rename never invalidates any of them."""
-    title: str = Field(min_length=1, max_length=300)
+class UpdateItemRequest(BaseModel):
+    """Edit a source in place. Every field here is FREE to change — none of
+    them invalidates any stored work:
+
+      · title — cosmetic.
+      · growth_profile_name — never touches the embeddings. Those are vectors
+        of the BOOK's text; the profile only shapes the query at
+        session-generation time.
+      · mode — every processed book already holds BOTH of the things the two
+        modes need: item.content (which story mode reads in order) and its
+        Pinecone vectors (which wisdom mode retrieves from). index_text runs
+        for every upload regardless of mode.
+
+    So switching a book that has been OCR'd costs nothing and needs no
+    re-upload — which is the whole point, because OCR is the expensive part.
+    """
+    title: Optional[str] = Field(default=None, min_length=1, max_length=300)
+    mode: Optional[str] = None                    # 'wisdom' | 'story'
+    growth_profile_name: Optional[str] = None
 
 
 class LibraryItemList(BaseModel):
