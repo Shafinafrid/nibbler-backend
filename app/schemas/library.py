@@ -42,6 +42,9 @@ class LibraryItemResponse(BaseModel):
     growth_profile_name: Optional[str] = None
     story_progress: Optional[int] = 0
     is_active: Optional[bool] = True
+    ocr_status: Optional[str] = None
+    ocr_pages_done: Optional[int] = 0
+    ocr_pages_total: Optional[int] = 0
     created_at: datetime
 
     class Config:

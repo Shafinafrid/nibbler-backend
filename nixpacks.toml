@@ -1,0 +1,8 @@
+# Tesseract is a SYSTEM binary — pip cannot install it, so Railway needs it
+# declared here. Without it, ocr_service.is_available() returns False and the
+# scanned-PDF feature simply stays dark; nothing else is affected.
+#
+# nixpacks rather than a Dockerfile on purpose: this is additive and leaves
+# Railway's existing build path alone.
+[phases.setup]
+aptPkgs = ["tesseract-ocr", "tesseract-ocr-eng"]

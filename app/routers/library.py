@@ -306,6 +306,105 @@ def rename_library_item(
     db.refresh(item)
     return item
 
+def _run_ocr(item_id: str, user_id: str):
+    """Read a scanned PDF and push it through the normal indexing path.
+
+    Runs in a BackgroundTask, and ocr_service serialises these so only one
+    holds the CPU at a time — see that module for why that guard matters more
+    than the cost does.
+    """
+    from app.database import SessionLocal
+    from app.services import ocr_service
+    db = SessionLocal()
+    try:
+        item = db.query(LibraryItem).filter(
+            LibraryItem.id == item_id, LibraryItem.user_id == user_id
+        ).first()
+        if not item or not item.file_url:
+            return
+
+        item.ocr_status = "running"
+        item.ocr_pages_done = 0
+        db.commit()
+
+        pdf_bytes = S3Service().download_file(item.file_url)
+
+        def progress(done: int, total: int):
+            # Committed as it goes so the Library row can show "page 40 of 335"
+            # — a job this long with only a spinner reads as broken.
+            item.ocr_pages_done = done
+            item.ocr_pages_total = total
+            db.commit()
+
+        text = ocr_service.ocr_pdf(pdf_bytes, on_progress=progress)
+
+        item.content = text
+        chunk_count = EmbeddingService().index_text(
+            text=text,
+            item_id=item_id,
+            user_id=user_id,
+            metadata={"title": item.title, "type": "pdf"},
+        )
+        item.chunk_count = chunk_count
+        item.processed = True
+        item.ocr_status = "done"
+        item.processing_error = None
+        db.commit()
+        logger.info("[ocr] %s indexed %s chunks from %s pages", item_id, chunk_count, item.ocr_pages_total)
+    except Exception as e:
+        db.rollback()
+        try:
+            item = db.query(LibraryItem).filter(LibraryItem.id == item_id).first()
+            if item:
+                item.ocr_status = "failed"
+                item.processing_error = str(e)[:400]
+                db.commit()
+        except Exception:
+            pass
+        logger.error("[ocr] FAILED for %s: %s", item_id, e)
+    finally:
+        db.close()
+
+
+# ── POST /library/{item_id}/ocr ───────────────────────────────────────────────
+@router.post("/{item_id}/ocr", response_model=LibraryItemResponse)
+def start_ocr(
+    item_id: str,
+    background_tasks: BackgroundTasks,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Opt in to reading a scanned PDF with OCR. Free to the user, and slow —
+    the client says so and lets them carry on using the app meanwhile."""
+    from app.services import ocr_service
+
+    item = db.query(LibraryItem).filter(
+        LibraryItem.id == item_id,
+        LibraryItem.user_id == current_user.id,
+    ).first()
+    if not item:
+        raise HTTPException(status_code=404, detail="Item not found.")
+    if not ocr_service.is_available():
+        raise HTTPException(status_code=503, detail={
+            "code": "ocr_unavailable",
+            "message": "Nibbler can't read scanned books just now. Please try again later.",
+        })
+    if item.ocr_status == "running":
+        return item
+    if not item.file_url:
+        raise HTTPException(status_code=409, detail={
+            "code": "no_original",
+            "message": "The original file isn't stored, so it can't be re-read.",
+        })
+
+    item.ocr_status = "running"
+    item.ocr_pages_done = 0
+    item.processing_error = None
+    db.commit()
+    db.refresh(item)
+    background_tasks.add_task(_run_ocr, item.id, current_user.id)
+    return item
+
 # ── DELETE /library/{item_id} ──────────────────────────────────────────────────
 @router.delete("/{item_id}")
 def delete_library_item(
@@ -497,8 +596,19 @@ def process_pdf_embeddings(item_id: str, pdf_bytes: bytes, user_id: str):
         text = pdf_to_structured_text(pdf_bytes, settings.max_extracted_text_chars)
 
         if not text.strip():
+            # Not a failure any more: a scan has no text to extract, but we can
+            # read it with OCR if the user asks. The client turns 'needed' into
+            # an offer rather than an error (see ocr_service).
+            from app.services import ocr_service
             item.processed = False
-            item.processing_error = "Couldn't read any text in this PDF — is it scanned pages/images?"
+            if ocr_service.is_available():
+                item.ocr_status = "needed"
+                item.ocr_pages_total = 0
+                item.processing_error = None
+            else:
+                item.processing_error = (
+                    "Couldn't read any text in this PDF — is it scanned pages/images?"
+                )
             db.commit()
             return
 

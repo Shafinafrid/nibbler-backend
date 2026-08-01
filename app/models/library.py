@@ -12,6 +12,11 @@ class LibraryItem(Base):
     # Figures extracted from the source at upload — see services/image_extract.
     # [{ref, page, w, h, context}]; empty for books with no usable pictures.
     images = Column(JSON, nullable=True)
+    # Scanned PDFs: 'needed' once extraction finds no text, then 'running' /
+    # 'done' / 'failed'. Null for every book with a real text layer.
+    ocr_status = Column(String, nullable=True)
+    ocr_pages_done = Column(Integer, default=0)
+    ocr_pages_total = Column(Integer, default=0)
     type = Column(String, nullable=False)       # pdf | url | text | note
     content = Column(Text, nullable=True)         # raw text or pasted content
     file_url = Column(String, nullable=True)      # S3 object key (pre-July-2026 rows hold full public URLs)

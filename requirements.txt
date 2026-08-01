@@ -18,6 +18,10 @@ tiktoken==0.7.0
 pypdf==5.1.0
 # Decodes embedded book figures so image_extract can size and filter them.
 pillow==11.0.0
+# Scanned-PDF OCR: PyMuPDF rasterises the pages (no poppler needed),
+# pytesseract drives the tesseract binary installed via nixpacks.toml.
+pymupdf==1.24.14
+pytesseract==0.3.13
 beautifulsoup4==4.12.3
 requests==2.32.3
 voyageai==0.2.3
