@@ -5,6 +5,12 @@ BACKEND = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 TMP = tempfile.mkdtemp()
 os.environ.update(DATABASE_URL=f"sqlite:///{TMP}/c.db", CLAUDE_API_KEY="t", FIREBASE_PROJECT_ID="t")
 sys.path.insert(0, BACKEND)
+# Isolate from the real .env, which holds production AWS/Pinecone/Voyage
+# credentials. Setting env vars is not enough: `env_file = ".env"` is a
+# RELATIVE path, so every key NOT overridden here still came from the real
+# file — which is how this suite once made a live S3 request. hermetic.py
+# moves the process somewhere .env does not exist. Must precede `app.` imports.
+import hermetic  # noqa: F401
 
 failures = []
 def check(name, cond, detail=""):

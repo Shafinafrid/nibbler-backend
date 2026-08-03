@@ -120,21 +120,53 @@ def delete_account(
     # ── 1. Delete S3 files ────────────────────────────────────────────────────
     try:
         s3 = S3Service()
+        # Every item, not only those with a stored source file: a book can have
+        # extracted figures at their own keys even when its original upload was
+        # never archived, and those must go too.
         library_items = db.query(LibraryItem).filter(
             LibraryItem.user_id == user_id,
-            LibraryItem.file_url.isnot(None),
         ).all()
+        image_count = 0
+        # EVERY delete is individually isolated. This is an erasure path: one
+        # object that raises must not abandon the objects after it, or a single
+        # transient S3 error silently leaves most of a user's data in the
+        # bucket while the endpoint reports the account gone.
         for item in library_items:
-            if not s3.delete_file(item.file_url):
-                erased["s3"] = False
+            if item.file_url:
+                try:
+                    if not s3.delete_file(item.file_url):
+                        erased["s3"] = False
+                except Exception as e:  # noqa: BLE001
+                    logger.error("Source-file delete raised for %s: %s", item.id, e)
+                    erased["s3"] = False
+            # Extracted book images are separate objects from the source file
+            # and would otherwise outlive the account. Keys are checked against
+            # this user's prefix before deletion, so a bad row cannot reach
+            # another account's objects.
+            prefix = "book-images/%s/%s/" % (user_id, item.id)
+            for img in (item.images or []):
+                key = (img or {}).get("key") if isinstance(img, dict) else None
+                if not key:
+                    continue
+                if not str(key).startswith(prefix):
+                    logger.error("Refusing out-of-scope image key during erasure of %s", user_id)
+                    erased["s3"] = False
+                    continue
+                image_count += 1
+                try:
+                    if not s3.delete_file(key):
+                        erased["s3"] = False
+                except Exception as e:  # noqa: BLE001
+                    logger.error("Image delete raised for %s: %s", key, e)
+                    erased["s3"] = False
         # The profile photo lives at its own key ({uid}/avatar.jpg) and is NOT
         # a library item, so the loop above never touched it — it would have
         # survived account deletion, which is exactly what GDPR erasure must
         # not leave behind.
         if current_user.avatar_url and not s3.delete_file(current_user.avatar_url):
             erased["s3"] = False
-        logger.info("Deleted %d S3 files for user %s (ok=%s)",
-                    len(library_items), user_id, erased["s3"])
+        logger.info("Deleted %d S3 files and %d book images for user %s (ok=%s)",
+                    len(library_items), image_count, user_id, erased["s3"])
     except Exception as e:
         erased["s3"] = False
         logger.error("S3 deletion failed for user %s: %s", user_id, e)

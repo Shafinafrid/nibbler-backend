@@ -421,6 +421,122 @@ def start_ocr(
     return item
 
 # ── DELETE /library/{item_id} ──────────────────────────────────────────────────
+# One hour. Long enough that a session's images are all fetched under one URL,
+# short enough that a leaked link is worthless by the time it travels.
+IMAGE_URL_TTL = 3600
+
+
+def _delete_item_images(item: LibraryItem, user_id: str) -> bool:
+    """Delete this book's extracted figures from S3. True when all succeeded.
+
+    Keys come from the stored rows and are checked against the owner-scoped
+    prefix before any delete is issued. That check is the reason a compromised
+    or corrupted row cannot turn this into a way to delete somebody else's
+    objects: the prefix is derived from the authenticated user, not from data.
+
+    Only the SOURCE images are removed. Sessions that referenced them are gone
+    with the book; sessions of other books are untouched, because every key is
+    scoped to this item.
+    """
+    images = item.images or []
+    if not isinstance(images, list) or not images:
+        return True
+    prefix = "book-images/%s/%s/" % (user_id, item.id)
+    s3 = S3Service()
+    ok = True
+    for img in images:
+        key = (img or {}).get("key") if isinstance(img, dict) else None
+        if not key:
+            continue
+        if not str(key).startswith(prefix):
+            logger.error("Refusing to delete out-of-scope image key for item %s", item.id)
+            ok = False
+            continue
+        # Each delete is isolated: one object that raises must not abandon the
+        # rest, or a single transient failure leaves the remainder orphaned
+        # forever with no record that they exist.
+        try:
+            if not s3.delete_file(key):
+                ok = False
+        except Exception as e:  # noqa: BLE001
+            logger.error("Image delete raised for %s: %s", key, e)
+            ok = False
+    return ok
+
+
+@router.get("/{item_id}/images/{candidate_id}")
+def get_book_image(
+    item_id: str,
+    candidate_id: str,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Mint a short-lived view URL for one extracted book figure, for its owner.
+
+    Returns JSON — `{"url": ..., "expires_in": 3600}` — deliberately, NOT a 307
+    redirect to S3. A redirect would have the client following a cross-host hop
+    while holding an `Authorization: Bearer <firebase id token>` header, and
+    iOS's URLSession forwards headers across redirects by default. That would
+    hand a user's Firebase token to Amazon on every image load. Returning the
+    URL as data keeps the authenticated request and the storage request
+    completely separate: the app fetches this with its token, then fetches the
+    picture with no credentials at all.
+
+    What a card persists is the API PATH, not the URL this returns. Presigned
+    URLs expire in an hour and a nibble is replayed from the Nibble Bank months
+    later, so a persisted URL would be a card that works today and 404s in
+    August. Refreshing expired access is therefore just calling this again.
+
+    Ownership is established by the QUERY, not by comparing ids: the lookup is
+    scoped to this user AND this book, so an id belonging to another account is
+    simply not found. There is no comparison to get wrong, and enumeration
+    reveals nothing.
+
+    Scoping by BOOK as well as owner matters because candidate ids were once
+    derived from the image checksum alone: the same figure in two uploaded
+    books produced one id, and a library-wide search then had two rows to
+    choose from and picked whichever came first. The path names the book, and
+    the id is now salted with it too.
+    """
+    if not candidate_id or not candidate_id.startswith("img_") or len(candidate_id) > 64:
+        raise HTTPException(status_code=404, detail="Image not found.")
+
+    item = db.query(LibraryItem).filter(
+        LibraryItem.id == item_id,
+        LibraryItem.user_id == current_user.id,
+    ).first()
+    if item is None:
+        raise HTTPException(status_code=404, detail="Image not found.")
+
+    for img in (item.images or []):
+        if not isinstance(img, dict) or img.get("id") != candidate_id:
+            continue
+        key = img.get("key") or ""
+        # The stored key must still sit under this owner's and book's prefix.
+        # A row that fails this was tampered with or written by a bug; either
+        # way it is not something to hand to S3.
+        if not key.startswith("book-images/%s/%s/" % (current_user.id, item.id)):
+            logger.error("Image row %s has an out-of-scope key", candidate_id)
+            raise HTTPException(status_code=404, detail="Image not found.")
+        try:
+            url = S3Service().generate_presigned_url(key, expiry=IMAGE_URL_TTL)
+        except Exception as e:
+            logger.warning("Presign failed for %s: %s", candidate_id, e)
+            raise HTTPException(status_code=502, detail="Image unavailable right now.")
+        return {
+            "id": candidate_id,
+            "item_id": item.id,
+            "url": url,
+            "expires_in": IMAGE_URL_TTL,
+            "mime": img.get("mime") or "image/png",
+            "alt": img.get("alt") or img.get("caption") or "",
+            "w": img.get("w"),
+            "h": img.get("h"),
+        }
+
+    raise HTTPException(status_code=404, detail="Image not found.")
+
+
 @router.delete("/{item_id}")
 def delete_library_item(
     item_id: str,
@@ -441,6 +557,12 @@ def delete_library_item(
     file_cleared = True
     if item.file_url:
         file_cleared = S3Service().delete_file(item.file_url)
+
+    # Extracted figures are separate S3 objects from the source file, so they
+    # survive deleting the book unless deleted explicitly. Scoped to this
+    # owner and this book: the keys come from the stored rows, never from user
+    # input, so no path here can address another user's objects.
+    images_cleared = _delete_item_images(item, current_user.id)
 
     # Everything derived from this book goes with it, in the same transaction.
     #
@@ -491,18 +613,19 @@ def delete_library_item(
     db.delete(item)
     db.commit()
 
-    if not (vectors_cleared and file_cleared):
+    if not (vectors_cleared and file_cleared and images_cleared):
         # The row is gone either way — but say so, rather than reporting a clean
         # delete while objects or vectors are still out there.
         logger.error(
-            "Library delete incomplete for item %s (user %s): pinecone_ok=%s s3_ok=%s. "
-            "Manual cleanup required.", item_id, current_user.id, vectors_cleared, file_cleared,
+            "Library delete incomplete for item %s (user %s): pinecone_ok=%s s3_ok=%s "
+            "images_ok=%s. Manual cleanup required.",
+            item_id, current_user.id, vectors_cleared, file_cleared, images_cleared,
         )
 
     return {
         "message": "Item deleted successfully",
         "removed": removed,
-        "external_cleanup_complete": bool(vectors_cleared and file_cleared),
+        "external_cleanup_complete": bool(vectors_cleared and file_cleared and images_cleared),
     }
 
 
@@ -516,6 +639,69 @@ EMBEDDING_DOWN_MESSAGE = (
     "Nibbler couldn't finish reading this one — the reading service is briefly "
     "unavailable. Delete it and upload again in a few minutes."
 )
+
+
+def _extract_book_images(db, item, file_bytes: bytes, user_id: str) -> int:
+    """Extract this book's figures onto `item.images`. Never raises.
+
+    Runs after text extraction and indexing have already succeeded, so the only
+    thing at risk is the pictures themselves. Everything is caught: Pillow
+    missing, a malformed PDF stream, S3 down, an EPUB with a broken OPF. All of
+    those end with a normal text-only book, which is the expected state for
+    most uploads anyway.
+
+    Existing library items are NOT reprocessed. A book uploaded before this
+    feature has `images = None` and keeps producing text-only sessions, which
+    is correct — re-reading every stored file to hunt for figures would be a
+    large, silent, retroactive S3 bill.
+    """
+    from app.services.image_extract import extract_and_store, pdf_page_texts
+
+    try:
+        is_epub = (item.type or "").lower() == "epub"
+        page_texts = None
+        if not is_epub:
+            try:
+                page_texts = pdf_page_texts(file_bytes)
+            except Exception:
+                # Page text only sharpens relevance matching; without it the
+                # candidates are still usable, just less well described.
+                page_texts = None
+
+        images = extract_and_store(
+            file_bytes=file_bytes,
+            filename=("x.epub" if is_epub else "x.pdf"),
+            item_id=item.id,
+            user_id=user_id,
+            page_texts=page_texts,
+        )
+        if not images:
+            return 0
+        try:
+            item.images = images
+            db.commit()
+        except Exception as e:
+            # The objects are already in S3. Failing to record them would leave
+            # paid-for files nothing knows about — invisible to book deletion,
+            # invisible to account erasure, and therefore permanent. Delete
+            # what we just uploaded rather than orphan it.
+            logger.error("[images] could not persist rows for %s (%s) — removing "
+                         "the uploaded objects", item.id, e)
+            try:
+                db.rollback()
+            except Exception:
+                pass
+            from app.services.image_extract import delete_stored
+            delete_stored(images)
+            return 0
+        return len(images)
+    except Exception as e:
+        logger.warning("[images] extraction skipped for %s: %s", item.id, e)
+        try:
+            db.rollback()
+        except Exception:
+            pass
+        return 0
 
 
 def _record_processing_error(item_id: str, message: str):
@@ -641,6 +827,12 @@ def process_pdf_embeddings(item_id: str, pdf_bytes: bytes, user_id: str):
         item.processed = True
         item.chunk_count = chunk_count
         db.commit()
+
+        # Figures, AFTER the text is safely indexed. Deliberately last and
+        # deliberately swallowed: a book's pictures are a garnish on a pipeline
+        # whose real job is text, and no failure here may cost the user their
+        # upload. `_extract_book_images` never raises.
+        _extract_book_images(db, item, pdf_bytes, user_id)
     except EmbeddingError as e:
         db.rollback()
         print(f"[process_pdf_embeddings] Embedding failed for item {item_id}: {e}")
@@ -773,6 +965,11 @@ def process_epub_embeddings(item_id: str, epub_bytes: bytes, user_id: str):
         item.processed = True
         item.chunk_count = chunk_count
         db.commit()
+
+        # Figures, after the text is safely indexed — see the PDF path. An
+        # EPUB's images come with captions and alt text, so they describe
+        # themselves far better than a PDF's do.
+        _extract_book_images(db, item, epub_bytes, user_id)
     except EmbeddingError as e:
         db.rollback()
         print(f"[process_epub_embeddings] Embedding failed for item {item_id}: {e}")

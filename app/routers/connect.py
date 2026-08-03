@@ -26,7 +26,7 @@ from app.models.user import User
 from app.models.library import LibraryItem
 from app.models.bite import DailyBite
 from app.rate_limit import limiter
-from app.services.claude import ClaudeService
+from app.services.llm import LLMService
 from app.services.embedding_service import EmbeddingService, EmbeddingError
 from app.services import mixpanel_service
 
@@ -298,9 +298,9 @@ def chat(
     if not excerpts:
         raise HTTPException(status_code=422, detail="No indexed content found for this book.")
 
-    claude = ClaudeService(is_premium=current_user.effective_premium)
+    llm = LLMService()
     try:
-        reply = claude.chat_with_book(
+        reply = llm.chat_with_book(
             book_title=item.title,
             author=item.author,
             excerpts=excerpts,

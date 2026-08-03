@@ -18,6 +18,12 @@ os.environ["DATABASE_URL"] = f"sqlite:///{TMP}/test.db"
 os.environ["CLAUDE_API_KEY"] = "test-not-a-real-key"
 os.environ["FIREBASE_PROJECT_ID"] = "test-project"
 sys.path.insert(0, BACKEND)
+# Isolate from the real .env, which holds production AWS/Pinecone/Voyage
+# credentials. Setting env vars is not enough: `env_file = ".env"` is a
+# RELATIVE path, so every key NOT overridden here still came from the real
+# file — which is how this suite once made a live S3 request. hermetic.py
+# moves the process somewhere .env does not exist. Must precede `app.` imports.
+import hermetic  # noqa: F401
 
 failures = []
 

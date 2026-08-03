@@ -23,8 +23,9 @@ from sqlalchemy.exc import IntegrityError
 from app.models.bite import DailyBite
 from app.models.library import LibraryItem
 from app.models.user import User
-from app.services.claude import ClaudeService
+from app.services.llm import LLMService
 from app.services.embedding_service import EmbeddingService
+from app.services import image_select
 
 logger = logging.getLogger(__name__)
 
@@ -35,7 +36,7 @@ STORY_WORDS = {5: 1100, 10: 2200, 15: 3300}
 
 
 class SessionGenerationError(Exception):
-    """A session couldn't be generated (bad input, retrieval empty, Claude failure)."""
+    """A session couldn't be generated (bad input, retrieval empty, provider failure)."""
 
     def __init__(self, message: str, status_code: int = 502):
         super().__init__(message)
@@ -125,8 +126,9 @@ def generate_session_for_item(
     own those pre-checks (the HTTP handler and the scheduler differ there).
     """
     read_length = read_length if read_length in CARD_TARGETS else 5
-    is_premium = user.effective_premium
-    claude = ClaudeService(is_premium=is_premium)
+    # Which model generates this deck is a routing decision, not a tier one:
+    # free, trial and premium users all get whatever LLM_ROUTING_MODE selects.
+    llm = LLMService()
     mode = item.mode or "wisdom"
     card_target = CARD_TARGETS[read_length]
     story_finished = False
@@ -160,18 +162,34 @@ def generate_session_for_item(
             bodies = split_story_cards(excerpt, max(3, card_target - 1))
             if not bodies:
                 raise SessionGenerationError("No readable text stored for this book.", 422)
+            # Figures the reader has already reached. A picture from further
+            # ahead is a spoiler — a character, a place, a plot beat they have
+            # not met — so the shortlist is capped at today's position and the
+            # same cap is re-applied after the model answers.
+            # Both sides of this comparison are WORD fractions of the same
+            # text: `progress` is a word offset into item.content, and a
+            # candidate's position is the fraction of the book's words before
+            # it. Candidates recorded in pages or spine units are refused
+            # outright rather than converted — see image_select.
+            story_max_position = min(1.0, (progress + n) / max(1, len(words)))
+            story_candidates = image_select.safe_shortlist(
+                item.images, excerpt, max_position=story_max_position,
+            )
+
             # The model never carries the prose — it only names what it reads.
             # Story mode's whole promise is the book itself, so a paraphrase or
             # a silently reflowed paragraph is a bug, not a style choice.
             try:
-                meta = claude.generate_story_metadata(
+                meta = llm.generate_story_metadata(
                     book_title=item.title, author=item.author,
                     card_bodies=bodies, part_number=part_number,
+                    image_options=image_select.safe_prompt(story_candidates),
                 )
             except Exception as e:
                 logger.warning("Story metadata failed (%s) — serving plain headings", e)
                 meta = {}
             headings = meta.get("headings") or []
+            story_image_ids = meta.get("imageIds") or []
             result = {
                 "title": meta.get("title") or f"{item.title} — part {part_number}",
                 "chapter": f"PART {part_number}",
@@ -183,11 +201,28 @@ def generate_session_for_item(
                         "eyebrow": "TODAY'S READING" if i == 0 else "THE STORY CONTINUES",
                         "title": headings[i] if i < len(headings) else "",
                         "body": body,
+                        # Positional: story cards are server-owned and have no
+                        # id the model could name, so it answers with an array
+                        # parallel to `headings`. Validated below.
+                        "imageId": (story_image_ids[i]
+                                    if i < len(story_image_ids) else None),
                     }
                     for i, body in enumerate(bodies)
                 ],
                 "quiz": None,
             }
+            # Failure here must never cost the reader their portion: the text
+            # is already correct and complete, and a picture is a garnish.
+            try:
+                image_select.attach_images(
+                    result["cards"], shortlisted=story_candidates,
+                    user_id=user.id, item_id=item.id,
+                    max_position=story_max_position,
+                )
+            except Exception as e:
+                logger.warning("Story image attach failed (%s) — text-only portion", e)
+                for card in result["cards"]:
+                    card.pop("imageId", None)
             item.story_progress = min(progress + n, len(words))
     else:
         profile = profile or {}
@@ -232,14 +267,34 @@ def generate_session_for_item(
             chunk_ids = []
         if not chunks:
             raise SessionGenerationError("No indexed content found for this item.", 422)
+        # Figures whose caption/alt/nearby text overlaps the passages this
+        # deck is being written from. Empty for most books, which is the
+        # expected outcome — a text-only deck is a correct deck.
+        wisdom_candidates = image_select.safe_shortlist(item.images, " ".join(chunks))
+
         try:
-            result = claude.generate_wisdom_session(
+            result = llm.generate_wisdom_session(
                 book_title=item.title, author=item.author,
                 profile=profile, context_chunks=chunks,
                 card_target=card_target, read_length=read_length,
+                image_options=image_select.safe_prompt(wisdom_candidates),
             )
         except Exception as e:
             raise SessionGenerationError(f"Session generation failed: {e}", 502)
+
+        # Ownership, book and shortlist membership are all re-checked here from
+        # the stored rows — the id came back from a model, so nothing about it
+        # is trusted. An exception must not lose an otherwise valid deck.
+        try:
+            image_select.attach_images(
+                result.get("cards") or [], shortlisted=wisdom_candidates,
+                user_id=user.id, item_id=item.id,
+            )
+        except Exception as e:
+            logger.warning("Wisdom image attach failed (%s) — text-only deck", e)
+            for card in result.get("cards") or []:
+                if isinstance(card, dict):
+                    card.pop("imageId", None)
 
     bite = DailyBite(
         id=str(uuid.uuid4()),

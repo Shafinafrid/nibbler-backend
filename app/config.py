@@ -12,12 +12,80 @@ class Settings(BaseSettings):
     openai_api_key: str = ""
     image_model: str = "gpt-image-1"
     image_quality: str = "low"
-    image_generation_enabled: bool = True
+    # Default flipped True → False on 2026-08-02 after audit. The module was
+    # already unreachable, but "unreachable" was an accident of nothing
+    # importing it (and of a broken import inside it) rather than a decision.
+    # A default of True meant the day someone wired it up, image generation
+    # would switch itself on and start billing. Turning it on must take a
+    # deliberate act.
+    image_generation_enabled: bool = False
 
-    # Claude
-    claude_api_key: str
-    claude_model_free: str = "claude-haiku-4-5"
-    claude_model_paid: str = "claude-sonnet-4-6"
+    # ── Text generation: provider-neutral routing ────────────────────────────
+    # Nibbler talks to one of three interchangeable models through
+    # app/services/llm/. Which one is a deployment decision, not a code change:
+    # flip these variables in Railway and restart.
+    #
+    #   single   → call LLM_ACTIVE_PROVIDER and nothing else. This is the mode
+    #              for judging output quality, because a silent fallback would
+    #              mean reviewing a different model's work than you think.
+    #   fallback → walk LLM_FALLBACK_ORDER, stopping at the first response that
+    #              passes schema + semantic validation.
+    llm_routing_mode: str = "fallback"          # single | fallback
+    llm_active_provider: str = "luna"           # luna | haiku | qwen
+    llm_fallback_order: str = "luna,haiku,qwen"
+    llm_luna_enabled: bool = True
+    llm_haiku_enabled: bool = True
+    llm_qwen_enabled: bool = True
+    # How long a provider stays skipped after it proves itself unwell (out of
+    # credit, 401, unreachable). Process-local — see llm/circuit.py.
+    llm_circuit_cooldown_seconds: int = 120
+
+    # Luna (OpenAI GPT-5.6 Luna) — default provider.
+    # DELIBERATELY SEPARATE from `openai_api_key` above, which belongs to the
+    # inert image-generation module. Setting this key must never switch image
+    # generation on, so the two never share a field.
+    openai_llm_api_key: str = ""
+    # Always the explicit Luna id: the bare `gpt-5.6` alias routes to Sol.
+    openai_llm_model: str = "gpt-5.6-luna"
+    # Capped at low by validate_llm_settings(); reasoning tokens bill as output.
+    openai_llm_reasoning_effort: str = "low"
+    openai_llm_timeout_seconds: float = 90.0
+
+    # Haiku (Anthropic Claude Haiku 4.5) — first fallback.
+    # `claude_api_key` is the pre-August-2026 name, kept working so an existing
+    # Railway deploy does not break the moment this ships; the new name wins if
+    # both are set. It no longer has a required marker, because Luna-only or
+    # Qwen-only deployments must not need an Anthropic key at all.
+    anthropic_llm_api_key: str = ""
+    anthropic_llm_model: str = "claude-haiku-4-5"
+    anthropic_llm_timeout_seconds: float = 120.0
+    claude_api_key: str = ""
+
+    # DEPRECATED AND UNREAD. Nothing in the codebase looks at these — model
+    # choice is a routing decision now, never a subscription-tier one, and
+    # Sonnet is not used at all. They are declared solely because
+    # pydantic-settings rejects unknown env keys, and both are still set in
+    # Railway and in local .env files: deleting the fields would turn the next
+    # deploy into a boot failure. Safe to remove here once they are gone from
+    # the Railway variables.
+    claude_model_free: str = ""
+    claude_model_paid: str = ""
+
+    # Qwen — second fallback, an OpenAI-compatible HTTPS endpoint.
+    # Railway cannot reach a MacBook's localhost or LAN, so this is a public
+    # tunnel URL with its own bearer token, never http://127.0.0.1.
+    qwen_base_url: str = ""
+    qwen_api_key: str = ""
+    qwen_model: str = "qwen3-14b"
+    qwen_timeout_seconds: float = 180.0
+    # The context window llama-server was STARTED with (`--ctx-size`). The
+    # backend cannot ask the server what it is, so it is declared here and
+    # checked at startup against the largest request Nibbler actually makes.
+    # 8192 — the obvious-looking default — cannot serve a 15-minute Wisdom
+    # deck: that request alone reserves 7,980 output tokens, which would leave
+    # ~200 for the system prompt, profile and book excerpts. See
+    # docs/QWEN_LOCAL_SETUP.md for the arithmetic.
+    qwen_context_size: int = 32768
 
     # Firebase
     firebase_project_id: str

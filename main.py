@@ -8,8 +8,12 @@ from app.rate_limit import limiter
 from app.routers import auth, profile, library, bites, streak
 from app.routers import notifications, connect, support, revenuecat, sync
 from app.services.notification_service import start_scheduler, stop_scheduler
+from app.services.llm import validate_llm_settings
 from app.config import get_settings
 
+import logging
+
+logger = logging.getLogger(__name__)
 settings = get_settings()
 
 
@@ -20,6 +24,11 @@ def _db_factory():
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Startup
+    # Fail loudly and early on an unusable provider configuration: a bad
+    # LLM_FALLBACK_ORDER should be a boot error with a readable message, not a
+    # 502 the first time someone opens a nibble. Makes no network or paid call.
+    for warning in validate_llm_settings(settings):
+        logger.warning("LLM config: %s", warning)
     create_tables()
     start_scheduler(_db_factory)
     yield

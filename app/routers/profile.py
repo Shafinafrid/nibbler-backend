@@ -13,7 +13,7 @@ from app.schemas.profile import (
     AspirationResult,
     GrowthStateUpdate,
 )
-from app.services.claude import ClaudeService
+from app.services.llm import LLMService
 import logging
 import uuid
 
@@ -153,11 +153,11 @@ def interpret_aspiration(request: Request, data: AspirationRequest):
     Anthropic key never ships in the app binary).
 
     Deliberately unauthenticated: onboarding runs before account creation.
-    Kept cheap and abuse-resistant via the 500-char input cap, the free-tier
-    model, small max_tokens, and per-IP rate limiting.
+    Kept cheap and abuse-resistant via the 500-char input cap, a small
+    max_tokens budget, and per-IP rate limiting.
     """
-    claude = ClaudeService(is_premium=False)
-    return claude.interpret_aspiration(data.answer)
+    llm = LLMService()
+    return llm.interpret_aspiration(data.answer)
 
 
 # NOTE (July 2026): POST /profile/onboarding/chat was retired here. It served

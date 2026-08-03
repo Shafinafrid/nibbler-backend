@@ -5,6 +5,12 @@ BACKEND = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 TMP = tempfile.mkdtemp()
 os.environ.update(DATABASE_URL=f"sqlite:///{TMP}/b.db", CLAUDE_API_KEY="t", FIREBASE_PROJECT_ID="t")
 sys.path.insert(0, BACKEND)
+# Isolate from the real .env, which holds production AWS/Pinecone/Voyage
+# credentials. Setting env vars is not enough: `env_file = ".env"` is a
+# RELATIVE path, so every key NOT overridden here still came from the real
+# file — which is how this suite once made a live S3 request. hermetic.py
+# moves the process somewhere .env does not exist. Must precede `app.` imports.
+import hermetic  # noqa: F401
 
 failures = []
 def check(name, cond, detail=""):
@@ -53,11 +59,39 @@ calls = [
     ("PUT",    "/sync/avatar",         {"image_base64": base64.b64encode(b"x" * 64).decode()}),
     ("DELETE", "/sync/avatar",         None),
 ]
+# PUT /sync/avatar uploads to S3. Blank AWS credentials do NOT stop boto3 from
+# opening a real TLS connection to AWS and being rejected there — so the old
+# "502 is acceptable, no creds in this harness" allowance was quietly passing
+# over a genuine outbound request to Amazon on every run. Stub the client
+# instead: the endpoint's own logic is what this suite is checking, not S3's.
+import app.routers.sync as sync_router  # noqa: E402
+
+_s3_calls = []
+
+
+class _StubS3:
+    def upload_file(self, file_content, filename, content_type=None):
+        _s3_calls.append(("upload", filename))
+        return filename
+
+    def download_file(self, key):
+        _s3_calls.append(("download", key))
+        return b"stub-image-bytes"
+
+    def delete_file(self, key):
+        _s3_calls.append(("delete", key))
+        return True
+
+
+sync_router.S3Service = _StubS3
+
 for method, path, body in calls:
     r = c.request(method, path, json=body) if body is not None else c.request(method, path)
-    # 502 is acceptable for avatar PUT (no AWS creds in this harness).
-    ok = r.status_code < 500 or (path == "/sync/avatar" and r.status_code == 502)
+    ok = r.status_code < 500
     check(f"{method} {path} → {r.status_code}", ok, "" if ok else r.text[:160])
+
+check("avatar upload reached S3 through the stub, not the network",
+      ("upload", "u1/avatar.jpg") in _s3_calls, str(_s3_calls))
 
 section("ITEM 20a — re-pushing a highlight refreshes its card text")
 c.put("/sync/highlights", json={"book_id": "b9", "card_index": 1, "card_title": "Old title", "card_body": "old"})
