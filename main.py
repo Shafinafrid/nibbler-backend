@@ -8,13 +8,21 @@ from app.rate_limit import limiter
 from app.routers import auth, profile, library, bites, streak
 from app.routers import notifications, connect, support, revenuecat, sync
 from app.services.notification_service import start_scheduler, stop_scheduler
-from app.services.llm import validate_llm_settings
+from app.services.llm import validate_llm_settings, configure_llm_telemetry_logging
 from app.config import get_settings
 
 import logging
 
 logger = logging.getLogger(__name__)
 settings = get_settings()
+
+# Module-level, not inside lifespan(): this runs the moment uvicorn imports
+# `main:app`, before any route exists to receive a request — the earliest
+# point that still satisfies "before any request can invoke an LLM". Touches
+# only the LLM telemetry logger (see app/services/llm/usage.py); uvicorn's own
+# logging setup is untouched either way, since it sets
+# disable_existing_loggers=False and only configures its own three loggers.
+configure_llm_telemetry_logging()
 
 
 def _db_factory():

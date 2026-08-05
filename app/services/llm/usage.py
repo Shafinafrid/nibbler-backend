@@ -264,3 +264,56 @@ def emit_circuit_skip(*, request_id: str, operation: str, provider: str,
         "provider": provider,
         "seconds_remaining": seconds_remaining,
     })
+
+
+# ── making the telemetry above actually visible in production ──────────────
+# `logger` above is this module's own `getLogger(__name__)` — every event this
+# file emits already goes through it. Nothing in the app ever configures the
+# ROOT logger (no `logging.basicConfig`), so a bare `logger.info(...)` here
+# inherits Python's default root level, WARNING, and is silently dropped. That
+# is why Railway showed uvicorn's own access/startup lines (uvicorn configures
+# "uvicorn"/"uvicorn.error"/"uvicorn.access" itself, explicitly, at INFO) but
+# never an `llm_attempt` or `llm_usage` line, even for a real, successful call.
+#
+# The fix is scoped to exactly this one logger — not the root logger, not any
+# third-party SDK logger — so it cannot turn on verbose OpenAI/Anthropic/httpx/
+# urllib3/boto3/Firebase/Pinecone/Voyage output as a side effect.
+_TELEMETRY_HANDLER_MARKER = "_nibbler_llm_telemetry_handler"
+
+
+def configure_llm_telemetry_logging() -> logging.Logger:
+    """Make this module's INFO-level telemetry visible, exactly once per process.
+
+    Idempotent by construction: the marker attribute on the handler (not a
+    handler *count*) is what gets checked, so calling this twice — a stray
+    duplicate import, calling it from more than one startup path — attaches
+    nothing a second time and does not double every future log line. Uvicorn
+    sets `disable_existing_loggers: False` in its own dictConfig (verified
+    against the installed version), so this logger's level/handler survive
+    regardless of whether uvicorn's own logging setup runs before or after
+    this call.
+
+    Safe to call before uvicorn's app import completes: it touches only the
+    logger named after this module, never the root logger and never uvicorn's
+    own "uvicorn"/"uvicorn.access"/"uvicorn.error" loggers.
+    """
+    logger.setLevel(logging.INFO)
+
+    if not any(getattr(h, _TELEMETRY_HANDLER_MARKER, False) for h in logger.handlers):
+        handler = logging.StreamHandler()
+        handler.setLevel(logging.INFO)
+        handler.setFormatter(logging.Formatter(
+            "%(asctime)s %(levelname)s %(name)s %(message)s"
+        ))
+        setattr(handler, _TELEMETRY_HANDLER_MARKER, True)
+        logger.addHandler(handler)
+        # This logger now has its own handler; letting the record ALSO
+        # propagate to the root logger's handlers (present or future) would
+        # print every event twice.
+        logger.propagate = False
+        # One harmless line, carrying no environment, provider, model or
+        # account information — proves telemetry is live without needing a
+        # real (paid) provider call to verify it in production.
+        _emit("llm_telemetry_ready", {"enabled": True})
+
+    return logger

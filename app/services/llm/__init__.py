@@ -45,7 +45,7 @@ from .prompts import (
 )
 from .router import LLMConfigError, LLMRouter, validate_llm_settings
 from .schemas import aspiration_schema, story_schema, wisdom_schema
-from .usage import OP_ASPIRATION, OP_CONNECT, OP_STORY, OP_WISDOM
+from .usage import OP_ASPIRATION, OP_CONNECT, OP_STORY, OP_WISDOM, configure_llm_telemetry_logging
 from .validation import (
     coerce_card_list,
     enforce_schema,
