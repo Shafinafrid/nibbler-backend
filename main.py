@@ -16,14 +16,6 @@ import logging
 logger = logging.getLogger(__name__)
 settings = get_settings()
 
-# Module-level, not inside lifespan(): this runs the moment uvicorn imports
-# `main:app`, before any route exists to receive a request — the earliest
-# point that still satisfies "before any request can invoke an LLM". Touches
-# only the LLM telemetry logger (see app/services/llm/usage.py); uvicorn's own
-# logging setup is untouched either way, since it sets
-# disable_existing_loggers=False and only configures its own three loggers.
-configure_llm_telemetry_logging()
-
 
 def _db_factory():
     return SessionLocal()
@@ -32,6 +24,13 @@ def _db_factory():
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Startup
+    # First, always: a preloaded/forked worker must run this ITSELF rather
+    # than relying on whatever module-import time did (a fork inherits an
+    # already-configured logger, but still needs to announce ITS OWN PID —
+    # see configure_llm_telemetry_logging's docstring). Before settings
+    # validation, database init and the scheduler, and before any route can
+    # receive a request.
+    configure_llm_telemetry_logging()
     # Fail loudly and early on an unusable provider configuration: a bad
     # LLM_FALLBACK_ORDER should be a boot error with a readable message, not a
     # 502 the first time someone opens a nibble. Makes no network or paid call.

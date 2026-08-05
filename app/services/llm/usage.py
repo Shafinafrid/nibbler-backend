@@ -18,6 +18,8 @@ content. The events carry counts, categories and identifiers — never payloads.
 
 import json
 import logging
+import os
+import threading
 from typing import Any, Dict, Optional
 
 logger = logging.getLogger(__name__)
@@ -278,42 +280,98 @@ def emit_circuit_skip(*, request_id: str, operation: str, provider: str,
 # The fix is scoped to exactly this one logger — not the root logger, not any
 # third-party SDK logger — so it cannot turn on verbose OpenAI/Anthropic/httpx/
 # urllib3/boto3/Firebase/Pinecone/Voyage output as a side effect.
+#
+# TWO independent idempotency mechanisms, deliberately not conflated:
+#
+#   * the marked HANDLER answers "does this logger already have somewhere to
+#     write to?" — true for a forked child, which inherits it via copy-on-write
+#     memory, exactly as it inherits everything else at the moment of fork().
+#   * the READY-PID answers "has THIS process already announced itself?" — a
+#     forked child has a different real `os.getpid()` than whatever PID was
+#     recorded before the fork, so it still gets to announce itself even
+#     though it did not have to build its own handler to do it.
+#
+# Treating "a handler exists" as proof that "this process already announced
+# itself" is exactly the bug this round fixes: it gave one readiness line per
+# interpreter LINEAGE (parent + every forked child sharing the parent's
+# already-configured state), not one per actual OS process.
 _TELEMETRY_HANDLER_MARKER = "_nibbler_llm_telemetry_handler"
+
+_telemetry_lock = threading.Lock()
+_ready_pid: Optional[int] = None
+
+
+def _reset_telemetry_lock_after_fork() -> None:
+    """Give a forked child a FRESH, certainly-unlocked lock.
+
+    `fork()` duplicates whatever state the lock was in at the instant of the
+    call. If some OTHER thread happened to hold `_telemetry_lock` at that
+    moment, the child would inherit a permanently-held lock with no thread
+    that will ever release it — a deadlock the very first time the child
+    calls `configure_llm_telemetry_logging()`. Replacing the lock object
+    outright, rather than trying to unlock the inherited one, is the standard
+    fix and needs no assumption about what the inherited lock's state is.
+    """
+    global _telemetry_lock
+    _telemetry_lock = threading.Lock()
+
+
+if hasattr(os, "register_at_fork"):  # POSIX only; Windows has no fork() to guard
+    os.register_at_fork(after_in_child=_reset_telemetry_lock_after_fork)
 
 
 def configure_llm_telemetry_logging() -> logging.Logger:
-    """Make this module's INFO-level telemetry visible, exactly once per process.
+    """Make this module's INFO-level telemetry visible, once per OS process.
 
-    Idempotent by construction: the marker attribute on the handler (not a
-    handler *count*) is what gets checked, so calling this twice — a stray
-    duplicate import, calling it from more than one startup path — attaches
-    nothing a second time and does not double every future log line. Uvicorn
-    sets `disable_existing_loggers: False` in its own dictConfig (verified
-    against the installed version), so this logger's level/handler survive
-    regardless of whether uvicorn's own logging setup runs before or after
-    this call.
+    Call from the START of FastAPI's lifespan startup — before settings
+    validation, database init or the scheduler — so every actual serving
+    worker (including one that began life as a fork of an already-configured
+    parent) runs this itself, rather than relying on whatever module-import
+    happened to do.
 
-    Safe to call before uvicorn's app import completes: it touches only the
-    logger named after this module, never the root logger and never uvicorn's
-    own "uvicorn"/"uvicorn.access"/"uvicorn.error" loggers.
+    Thread-safe: the whole check-then-act sequence (marker inspection,
+    handler attachment, level, propagation, and the ready-PID compare-and-set)
+    runs under one lock, so concurrent callers cannot both observe "no handler
+    yet" and both attach one, and cannot both observe "not yet ready for this
+    PID" and both emit readiness.
+
+    Uvicorn sets `disable_existing_loggers: False` in its own dictConfig
+    (verified against the installed version), so this logger's level/handler
+    survive regardless of whether Uvicorn's own logging setup runs before or
+    after this call, and neither Uvicorn's nor any third-party logger is ever
+    touched here.
     """
-    logger.setLevel(logging.INFO)
+    global _ready_pid
 
-    if not any(getattr(h, _TELEMETRY_HANDLER_MARKER, False) for h in logger.handlers):
-        handler = logging.StreamHandler()
-        handler.setLevel(logging.INFO)
-        handler.setFormatter(logging.Formatter(
-            "%(asctime)s %(levelname)s %(name)s %(message)s"
-        ))
-        setattr(handler, _TELEMETRY_HANDLER_MARKER, True)
-        logger.addHandler(handler)
-        # This logger now has its own handler; letting the record ALSO
-        # propagate to the root logger's handlers (present or future) would
-        # print every event twice.
-        logger.propagate = False
-        # One harmless line, carrying no environment, provider, model or
-        # account information — proves telemetry is live without needing a
-        # real (paid) provider call to verify it in production.
-        _emit("llm_telemetry_ready", {"enabled": True})
+    with _telemetry_lock:
+        logger.setLevel(logging.INFO)
+
+        has_handler = any(getattr(h, _TELEMETRY_HANDLER_MARKER, False) for h in logger.handlers)
+        if not has_handler:
+            handler = logging.StreamHandler()
+            handler.setLevel(logging.INFO)
+            handler.setFormatter(logging.Formatter(
+                "%(asctime)s %(levelname)s %(name)s %(message)s"
+            ))
+            setattr(handler, _TELEMETRY_HANDLER_MARKER, True)
+            logger.addHandler(handler)
+            # This logger now has its own handler; letting the record ALSO
+            # propagate to the root logger's handlers (present or future)
+            # would print every event twice.
+            logger.propagate = False
+
+        # A forked child inherits `_ready_pid` set to whatever PID last
+        # announced readiness — its PARENT's, at fork time. `os.getpid()` is a
+        # syscall, never inherited, so it correctly differs in the child, and
+        # the child gets to announce itself exactly once despite having
+        # inherited a handler it did not have to build.
+        current_pid = os.getpid()
+        if _ready_pid != current_pid:
+            _ready_pid = current_pid
+            # One harmless line, carrying no environment, provider, model,
+            # account or PID information — proves telemetry is live without
+            # needing a real (paid) provider call to verify it in production.
+            # The PID is tracked only for internal lifecycle bookkeeping.
+            _emit("llm_telemetry_ready", {"enabled": True})
 
     return logger

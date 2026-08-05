@@ -66,6 +66,7 @@ __all__ = [
     "ErrorCategory",
     "validate_llm_settings",
     "ASPIRATION_FALLBACK",
+    "configure_llm_telemetry_logging",
 ]
 
 # ── visible-output budgets, per operation ───────────────────────────────────
