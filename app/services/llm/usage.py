@@ -281,24 +281,40 @@ def emit_circuit_skip(*, request_id: str, operation: str, provider: str,
 # third-party SDK logger — so it cannot turn on verbose OpenAI/Anthropic/httpx/
 # urllib3/boto3/Firebase/Pinecone/Voyage output as a side effect.
 #
-# TWO independent idempotency mechanisms, deliberately not conflated:
+# TWO independent idempotency mechanisms, deliberately not conflated, and BOTH
+# stored as attributes on the persistent Logger object itself rather than as
+# plain module-level globals:
 #
 #   * the marked HANDLER answers "does this logger already have somewhere to
 #     write to?" — true for a forked child, which inherits it via copy-on-write
 #     memory, exactly as it inherits everything else at the moment of fork().
-#   * the READY-PID answers "has THIS process already announced itself?" — a
-#     forked child has a different real `os.getpid()` than whatever PID was
-#     recorded before the fork, so it still gets to announce itself even
-#     though it did not have to build its own handler to do it.
+#   * the READY-PID marker answers "has THIS process already announced
+#     itself?" — a forked child has a different real `os.getpid()` than
+#     whatever PID was recorded before the fork, so it still gets to announce
+#     itself even though it did not have to build its own handler to do it.
 #
 # Treating "a handler exists" as proof that "this process already announced
-# itself" is exactly the bug this round fixes: it gave one readiness line per
-# interpreter LINEAGE (parent + every forked child sharing the parent's
-# already-configured state), not one per actual OS process.
+# itself" is exactly the bug an earlier round fixed: it gave one readiness
+# line per interpreter LINEAGE (parent + every forked child sharing the
+# parent's already-configured state), not one per actual OS process.
+#
+# A SECOND bug, found afterwards, is why the ready-PID marker lives on the
+# Logger rather than in a plain module global: `logging.getLogger(name)` is a
+# process-wide singleton (`logging.Logger.manager.loggerDict`), so
+# `importlib.reload()` of THIS module does not create a new Logger — it keeps
+# the same one, marked handler included — but it DOES re-execute this file's
+# top-level statements, which would reset a plain module-level global back to
+# its initial value. A global `_ready_pid` therefore reset to `None` on every
+# reload even though the persistent Logger's handler was untouched, so the
+# very next call saw "handler already attached" (skip re-attaching) but "not
+# yet ready for this PID" (fire a SECOND readiness line) — for a process that
+# never actually restarted. Storing the marker as an attribute on the same
+# persistent Logger the handler lives on means both rise and fall together
+# under reload, fork, or any combination of the two.
 _TELEMETRY_HANDLER_MARKER = "_nibbler_llm_telemetry_handler"
+_TELEMETRY_READY_PID_MARKER = "_nibbler_llm_telemetry_ready_pid"
 
 _telemetry_lock = threading.Lock()
-_ready_pid: Optional[int] = None
 
 
 def _reset_telemetry_lock_after_fork() -> None:
@@ -335,14 +351,19 @@ def configure_llm_telemetry_logging() -> logging.Logger:
     yet" and both attach one, and cannot both observe "not yet ready for this
     PID" and both emit readiness.
 
+    Both idempotency markers live as attributes on `logger` itself — a
+    process-wide singleton object that survives `importlib.reload()` of this
+    module — rather than in this module's own globals, which reload DOES
+    reset. Reload therefore cannot desynchronize "already has a handler" from
+    "already announced this PID": both read from, and write to, the one
+    object that outlives the reload.
+
     Uvicorn sets `disable_existing_loggers: False` in its own dictConfig
     (verified against the installed version), so this logger's level/handler
     survive regardless of whether Uvicorn's own logging setup runs before or
     after this call, and neither Uvicorn's nor any third-party logger is ever
     touched here.
     """
-    global _ready_pid
-
     with _telemetry_lock:
         logger.setLevel(logging.INFO)
 
@@ -360,14 +381,16 @@ def configure_llm_telemetry_logging() -> logging.Logger:
             # would print every event twice.
             logger.propagate = False
 
-        # A forked child inherits `_ready_pid` set to whatever PID last
-        # announced readiness — its PARENT's, at fork time. `os.getpid()` is a
-        # syscall, never inherited, so it correctly differs in the child, and
-        # the child gets to announce itself exactly once despite having
-        # inherited a handler it did not have to build.
+        # A forked child inherits this marker set to whatever PID last
+        # announced readiness — its PARENT's, at fork time (or, after a
+        # reload, whatever the pre-reload code last recorded, since the
+        # attribute lives on the Logger, not in code that reload replaces).
+        # `os.getpid()` is a syscall, never inherited and never reset by
+        # reload, so it correctly differs whenever the OS process actually
+        # differs, and stays the same whenever it does not.
         current_pid = os.getpid()
-        if _ready_pid != current_pid:
-            _ready_pid = current_pid
+        if getattr(logger, _TELEMETRY_READY_PID_MARKER, None) != current_pid:
+            setattr(logger, _TELEMETRY_READY_PID_MARKER, current_pid)
             # One harmless line, carrying no environment, provider, model,
             # account or PID information — proves telemetry is live without
             # needing a real (paid) provider call to verify it in production.
