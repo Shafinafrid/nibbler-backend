@@ -29,6 +29,7 @@ from app.rate_limit import limiter
 from app.services.llm import LLMService
 from app.services.embedding_service import EmbeddingService, EmbeddingError
 from app.services import mixpanel_service
+from app.services.entitlement_service import is_source_unlocked
 
 router = APIRouter(prefix="/connect", tags=["connect"])
 
@@ -121,11 +122,22 @@ def _get_item(item_id: str, user: User, db: Session) -> LibraryItem:
     item = db.query(LibraryItem).filter(
         LibraryItem.id == item_id,
         LibraryItem.user_id == user.id,
+        LibraryItem.deletion_state.is_(None),  # a tombstoned item is gone
     ).first()
     if not item:
         raise HTTPException(status_code=404, detail="Library item not found.")
     if not item.processed:
         raise HTTPException(status_code=409, detail="Nibbler is still reading this one.")
+    if not is_source_unlocked(user, item):
+        # Covers /connect/insights, /connect/stats/{id} and /connect/chat in
+        # one place — every caller routes through this helper (Task 2).
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "code": "source_locked",
+                "message": "This source is Premium-only right now. Upgrade to chat with it again.",
+            },
+        )
     return item
 
 

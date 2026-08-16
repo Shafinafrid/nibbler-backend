@@ -1,6 +1,6 @@
 from pydantic import BaseModel, Field
 from datetime import datetime
-from typing import Optional
+from typing import Optional, List
 
 
 class LibraryItemCreate(BaseModel):
@@ -46,6 +46,24 @@ class LibraryItemResponse(BaseModel):
     ocr_pages_done: Optional[int] = 0
     ocr_pages_total: Optional[int] = 0
     created_at: datetime
+    # ── Task 2 (Aug 2026) — Free lifetime source entitlement ──────────────
+    # unlocked: the authoritative, backend-computed effective access right
+    #   now — always true while Premium/trial/complimentary; while Free,
+    #   true only for the persisted ≤3-item selection. The client must
+    #   render/gate off THIS field, never re-derive its own lock logic.
+    # preselected: the raw persisted selection flag, independent of current
+    #   tier — lets the "choose your 3" picker show what's currently chosen
+    #   even while still Premium (when `unlocked` is true for everything).
+    unlocked: bool = True
+    preselected: bool = False
+    # Task 2 remediation (exactly-three chooser honesty, 2nd audit): the
+    # RAW provenance of the current selection — 'explicit' (the user picked
+    # it via PUT /library/free-selection), 'fallback' (computed
+    # deterministically at a real downgrade), 'legacy_fallback' (pre-cutover
+    # migration), or None (not currently selected). Lets the chooser UI show
+    # "you chose this" vs. "we picked this for you" truthfully instead of
+    # presenting every current pick as if the user had actively chosen it.
+    selection_kind: Optional[str] = None
 
     class Config:
         from_attributes = True
@@ -53,6 +71,13 @@ class LibraryItemResponse(BaseModel):
 
 class SetActiveRequest(BaseModel):
     active: bool
+
+
+class FreeSelectionRequest(BaseModel):
+    """A currently-entitled user choosing which ≤3 sources should stay
+    unlocked after their NEXT downgrade. Rejected while already Free — see
+    PUT /library/free-selection."""
+    item_ids: List[str] = Field(..., max_length=3)
 
 
 class UpdateItemRequest(BaseModel):
@@ -80,3 +105,7 @@ class LibraryItemList(BaseModel):
     items: list[LibraryItemResponse]
     total: int
     limit_reached: bool
+    # Task 2: authoritative numbers for the client's upload-limit copy —
+    # "consumed" is the PERMANENT lifetime count, not len(items).
+    successful_sources_total: int = 0
+    free_source_limit: int = 3

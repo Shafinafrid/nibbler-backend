@@ -1,5 +1,5 @@
 from datetime import datetime, timedelta
-from sqlalchemy import Column, String, Boolean, DateTime, func
+from sqlalchemy import Column, String, Boolean, DateTime, Integer, func
 from sqlalchemy.orm import relationship
 from app.database import Base
 
@@ -30,6 +30,36 @@ class User(Base):
     platform = Column(String, nullable=True)       # 'ios' | 'android'
     app_version = Column(String, nullable=True)
     last_seen_at = Column(DateTime, nullable=True)
+
+    # ── Free lifetime source entitlement (Task 2, Aug 2026) ───────────────────
+    # A PERMANENT, monotonic count of library_items that have ever reached
+    # processed=True for this account — regardless of tier at the time, and
+    # NEVER decremented on delete. This is what "3 permanent successful
+    # sources" is checked against for Free uploads; it is deliberately NOT a
+    # live COUNT(*) of current rows, because deleting a source must not
+    # restore an entitlement. See app/services/entitlement_service.py.
+    successful_sources_total = Column(Integer, default=0, nullable=False)
+    # Transient count of currently-PENDING Free reservations (see
+    # entitlement_service.reserve_free_capacity) — a slot held between "an
+    # upload started, capacity was checked" and "processing finished/failed".
+    # Always 0 for an entitled account. Never a substitute for
+    # successful_sources_total: reserved converts into consumed (+1 there,
+    # -1 here) on success, or is released (-1 here, nothing consumed) on
+    # failure/expiry — see app/services/entitlement_service.py.
+    reserved_sources_count = Column(Integer, default=0, nullable=False)
+    # Identifies the entitlement "episode" (is_premium + premium_until) that
+    # library_items.is_unlocked_selection was last computed for. Reconciled
+    # lazily on every authenticated request (see middleware/auth.py) — NULL
+    # means "never reconciled yet".
+    free_lock_state_token = Column(String, nullable=True)
+    # Snapshot of `effective_premium` as of the last reconcile call. Needed
+    # because `free_lock_state_token` alone cannot detect a PURE wall-clock
+    # transition (trial or premium_until expiring): `is_premium`/
+    # `premium_until` don't change merely because time passed, so the token
+    # stays identical across the exact moment effective_premium flips
+    # True→False. Comparing against this snapshot is what makes that
+    # transition detectable — see entitlement_service.reconcile_free_lock_state.
+    free_lock_last_effective_premium = Column(Boolean, nullable=True)
 
     @property
     def effective_premium(self) -> bool:

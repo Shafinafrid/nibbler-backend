@@ -92,7 +92,11 @@ def old_query_count():
 
 
 def new_query_count():
-    return _live_unread_query(db, "uid-1").count()
+    # _live_unread_query now takes the User object (Task 2 remediation: it
+    # also excludes bites on a currently-LOCKED source) and returns a plain
+    # list rather than a Query — see notification_service.py.
+    user = db.query(User).filter(User.id == "uid-1").first()
+    return len(_live_unread_query(db, user))
 
 
 check("baseline: both queries see both unread bites",

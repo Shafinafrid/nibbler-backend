@@ -161,8 +161,8 @@ def _reset_streak_if_broken(db, user_id: str, today) -> None:
         logger.info("Streak reset (missed cycle) for user %s", user_id)
 
 
-def _live_unread_query(db: Session, user_id: str):
-    """Unread nibbles the user can actually still open.
+def _live_unread_query(db: Session, user) -> list:
+    """Unread nibbles the user can actually still open, newest first.
 
     `daily_bites.library_item_id` is a plain nullable String with NO foreign key
     (app/models/bite.py), and DELETE /library/{id} removes only the item, its
@@ -181,24 +181,38 @@ def _live_unread_query(db: Session, user_id: str):
     openable". Deactivated books are deliberately NOT excluded — the user can
     still open those from the Library, so their unread nibble legitimately
     holds. (Found 2026-07-25 in an external audit of DATA_PERSISTENCE_WALKTHROUGH.)
+
+    Task 2 remediation: a source that is currently LOCKED is exactly the
+    same kind of unreachable as a deleted one — the user cannot open Session/
+    Review/Connect for it while locked, so its unread bite can never be
+    marked read through the normal flow either. Without excluding it here, a
+    single session generated before a downgrade would hold generation,
+    the "forgot yesterday's nibble" push, and the streak alert hostage
+    FOREVER, the identical failure mode the join above already fixed for
+    deleted books. Filtered in Python (not SQL) because lock state depends
+    on `user.effective_premium`, a computed property, not a plain column.
     """
     from app.models.bite import DailyBite
     from app.models.library import LibraryItem
+    from app.services.entitlement_service import is_source_unlocked
 
     # An inner join also drops rows whose library_item_id is NULL, which is
     # correct: those are legacy pre-session bites, equally unopenable today.
-    return (
-        db.query(DailyBite)
+    rows = (
+        db.query(DailyBite, LibraryItem)
         .join(
             LibraryItem,
             (LibraryItem.id == DailyBite.library_item_id)
             & (LibraryItem.user_id == DailyBite.user_id),
         )
         .filter(
-            DailyBite.user_id == user_id,
+            DailyBite.user_id == user.id,
             DailyBite.read_at.is_(None),
         )
+        .order_by(DailyBite.date.desc())
+        .all()
     )
+    return [bite for bite, item in rows if is_source_unlocked(user, item)]
 
 
 def _prepare_user_nibbles(db_factory, user_id: str) -> None:
@@ -214,6 +228,7 @@ def _prepare_user_nibbles(db_factory, user_id: str) -> None:
     from app.models.bite import DailyBite
     from app.config import get_settings
     from app.services.session_service import generate_session_for_item, SessionGenerationError
+    from app.services.entitlement_service import reconcile_free_lock_state
 
     settings = get_settings()
     with db_factory() as db:
@@ -222,12 +237,21 @@ def _prepare_user_nibbles(db_factory, user_id: str) -> None:
             return
         today = date.today()  # UTC day at generation (~the user's local delivery time)
 
+        # The scheduler never goes through get_current_user (no HTTP request
+        # is involved), so it is the ONE path that must reconcile the Free
+        # lock selection itself before trusting `is_active` below — otherwise
+        # a user who downgrades and never reopens the app would keep every
+        # source `is_active=True` forever, and the scheduler would keep
+        # generating/pushing for locked sources indefinitely (Task 2).
+        reconcile_free_lock_state(db, user)
+
         active = (
             db.query(LibraryItem)
             .filter(
                 LibraryItem.user_id == user_id,
                 LibraryItem.is_active.is_(True),
                 LibraryItem.processed.is_(True),
+                LibraryItem.deletion_state.is_(None),  # Task 2 closeout: scheduled generation must never select a tombstoned item
             )
             .order_by(LibraryItem.id.asc())
             .all()
@@ -242,13 +266,10 @@ def _prepare_user_nibbles(db_factory, user_id: str) -> None:
         # Hold-until-read: never generate a new set while one is unread.
         # Origin-agnostic on purpose: an unread manual/prefetched session is
         # still "the current session" and must be held, not buried under a
-        # fresh scheduled one.
-        unread = (
-            _live_unread_query(db, user_id)
-            .order_by(DailyBite.date.desc())
-            .first()
-        )
-        if unread:
+        # fresh scheduled one. (Already lock-filtered — see
+        # _live_unread_query's docstring.)
+        unread_list = _live_unread_query(db, user)
+        if unread_list:
             return  # keep the held session; do not obsolete or regenerate
 
         # One set per day, whatever its origin: if the user already generated
@@ -304,8 +325,9 @@ async def _notify_delivery_slot(db_factory, now) -> None:
     """Notify users whose delivery time is `now`, with copy that depends on
     whether their held set is fresh (prepared today) or forgotten (older)."""
     from app.models.push_token import PushToken
-    from app.models.bite import DailyBite
+    from app.models.user import User
     from app.config import get_settings
+    from app.services.entitlement_service import reconcile_free_lock_state
 
     settings = get_settings()
     hour, slot = _slot(now)
@@ -324,15 +346,21 @@ async def _notify_delivery_slot(db_factory, now) -> None:
         for r in rows:
             by_user.setdefault(r.user_id, []).append(r.token)
         for user_id, toks in by_user.items():
+            user = db.query(User).filter(User.id == user_id).first()
+            if not user:
+                continue
+            # This tick never goes through get_current_user, so lock state
+            # must be reconciled here too — a user whose trial/subscription
+            # expired since the last _prepare_user_nibbles tick must not
+            # keep getting "fresh nibble" pushes for a source that's now
+            # locked (see _live_unread_query, which excludes it below).
+            reconcile_free_lock_state(db, user)
             # Origin-agnostic: a session the user generated themselves (manual/
             # prefetched) is still today's session — remind about it the same way.
-            unread = (
-                _live_unread_query(db, user_id)
-                .order_by(DailyBite.date.desc())
-                .first()
-            )
+            unread_list = _live_unread_query(db, user)
+            unread = unread_list[0] if unread_list else None
             if not unread:
-                continue  # nothing prepared (no active sources / gen failed) → no push
+                continue  # nothing prepared (no active/unlocked sources or gen failed) → no push
             (fresh_tokens if unread.date >= today else forgotten_tokens).extend(toks)
 
     expo = getattr(settings, "expo_access_token", "")
@@ -366,9 +394,10 @@ async def _notify_streak_alert_slot(db_factory, now) -> None:
     """
     from datetime import timedelta
     from app.models.push_token import PushToken
-    from app.models.bite import DailyBite
     from app.models.streak import Streak
+    from app.models.user import User
     from app.config import get_settings
+    from app.services.entitlement_service import reconcile_free_lock_state
 
     settings = get_settings()
     hour, slot = _slot(now + timedelta(minutes=65))
@@ -396,11 +425,15 @@ async def _notify_streak_alert_slot(db_factory, now) -> None:
                 continue
             if streak.last_active_date and streak.last_active_date >= today:
                 continue  # already read today — nothing at risk
-            held = (
-                _live_unread_query(db, user_id)
-                .filter(DailyBite.date < today)
-                .first()
-            )
+            user = db.query(User).filter(User.id == user_id).first()
+            if not user:
+                continue
+            # Same reasoning as _notify_delivery_slot: this tick must not
+            # alert about a streak-saving session on a source that's since
+            # become locked (that bite is unreachable — see
+            # _live_unread_query — so "finish it now" would be a dead end).
+            reconcile_free_lock_state(db, user)
+            held = next((b for b in _live_unread_query(db, user) if b.date < today), None)
             if not held:
                 continue  # no session whose window is closing
             at_risk_tokens.extend(toks)
@@ -453,9 +486,80 @@ async def _run_delivery_cycle(db_factory) -> None:
     await _notify_delivery_slot(db_factory, now)
 
 
+async def _run_task2_maintenance_cycle(db_factory) -> None:
+    """Task 2 consolidated backend pass — the real, registered production
+    job that closes the "autonomous retry, never restart-only" requirement
+    for every durable queue this codebase maintains:
+      1. `cleanup_tasks` (Pinecone/S3 compensating cleanup after an
+         abandoned/rejected attempt) — see entitlement_service.
+         retry_cleanup_tasks.
+      2. `reconciliation_tasks` (the mixed-version-cutover fencing queue)
+         — see entitlement_service.retry_reconciliation_tasks.
+      3. Tombstoned `library_items` whose deletion cleanup previously
+         failed (Task 2 closeout, Verified Blocker 6) — see
+         entitlement_service.retry_item_deletions.
+      4. Pending/failed account erasures (Task 2 closeout, Verified
+         Blocker 8) — see entitlement_service.retry_account_erasures.
+    Runs every 5 minutes, same cadence as the notification cycle. Each
+    queue is processed independently — one raising does not block the
+    others — and each queue's own runner already processes its rows
+    independently under the SAME claim-lease discipline, so one row's
+    failure can never block an unrelated row in the same tick. Blocking
+    (real DB work), so it runs in a threadpool to spare the event loop,
+    matching `_prepare_user_nibbles`'s own pattern above.
+    """
+    import asyncio
+    from app.services import entitlement_service as ent
+
+    def _run_cleanup():
+        with db_factory() as db:
+            resolved, failed = ent.retry_cleanup_tasks(db)
+            if resolved or failed:
+                logger.info("[task2-maintenance] cleanup retry: resolved=%d failed=%d", resolved, failed)
+
+    def _run_reconciliation():
+        with db_factory() as db:
+            resolved, failed = ent.retry_reconciliation_tasks(db)
+            if resolved or failed:
+                logger.info("[task2-maintenance] reconciliation retry: resolved=%d failed=%d", resolved, failed)
+
+    def _run_item_deletions():
+        with db_factory() as db:
+            resolved, failed = ent.retry_item_deletions(db)
+            if resolved or failed:
+                logger.info("[task2-maintenance] item-deletion retry: resolved=%d failed=%d", resolved, failed)
+
+    def _run_account_erasures():
+        with db_factory() as db:
+            resolved, failed = ent.retry_account_erasures(db)
+            if resolved or failed:
+                logger.info("[task2-maintenance] account-erasure retry: resolved=%d failed=%d", resolved, failed)
+
+    try:
+        await asyncio.to_thread(_run_cleanup)
+    except Exception as e:
+        logger.error("[task2-maintenance] cleanup-task retry pass failed: %s", e)
+
+    try:
+        await asyncio.to_thread(_run_reconciliation)
+    except Exception as e:
+        logger.error("[task2-maintenance] reconciliation-task retry pass failed: %s", e)
+
+    try:
+        await asyncio.to_thread(_run_item_deletions)
+    except Exception as e:
+        logger.error("[task2-maintenance] item-deletion retry pass failed: %s", e)
+
+    try:
+        await asyncio.to_thread(_run_account_erasures)
+    except Exception as e:
+        logger.error("[task2-maintenance] account-erasure retry pass failed: %s", e)
+
+
 def start_scheduler(db_factory) -> None:
     """
-    Start the APScheduler with the daily notification job.
+    Start the APScheduler with the daily notification job and the Task 2
+    cleanup/reconciliation maintenance job.
     db_factory should be a callable that returns a context-managed DB session.
     """
     if scheduler.running:
@@ -470,6 +574,16 @@ def start_scheduler(db_factory) -> None:
         replace_existing=True,
         misfire_grace_time=240,  # under one slot, so a stalled tick can't double-fire into the next
         max_instances=1,         # never overlap a still-running generation cycle
+    )
+    scheduler.add_job(
+        _run_task2_maintenance_cycle,
+        trigger="cron",
+        minute="*/5",
+        kwargs={"db_factory": db_factory},
+        id="task2_cleanup_reconciliation",
+        replace_existing=True,
+        misfire_grace_time=240,
+        max_instances=1,
     )
     scheduler.start()
     logger.info("Notification scheduler started")

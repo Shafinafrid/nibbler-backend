@@ -1,4 +1,5 @@
 import boto3
+from botocore.config import Config
 from botocore.exceptions import ClientError
 import logging
 from app.config import get_settings
@@ -8,6 +9,12 @@ settings = get_settings()
 
 logger = logging.getLogger(__name__)
 
+# Task 2 closeout (Verified Blocker 10): bounded provider timeout — the
+# image-byte proxy route now calls download_file() synchronously inside a
+# request, so an unresponsive S3 endpoint must fail fast rather than hang
+# the request (and the worker) indefinitely.
+_S3_CLIENT_CONFIG = Config(connect_timeout=5, read_timeout=10, retries={"max_attempts": 2})
+
 
 class S3Service:
     def __init__(self):
@@ -16,6 +23,7 @@ class S3Service:
             aws_access_key_id=settings.aws_access_key_id,
             aws_secret_access_key=settings.aws_secret_access_key,
             region_name=settings.aws_region,
+            config=_S3_CLIENT_CONFIG,
         )
         self.bucket = settings.s3_bucket_name
 

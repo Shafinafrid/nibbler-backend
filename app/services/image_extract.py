@@ -675,13 +675,22 @@ def extract_epub_images(file_bytes: bytes) -> List[Dict]:
 
 # ── extraction + storage ────────────────────────────────────────────────────
 
-def image_key(user_id: str, item_id: str, cid: str, ext: str) -> str:
-    """Private S3 key, scoped by owner THEN book.
+def image_key(user_id: str, item_id: str, cid: str, ext: str, attempt_token: Optional[str] = None) -> str:
+    """Private S3 key, scoped by owner THEN book THEN (Task 2 closeout,
+    Verified Blocker 3) the worker attempt that uploaded it.
 
-    The prefix order is a safety property, not a filing preference: deletion
-    walks `<user_id>/<item_id>/`, so a key built this way cannot be made to
-    address another user's object however the ids are manipulated.
+    The owner/book prefix order is a safety property, not a filing
+    preference: deletion walks `<user_id>/<item_id>/`, so a key built this
+    way cannot be made to address another user's object however the ids
+    are manipulated. The ATTEMPT segment is what makes two different
+    attempts' uploads for the same book structurally unable to collide —
+    a stale attempt's own compensating cleanup can delete only ITS OWN
+    attempt-scoped objects, never a newer attempt's live ones at what
+    would otherwise be the identical path. `attempt_token=None` (legacy
+    callers) falls back to the un-scoped path for backward compatibility.
     """
+    if attempt_token:
+        return "book-images/%s/%s/%s/%s.%s" % (user_id, item_id, attempt_token, cid, ext)
     return "book-images/%s/%s/%s.%s" % (user_id, item_id, cid, ext)
 
 
@@ -691,6 +700,7 @@ def extract_and_store(
     item_id: str,
     user_id: str,
     page_texts: Optional[List[str]] = None,
+    attempt_token: Optional[str] = None,
 ) -> List[Dict]:
     """Extract, upload privately to S3, and return the rows to persist.
 
@@ -724,7 +734,7 @@ def extract_and_store(
     for f in found:
         cid = candidate_id(f["checksum"], item_id)
         ext = f["ext"]
-        key = image_key(user_id, item_id, cid, ext)
+        key = image_key(user_id, item_id, cid, ext, attempt_token=attempt_token)
         try:
             s3.upload_file(f["data"], key, _MIME.get(ext, "image/png"))
         except Exception as e:

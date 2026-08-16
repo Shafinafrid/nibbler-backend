@@ -26,6 +26,7 @@ from app.models.user import User
 from app.services.llm import LLMService
 from app.services.embedding_service import EmbeddingService
 from app.services import image_select
+from app.services.entitlement_service import is_source_unlocked, touch_last_active
 
 logger = logging.getLogger(__name__)
 
@@ -125,6 +126,13 @@ def generate_session_for_item(
     Does NOT enforce daily caps or dedupe an already-generated session — callers
     own those pre-checks (the HTTP handler and the scheduler differ there).
     """
+    if not is_source_unlocked(user, item):
+        # Belt-and-suspenders: both callers (the HTTP handler and the
+        # scheduler) already filter locked sources out before reaching here,
+        # but this is the ONE place that actually calls the paid LLM, so it
+        # is also the one place that must refuse unconditionally rather than
+        # trust every caller to have checked (Task 2).
+        raise SessionGenerationError("This source is locked for Free accounts.", status_code=403)
     read_length = read_length if read_length in CARD_TARGETS else 5
     # Which model generates this deck is a routing decision, not a tier one:
     # free, trial and premium users all get whatever LLM_ROUTING_MODE selects.
@@ -319,6 +327,11 @@ def generate_session_for_item(
         origin=origin,
     )
     db.add(bite)
+    # A session was actually generated for this source — real "use", the
+    # authoritative signal the deterministic downgrade fallback ranks on
+    # (see entitlement_service._fallback_candidates), distinct from a bare
+    # metadata edit that also bumps `updated_at`.
+    touch_last_active(item)
     try:
         db.commit()
     except IntegrityError:

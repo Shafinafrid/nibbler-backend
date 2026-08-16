@@ -29,6 +29,7 @@ from sqlalchemy.orm import Session
 from app.database import get_db
 from app.middleware.auth import get_current_user
 from app.models.user import User
+from app.models.library import LibraryItem
 from app.rate_limit import limiter
 from app.models.bite import DailyBite
 from app.models.streak import Streak
@@ -42,6 +43,7 @@ from app.schemas.user_data import (
     SessionCompleteIn, SessionCompleteOut, SettingsIn,
     SettingsOut, StateIn, StateOut, SyncAllOut,
 )
+from app.services.entitlement_service import is_source_unlocked
 from app.services.s3_service import S3Service
 
 logger = logging.getLogger(__name__)
@@ -61,6 +63,98 @@ SYNC_READ_LIMIT = "120/hour"    # /sync/all runs on init, ~hourly per device
 # review_state is an opaque client blob, so bound it by serialised size rather
 # than by shape. ReviewScreen's real runs are a few KB.
 MAX_REVIEW_STATE_BYTES = 256_000
+
+
+# ── Source-lock enforcement (Task 2, 3rd-audit remediation #5) ─────────────
+#
+# Notes/highlights/chat/completions are all keyed by a plain `book_id`
+# string with NO foreign key to library_items (see delete_library_item's
+# comment on why — nothing here cascades). That means a book_id on one of
+# these rows can be in exactly one of three states relative to the CALLER:
+#
+#   'unlocked'     → a LibraryItem the caller owns, currently unlocked
+#                    (Premium/trial, or one of the persisted ≤3 Free picks)
+#   'locked'       → a LibraryItem the caller owns, currently locked
+#   'foreign'      → a LibraryItem that exists but belongs to someone ELSE —
+#                    a real ownership-bypass attempt, never "just legacy"
+#   'unattributed' → no LibraryItem exists with this id at all — a
+#                    reference/demo book outside the user's Library, a
+#                    pre-cutover orphan, or a genuinely unattributable
+#                    legacy row. CONSERVATIVE, DOCUMENTED POLICY: treated as
+#                    allowed (default-allow), same policy already applied
+#                    to legacy rows with no daily_bite_id elsewhere in Task
+#                    2 — explicitly NOT "proven unlocked", just "nothing
+#                    here can attribute it to any of the account's OWN
+#                    sources to lock in the first place".
+#
+# Writes reject 'locked' and 'foreign'; the restore path (`sync_all`) omits
+# 'locked' and 'foreign' rows, keeping 'unlocked' and 'unattributed' ones.
+def _book_lock_status(db: Session, user: User, book_id) -> str:
+    if not book_id:
+        return "unattributed"
+    item = db.query(LibraryItem).filter(LibraryItem.id == book_id).first()
+    if item is None:
+        return "unattributed"
+    if item.user_id != user.id:
+        return "foreign"
+    if item.deletion_state is not None:
+        # Task 2 closeout (Verified Blocker 6): a tombstoned book is gone —
+        # treated exactly like 'locked' everywhere this status feeds
+        # (refused on write, omitted on restore), never like 'unattributed'
+        # (that default-allow policy is for rows this table never had any
+        # opinion about, not for a source that WAS here and was deleted).
+        return "locked"
+    return "unlocked" if is_source_unlocked(user, item) else "locked"
+
+
+def _resolve_book_lock_map(db: Session, user: User, book_ids: set) -> dict:
+    """Batch version of `_book_lock_status` for restore filtering — one
+    query for every distinct book_id referenced across notes/highlights/
+    chats/completions, instead of one query per row."""
+    book_ids = {b for b in book_ids if b}
+    if not book_ids:
+        return {}
+    items = (
+        db.query(LibraryItem)
+        .filter(LibraryItem.user_id == user.id, LibraryItem.id.in_(book_ids))
+        .all()
+    )
+    by_id = {it.id: it for it in items}
+    out = {}
+    for bid in book_ids:
+        it = by_id.get(bid)
+        # A row already scoped to THIS user's own notes/highlights/etc can
+        # only be 'unattributed' or 'unlocked'/'locked' here — 'foreign'
+        # cannot occur for data the user's own account created (the write
+        # gate already refused a foreign book_id at creation time), so the
+        # binary unattributed/unlocked/locked split is sufficient for reads.
+        # A tombstoned item is treated as 'locked' (see _book_lock_status).
+        if it is None:
+            out[bid] = "unattributed"
+        elif it.deletion_state is not None:
+            out[bid] = "locked"
+        else:
+            out[bid] = "unlocked" if is_source_unlocked(user, it) else "locked"
+    return out
+
+
+def _require_unlocked_book(db: Session, user: User, book_id) -> None:
+    """Write-path gate: reject a locked or foreign book_id before creating/
+    updating source-derived user data. 'foreign' 404s (no confirmation that
+    the id exists at all, consistent with rename_library_item elsewhere);
+    'locked' 403s with the same source_locked code every other Task 2
+    enforcement point uses; 'unattributed'/'unlocked' proceed."""
+    status = _book_lock_status(db, user, book_id)
+    if status == "foreign":
+        raise HTTPException(status_code=404, detail="Item not found.")
+    if status == "locked":
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "code": "source_locked",
+                "message": "This source is Premium-only right now.",
+            },
+        )
 
 
 def _card_scope(model, user_id: str, book_id: str, daily_bite_id, card_index: int):
@@ -134,6 +228,25 @@ def sync_all(
     )
     completions = db.query(Completion).filter(Completion.user_id == current_user.id).all()
 
+    # Task 2 remediation (3rd audit, sync/restore lock enforcement): a
+    # locked source's notes/highlights/chat/completions must not come back
+    # on restore, an account switch, or a fresh install — they were
+    # reachable through EVERY other source-bearing surface before this,
+    # making /sync/all the one remaining side door. Rows stay stored
+    # (nothing here deletes anything) and reappear the moment the source is
+    # unlocked again — see _resolve_book_lock_map's docstring for the
+    # unattributed-row policy.
+    lock_map = _resolve_book_lock_map(
+        db, current_user,
+        {getattr(r, "book_id", None) for r in (*notes, *highlights, *chats, *completions)},
+    )
+    def _visible(row):
+        return lock_map.get(row.book_id, "unattributed") != "locked"
+    notes = [r for r in notes if _visible(r)]
+    highlights = [r for r in highlights if _visible(r)]
+    chats = [r for r in chats if _visible(r)]
+    completions = [r for r in completions if _visible(r)]
+
     avatar_data_url = None
     if current_user.avatar_url:
         # Returned inline rather than as a presigned URL: the app renders the
@@ -166,6 +279,7 @@ def upsert_note(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
+    _require_unlocked_book(db, current_user, data.book_id)
     scope = _card_scope(Note, current_user.id, data.book_id, data.daily_bite_id, data.card_index)
     row = db.query(Note).filter(*scope).first()
     if row:
@@ -232,6 +346,7 @@ def upsert_highlight(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
+    _require_unlocked_book(db, current_user, data.book_id)
     scope = _card_scope(Highlight, current_user.id, data.book_id, data.daily_bite_id, data.card_index)
     row = db.query(Highlight).filter(*scope).first()
     if row:
@@ -305,6 +420,7 @@ def append_chat(
         if existing:
             return existing          # idempotent re-push after a flaky network
 
+    _require_unlocked_book(db, current_user, data.book_id)
     row = ChatMessage(
         user_id=current_user.id,
         book_id=data.book_id,
@@ -369,6 +485,7 @@ def add_completion(
         if existing:
             return existing
 
+    _require_unlocked_book(db, current_user, data.book_id)
     row = Completion(
         user_id=current_user.id,
         book_id=data.book_id,
@@ -426,6 +543,34 @@ def session_complete(
             longest_streak=streak.longest_streak if streak else 0,
             total_bites_read=streak.total_bites_read if streak else 0,
         )
+
+    # Task 2 remediation (3rd audit, sync/restore lock enforcement): a NEW
+    # completion (idempotent replays of an ALREADY-applied one already
+    # returned above, reporting historical fact, not granting new credit)
+    # against a locked or foreign source must not grant a read receipt,
+    # completion row, or streak credit — this is the offline-outbox path
+    # that could otherwise earn all three for a source that's since been
+    # downgraded out of, entirely bypassing every other Task 2 gate.
+    _require_unlocked_book(db, current_user, data.book_id)
+
+    # A daily_bite_id must actually belong to the book_id it's submitted
+    # with — the ORIGINAL gap this closes: nothing previously checked that
+    # the two matched, so a stale/crafted pair could mark a DIFFERENT
+    # book's bite read while claiming credit for a book the caller wants
+    # unlocked in the response. Bites without a library_item_id at all
+    # (demo/reference sessions) can't be cross-checked and are left alone —
+    # the same documented "can't attribute, so don't invent a mismatch"
+    # policy as everywhere else in this file.
+    if data.daily_bite_id:
+        bite_for_check = db.query(DailyBite).filter(
+            DailyBite.id == data.daily_bite_id,
+            DailyBite.user_id == current_user.id,
+        ).first()
+        if bite_for_check and bite_for_check.library_item_id and bite_for_check.library_item_id != data.book_id:
+            raise HTTPException(
+                status_code=400,
+                detail="daily_bite_id does not belong to the submitted book_id.",
+            )
 
     db.add(Completion(
         id=data.id,

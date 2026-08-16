@@ -17,6 +17,45 @@ from app.schemas.bite import (
 )
 from app.services import mixpanel_service
 from app.services.session_service import generate_session_for_item, SessionGenerationError, CARD_TARGETS
+from app.services.entitlement_service import is_source_unlocked
+
+
+def _filter_locked_sources(db: Session, user: User, rows: list):
+    """Task 2 remediation (locked-source access audit): drop any row whose
+    `library_item_id` points at a currently-LOCKED source. Rows with no
+    `library_item_id` (legacy, pre-session bites) or whose item no longer
+    exists are left visible — documented conservative policy: they predate
+    per-source entitlement tracking entirely and cannot be attributed to any
+    source's current lock state, so treating them as locked would hide
+    content the account has always fully owned, for a restriction that did
+    not exist when they were created. This is a deliberate default-allow for
+    the unattributable case, not a silent "proven unlocked" claim — it is
+    the same conservative default `GET /bites/sessions` and `GET
+    /bites/daily` already apply."""
+    item_ids = {r.library_item_id for r in rows if r.library_item_id}
+    if not item_ids:
+        return rows
+    items_by_id = {
+        i.id: i for i in db.query(LibraryItem).filter(LibraryItem.id.in_(item_ids)).all()
+    }
+    return [
+        r for r in rows
+        if not r.library_item_id
+        or r.library_item_id not in items_by_id
+        or is_source_unlocked(user, items_by_id[r.library_item_id])
+    ]
+
+
+def _bite_source_locked(db: Session, user: User, bite: DailyBite) -> bool:
+    """True only when this bite is attributable to a specific owned source
+    AND that source is currently locked — see `_filter_locked_sources` for
+    why an unattributable (legacy) bite is never treated as locked."""
+    if not bite.library_item_id:
+        return False
+    item = db.query(LibraryItem).filter(LibraryItem.id == bite.library_item_id).first()
+    if not item:
+        return False
+    return not is_source_unlocked(user, item)
 from app.config import get_settings
 import uuid
 
@@ -164,11 +203,20 @@ def get_or_create_session(
     item = db.query(LibraryItem).filter(
         LibraryItem.id == data.library_item_id,
         LibraryItem.user_id == current_user.id,
+        LibraryItem.deletion_state.is_(None),  # a tombstoned item is gone
     ).first()
     if not item:
         raise HTTPException(status_code=404, detail="Library item not found.")
     if not item.processed:
         raise HTTPException(status_code=409, detail="Nibbler is still reading this one — try again in a moment.")
+    if not is_source_unlocked(current_user, item):
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "code": "source_locked",
+                "message": "This source is Premium-only right now. Upgrade to bring it back, or open one of your unlocked sources.",
+            },
+        )
 
     read_length = data.read_length if data.read_length in CARD_TARGETS else 5
     today = _effective_today(data.client_date)
@@ -270,6 +318,12 @@ def get_daily_nibbles(
     )
     if not rows:
         return []
+    # Task 2: a session belonging to a currently-LOCKED source must not
+    # surface on Home either — same rule GET /bites/sessions (Review)
+    # already applies.
+    rows = _filter_locked_sources(db, current_user, rows)
+    if not rows:
+        return []
     # Return only the most-recent scheduled date's set (held-unread wins over today).
     top_date = rows[0].date
     return [_bite_to_session(b) for b in rows if b.date == top_date]
@@ -292,6 +346,17 @@ def mark_bite_read(
     ).first()
     if not bite:
         raise HTTPException(status_code=404, detail="Nibble not found.")
+    if _bite_source_locked(db, current_user, bite):
+        # Task 2 remediation: a mutation tied to a locked source's content
+        # must be refused the same as reading it, so a direct API call
+        # cannot reach protected source-derived content by a side door.
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "code": "source_locked",
+                "message": "This source is Premium-only right now.",
+            },
+        )
     if bite.read_at is None:
         bite.read_at = datetime.utcnow()
         db.commit()
@@ -334,6 +399,10 @@ def get_bite_history(
         query = query.filter(DailyBite.date >= cutoff)
 
     bites = query.order_by(DailyBite.date.desc()).limit(limit).all()
+    # Task 2 remediation: the insight/reflection/action text on a bite IS
+    # source-derived content — history must not surface it once its source
+    # has locked, exactly like Review and the daily set already refuse to.
+    bites = _filter_locked_sources(db, current_user, bites)
     saved_ids = {s.bite_id for s in db.query(SavedBite).filter(SavedBite.user_id == current_user.id).all()}
 
     return BiteHistoryResponse(
@@ -376,6 +445,11 @@ def get_session_history(
     )
     # Decks with no cards are useless to the client and only cost bandwidth.
     rows = [r for r in rows if r.cards]
+
+    # Task 2: a session belonging to a currently-LOCKED source must not
+    # surface in Review.
+    rows = _filter_locked_sources(db, current_user, rows)
+
     return SessionHistoryResponse(sessions=rows, total=len(rows))
 
 
@@ -391,6 +465,14 @@ def save_bite(
     ).first()
     if not bite:
         raise HTTPException(status_code=404, detail="Bite not found.")
+    if _bite_source_locked(db, current_user, bite):
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "code": "source_locked",
+                "message": "This source is Premium-only right now.",
+            },
+        )
 
     existing = db.query(SavedBite).filter(
         SavedBite.bite_id == bite_id,
@@ -444,6 +526,14 @@ def get_saved_bites(
         .order_by(SavedBite.saved_at.desc())
         .all()
     )
+    # Task 2 remediation: a saved bite is still source-derived content — a
+    # locked source's saves must not surface any more than its Review cards
+    # or history rows do. The row itself is preserved (not deleted) so it
+    # comes back if the source unlocks again.
+    unlocked_bites = {
+        b.id for b in _filter_locked_sources(db, current_user, [s.bite for s in saved if s.bite])
+    }
+    saved = [s for s in saved if s.bite and s.bite.id in unlocked_bites]
 
     saved_ids = {s.bite_id for s in saved}
     return [

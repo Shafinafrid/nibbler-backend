@@ -159,13 +159,54 @@ class EmbeddingService:
         item_id: str,
         user_id: str,
         metadata: dict = None,
+        attempt_token: str = None,
+        on_batch: "callable" = None,
+        check_ownership: "callable" = None,
     ) -> int:
-        """Chunk text, embed each chunk, and upsert to Pinecone."""
+        """Chunk text, embed each chunk, and upsert to Pinecone.
+
+        Task 2 remediation (3rd audit, attempt-scoped artifact ledger):
+        vector ids are DETERMINISTIC (`{item_id}_{chunk_index}`), so a retry
+        of the same item overwrites its predecessor's vectors IN PLACE — an
+        older attempt's compensating cleanup (a plain item_id-scoped delete)
+        could therefore delete a NEWER attempt's already-live vectors if the
+        stale attempt's cleanup runs after the newer one has written.
+        Stamping `attempt_token` into every vector's metadata lets
+        `delete_item_vectors(..., attempt_token=...)` scope its delete to
+        ONLY the vectors this exact attempt wrote — a stale attempt's delete
+        then matches nothing once a newer attempt has overwritten those ids,
+        instead of deleting them out from under it.
+
+        `on_batch(done, total)`, when given, fires after each upsert batch
+        commits — the heartbeat hook every pipeline (not just OCR) uses to
+        renew its reservation lease on a large book with many batches. It
+        may raise (e.g. when the caller's renewal comes back False,
+        meaning ownership is lost) — that exception is deliberately let
+        through uncaught, which stops the batch loop immediately: no
+        further upsert begins once a caller-supplied heartbeat reports
+        ownership loss (Task 2 lifecycle remediation, Follow-up 2A —
+        previously this return value was silently discarded).
+
+        `check_ownership()`, when given, is called immediately before
+        chunking, immediately before the (potentially long, unbatched)
+        embedding-generation call, immediately after it returns, and
+        immediately before each upsert batch — a cheap, in-process check
+        (no I/O) against a caller-owned background heartbeat's already-
+        observed state, covering the phases that have no natural per-batch
+        checkpoint of their own. Like `on_batch`, a raised exception here
+        is let through uncaught.
+        """
         if not self.pinecone_available:
             return 0
 
+        if check_ownership:
+            check_ownership()
         chunks = _chunk_text(text)
+        if check_ownership:
+            check_ownership()
         embeddings = _get_embeddings(chunks)
+        if check_ownership:
+            check_ownership()
         provider = embedding_provider()
         vectors = []
         for i, (chunk, embedding) in enumerate(zip(chunks, embeddings)):
@@ -179,6 +220,8 @@ class EmbeddingService:
                     # Lets Connect refuse to score against dev-mock vectors
                     # instead of reporting a nonsense ~4% goal match.
                     "embedder": provider,
+                    # Attempt-scoped ownership tag — see docstring above.
+                    "attempt_token": attempt_token or "none",
                     # Full chunk text (500 tokens ≈ 2KB — well within Pinecone's 40KB
                     # metadata limit). Truncating here starved session generation.
                     "text": chunk[:8000],
@@ -189,7 +232,11 @@ class EmbeddingService:
         # Upsert in batches of 100
         batch_size = 100
         for i in range(0, len(vectors), batch_size):
+            if check_ownership:
+                check_ownership()
             self.index.upsert(vectors=vectors[i:i + batch_size], namespace=user_id)
+            if on_batch:
+                on_batch(min(i + batch_size, len(vectors)), len(vectors))
 
         return len(vectors)
 
@@ -346,18 +393,28 @@ class EmbeddingService:
             print(f"[EmbeddingService] fetch_chunks error: {e}")
             return []
 
-    def delete_item_vectors(self, item_id: str, user_id: str = None) -> bool:
-        """Delete all vectors for a given library item. True when it succeeded."""
+    def delete_item_vectors(self, item_id: str, user_id: str = None, attempt_token: str = None) -> bool:
+        """Delete vectors for a given library item. True when it succeeded.
+
+        `attempt_token`, when given, scopes the delete to ONLY vectors
+        stamped with that attempt (see `index_text`'s docstring) — used by
+        compensating cleanup after a terminally failed/superseded attempt,
+        so it can never delete a newer attempt's already-live vectors that
+        happen to share the same item_id (and, for overwritten chunk
+        indexes, the same vector id). A full, unscoped delete (no
+        attempt_token) is still used for a REAL item deletion, where every
+        vector regardless of attempt must go.
+        """
         if not self.pinecone_available:
             return True
         try:
+            flt = {"item_id": {"$eq": item_id}}
+            if attempt_token:
+                flt["attempt_token"] = {"$eq": attempt_token}
             if user_id:
-                self.index.delete(
-                    filter={"item_id": {"$eq": item_id}},
-                    namespace=user_id,
-                )
+                self.index.delete(filter=flt, namespace=user_id)
             else:
-                self.index.delete(filter={"item_id": {"$eq": item_id}})
+                self.index.delete(filter=flt)
             return True
         except Exception as e:
             print(f"[EmbeddingService] Delete error: {e}")

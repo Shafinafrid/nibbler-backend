@@ -12,6 +12,7 @@ cross-user access, arbitrary key requests, images outliving a deleted account.
     .venv/bin/python tests/test_book_image_access.py
 """
 
+import datetime
 import os
 import sys
 import tempfile
@@ -29,7 +30,7 @@ from llm_fakes import Checks  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402
 
 from app.database import create_tables, SessionLocal, get_db  # noqa: E402
-from app.middleware.auth import get_current_user  # noqa: E402
+from app.middleware.auth import get_current_user, get_current_user_allow_pending_erasure  # noqa: E402
 from app.models.user import User  # noqa: E402
 from app.models.library import LibraryItem  # noqa: E402
 import app.routers.library as library_router  # noqa: E402
@@ -41,6 +42,7 @@ c = Checks("Book image access")
 # ── a stub S3 that records rather than dials ────────────────────────────────
 deleted_keys = []
 presigned = []
+downloaded = []
 
 
 class StubS3:
@@ -48,7 +50,8 @@ class StubS3:
         return filename
 
     def download_file(self, ref):
-        return b"bytes"
+        downloaded.append(ref)
+        return b"real image bytes"
 
     def delete_file(self, ref):
         deleted_keys.append(ref)
@@ -99,6 +102,12 @@ AS = {"id": "owner"}
 main.app.dependency_overrides[get_db] = _db
 main.app.dependency_overrides[get_current_user] = \
     lambda: db.query(User).filter(User.id == AS["id"]).first()
+# DELETE /auth/me now depends on get_current_user_allow_pending_erasure (Task
+# 2 closeout, Verified Blocker 8) — a DIFFERENT function object than
+# get_current_user, so it needs its own override or the real Firebase-token
+# path runs unmocked and the route never executes at all.
+main.app.dependency_overrides[get_current_user_allow_pending_erasure] = \
+    lambda: db.query(User).filter(User.id == AS["id"]).first()
 client = TestClient(main.app)
 
 
@@ -106,28 +115,66 @@ def as_user(uid):
     AS["id"] = uid
 
 
-# ══ the owner can see their own figures ════════════════════════════════════
+# ══ the owner can see their own figures ═════════════════════════════════════
+# Task 2 closeout (Verified Blocker 10): this endpoint now proxies the raw
+# image bytes (entitlement-revalidated on EVERY request) instead of minting a
+# presigned URL — a real, reusable capability that kept working for a full
+# hour even after a downgrade mid-flight.
 
 as_user("owner")
+downloaded.clear()
+presigned.clear()
 r = client.get("/library/book1/images/img_own1")
 c.ok(r.status_code == 200, "the owner gets 200 (got %d)" % r.status_code)
-body = r.json() if r.status_code == 200 else {}
-c.ok(body.get("url", "").startswith("https://"), "a usable view URL is returned")
-c.ok("X-Amz-Signature" in body.get("url", ""), "the URL is presigned")
-c.ok(body.get("expires_in") == library_router.IMAGE_URL_TTL,
-     "expiry metadata is returned so the client knows it is short-lived")
-c.ok(body.get("alt") == "a thing", "alt text comes back for the accessibility label")
-c.ok("key" not in body and "book-images" not in str(body.get("alt", "")),
-     "the raw S3 key is not in the response body")
+c.ok(r.content == b"real image bytes", "the actual image bytes are returned, not a URL")
+c.ok(r.headers.get("content-type") == "image/png", "the real MIME type is set as Content-Type")
+c.ok("no-store" in (r.headers.get("cache-control") or ""),
+     "Cache-Control: no-store so nothing caches a copy that should die with a downgrade")
+c.ok(not presigned, "no presigned S3 URL is minted at all — the object is fetched server-side")
+c.ok(downloaded == ["book-images/owner/book1/img_own1.png"],
+     "the server fetched the EXACT stored key")
 
-# JSON, NOT a redirect: a 307 to S3 would have iOS forward the Firebase bearer
+# JSON body checks no longer apply — the response IS the image. Still NOT a
+# 307 redirect to S3: a redirect would have iOS forward the Firebase bearer
 # token across hosts and hand it to Amazon.
-c.ok(r.status_code != 307 and "application/json" in r.headers.get("content-type", ""),
-     "the endpoint returns JSON rather than redirecting with the auth header attached")
+c.ok(r.status_code != 307, "the endpoint returns the image directly, never redirects with the auth header attached")
 
+downloaded.clear()
 second = client.get("/library/book1/images/img_own1")
-c.ok(second.status_code == 200 and len(presigned) >= 2,
-     "asking again mints a FRESH url — this is how expired access refreshes")
+c.ok(second.status_code == 200 and downloaded == ["book-images/owner/book1/img_own1.png"],
+     "asking again re-fetches for real — there is no outstanding capability to reuse or expire")
+
+
+# ══ downgrade mid-flight refuses the VERY NEXT request ══════════════════════
+# The old presigned-URL design kept a capability alive for a full hour after
+# this exact moment. There is nothing here to keep alive — every request
+# re-checks from scratch.
+
+book1_row = db.query(LibraryItem).filter(LibraryItem.id == "book1").first()
+book1_row.is_unlocked_selection = False
+owner_row = db.query(User).filter(User.id == "owner").first()
+owner_row.is_premium = False
+owner_row.premium_until = None
+owner_row.created_at = datetime.datetime(2020, 1, 1)  # signup trial long expired
+db.commit()
+
+downloaded.clear()
+r_locked = client.get("/library/book1/images/img_own1")
+c.ok(r_locked.status_code == 403 and r_locked.json()["detail"]["code"] == "source_locked",
+     "the SAME image path, for the SAME owner, is refused the moment the source locks "
+     "(got %d)" % r_locked.status_code)
+c.ok(not downloaded, "a locked source's bytes are never even fetched from S3")
+
+# Restore entitlement for the rest of the suite.
+book1_row = db.query(LibraryItem).filter(LibraryItem.id == "book1").first()
+book1_row.is_unlocked_selection = True
+owner_row = db.query(User).filter(User.id == "owner").first()
+owner_row.is_premium = True
+db.commit()
+downloaded.clear()
+r_restored = client.get("/library/book1/images/img_own1")
+c.ok(r_restored.status_code == 200 and downloaded == ["book-images/owner/book1/img_own1.png"],
+     "and access resumes immediately once unlocked again — no stale state either direction")
 
 
 # ══ nobody else can ════════════════════════════════════════════════════════
@@ -249,13 +296,22 @@ s3_module.S3Service = RecordingS3
 
 
 class BrokenCommitDB:
-    """A session whose commit fails the way a constraint violation would."""
+    """A REAL session (so the ownership pre-check and the atomic-write's
+    own locked query both see a genuine matching row) whose commit fails
+    the way a constraint violation would — every other method passes
+    through to the real session."""
+
+    def __init__(self, real_db):
+        self._real = real_db
 
     def commit(self):
         raise RuntimeError("database went away mid-commit")
 
     def rollback(self):
-        pass
+        self._real.rollback()
+
+    def __getattr__(self, name):
+        return getattr(self._real, name)
 
 
 class FakeItem:
@@ -336,13 +392,28 @@ _real_extract = library_router.__dict__.get("_extract_book_images")
 import app.services.image_extract as _ie_mod  # noqa: E402
 _orig_extract_and_store = _ie_mod.extract_and_store
 _ie_mod.extract_and_store = lambda **kw: [dict(r) for r in rows]
+# A real, matching row: Task 2 closeout (Verified Blocker 3) now checks
+# ownership (existence, not tombstoned, exact attempt token) via a REAL
+# query BEFORE and atomically WHEN persisting `item.images` — a purely
+# hand-rolled fake session can no longer stand in for the whole call.
+db.add(LibraryItem(id="bookX", user_id="owner", type="pdf", title="x.pdf",
+                    processed=True, last_processing_attempt_id="tok-brokencommit"))
+db.commit()
+# _cleanup_one_image_after_ownership_loss (the new durable per-image
+# cleanup path) calls `S3Service()` from library_router's OWN namespace,
+# not app.services.s3_service's — matching every other cleanup helper in
+# that module.
+_prior_library_s3 = library_router.S3Service
+library_router.S3Service = RecordingS3
 try:
-    count = library_router._extract_book_images(BrokenCommitDB(), FakeItem(), b"x", "owner")
+    count = library_router._extract_book_images(
+        BrokenCommitDB(db), FakeItem(), b"x", "owner", "tok-brokencommit")
     c.ok(count == 0, "a failed commit reports zero images stored")
-    c.ok(orphan_deleted == [r["key"] for r in rows],
+    c.ok(sorted(orphan_deleted) == sorted(r["key"] for r in rows),
          "and DELETES the objects it had already uploaded rather than orphaning them")
 finally:
     _ie_mod.extract_and_store = _orig_extract_and_store
+    library_router.S3Service = _prior_library_s3
 
 
 # ── One S3 failure must not abandon the objects after it ───────────────────
@@ -402,12 +473,14 @@ db.add(LibraryItem(id="bookB", user_id="stranger", title="B", type="pdf", proces
 db.commit()
 
 as_user("stranger")
+downloaded.clear()
 ra = client.get("/library/bookA/images/%s" % id_a)
 rb = client.get("/library/bookB/images/%s" % id_b)
 c.ok(ra.status_code == 200 and rb.status_code == 200, "each book serves its own copy")
-c.ok(ra.json()["url"] != rb.json()["url"], "and they resolve to different objects")
-c.ok("bookA" in ra.json()["url"] and "bookB" in rb.json()["url"],
-     "each URL points inside its own book's prefix")
+c.ok(len(downloaded) == 2 and downloaded[0] != downloaded[1],
+     "and they fetch two genuinely different, book-scoped S3 keys")
+c.ok("bookA" in downloaded[0] and "bookB" in downloaded[1],
+     "each fetched key sits inside its own book's prefix")
 
 cross = client.get("/library/bookA/images/%s" % id_b)
 c.ok(cross.status_code == 404,

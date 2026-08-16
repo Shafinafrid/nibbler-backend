@@ -7,6 +7,7 @@ from firebase_admin import auth as firebase_auth, credentials
 from app.database import get_db
 from app.models.user import User
 from app.config import get_settings
+from app.services.entitlement_service import reconcile_free_lock_state
 import logging
 import uuid
 
@@ -94,6 +95,31 @@ def get_or_create_user(decoded_token: dict, db: Session) -> User:
     return user
 
 
+def _erasure_gate(db: Session, user_id: str) -> None:
+    """Task 2 closeout (Verified Blocker 8): fail CLOSED for an account
+    with a pending/failed durable erasure request — checked on every
+    authenticated request, BEFORE any route logic runs, so no endpoint
+    can forget it. A pending erasure means the account's data is being
+    (or is about to be) deleted; treating it as still-normal-and-usable
+    would let a user, or a still-valid Firebase token, keep reading/
+    writing data this account no longer has any right to.
+
+    Deliberately a lightweight, indexed lookup (one row by unique
+    user_id) — not joined into `get_or_create_user`'s own query, so a
+    normal request pays one extra trivial SELECT, not a schema change to
+    the hot path."""
+    from app.models.library import AccountErasure
+    row = db.query(AccountErasure).filter(AccountErasure.user_id == user_id).first()
+    if row is not None and row.state in ("pending", "failed"):
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "code": "account_erasure_pending",
+                "message": "This account is being deleted and can no longer be used.",
+            },
+        )
+
+
 def get_current_user(
     request: Request,
     credentials: HTTPAuthorizationCredentials = Depends(security),
@@ -102,7 +128,31 @@ def get_current_user(
     token = credentials.credentials
     decoded = verify_firebase_token(token)
     user = get_or_create_user(decoded, db)
+    _erasure_gate(db, user.id)
     # Rate limits key on the uid so one user can't dodge them by rotating IPs
     # (see app/rate_limit.py).
+    request.state.user_id = user.id
+    # Task 2: keep the Free lock selection authoritative BEFORE any route
+    # logic runs. Cheap in the overwhelming common case (two attribute reads,
+    # zero queries) — only an actual entitlement transition does real work.
+    # Hooked here rather than per-route so no future endpoint can forget it.
+    reconcile_free_lock_state(db, user)
+    return user
+
+
+def get_current_user_allow_pending_erasure(
+    request: Request,
+    credentials: HTTPAuthorizationCredentials = Depends(security),
+    db: Session = Depends(get_db),
+) -> User:
+    """Task 2 closeout (Verified Blocker 8): the ONE deliberate exception
+    to `_erasure_gate` — `DELETE /auth/me` must remain callable for an
+    account whose erasure is already pending/failed, or the fail-closed
+    gate above would make a genuine retry (the user re-tapping delete, or
+    simply calling the endpoint again) impossible. Never used by any
+    other route: everywhere else, a pending erasure must refuse access."""
+    token = credentials.credentials
+    decoded = verify_firebase_token(token)
+    user = get_or_create_user(decoded, db)
     request.state.user_id = user.id
     return user

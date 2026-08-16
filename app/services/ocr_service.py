@@ -42,6 +42,17 @@ DPI = 200
 MIN_CHARS_PER_PAGE = 40
 
 
+class OcrCancelled(Exception):
+    """A caller's `on_progress` callback raises this to abort the job early
+    — e.g. Task 2's renewable reservation lease is no longer current, so
+    continuing would pay for more pages under a reservation the caller no
+    longer owns. Deliberately NOT swallowed by the per-page try/except
+    below, unlike any other `on_progress` failure (a flaky progress-
+    persistence write must not lose that page's already-OCR'd text) — this
+    is the one signal a caller can use to make cancellation here actually
+    stop the loop rather than merely being logged and ignored."""
+
+
 def is_available() -> bool:
     """True when both the Python binding and the tesseract binary are present."""
     try:
@@ -92,6 +103,8 @@ def ocr_pdf(
                 if on_progress:
                     try:
                         on_progress(i + 1, total)
+                    except OcrCancelled:
+                        raise
                     except Exception:
                         pass
         finally:
