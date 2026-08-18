@@ -84,8 +84,8 @@ def build_notification_copy(kind: str, item_title: str, bite, today=None) -> tup
     if kind == "forgotten":
         days_held = max(0, (today - bite.date).days) if today else 0
         prefix = _REMINDER_PREFIXES[days_held % len(_REMINDER_PREFIXES)]
-        return (f"{item_title} 🐱", f"{prefix} {hook}")
-    return (f"{item_title} 🐱", hook)
+        return (item_title, f"{prefix} {hook}")
+    return (item_title, hook)
 
 
 def _notification_data(item_id: str, bite) -> dict:
