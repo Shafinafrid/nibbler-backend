@@ -7,6 +7,7 @@ No native credentials needed on our end — Expo handles the APNs/FCM routing.
 Expo Push API docs: https://docs.expo.dev/push-notifications/sending-notifications/
 """
 
+import hashlib
 import logging
 from typing import Optional
 import httpx
@@ -25,51 +26,119 @@ EXPO_PUSH_URL = "https://exp.host/--/api/v2/push/send"
 # changed one only re-fires the next day.
 NIBBLE_LOCK_HOURS = 23
 
-# ── Push copy — single source of truth ────────────────────────────────────
-# Shared between the real scheduled sends below and preview_notification_for_
-# user (the owner's on-demand test button), so the two can never drift apart.
-FRESH_TITLE = "Your daily nibble is ready 🐱"
-FRESH_BODY = "Nibbler prepared something fresh for you — tap to dig in."
-FORGOTTEN_TITLE = "Psst… you forgot yesterday's nibble 🐱"
-FORGOTTEN_BODY = "No worries — Nibbler kept it warm for you. Tap to finish it."
-STREAK_TITLE = "Your streak ends in 1 hour 🔥"
-STREAK_BODY = "Yesterday's nibble is still waiting — finish it now to keep your streak alive."
+# ── Push copy — Task 3 (Aug 2026): dynamic, book-specific notifications ──────
+# The body is `DailyBite.headline` — the SAME "one arresting sentence that
+# makes the user want to read" the LLM already produces as part of the normal
+# session-generation call (see llm/schemas.py / prompts.py), already required
+# by validate_wisdom/validate_story, and already shown on Home/Notebook as
+# today's card teaser. Reusing it means a genuinely dynamic, spoiler-free,
+# per-book hook with NO second AI request — exactly what the audit asked for.
+# `_HOOK_FALLBACKS` stands in only for a bite with no headline (a pre-Task-3
+# legacy row) — varied and book-specific, never one fixed message.
+_HOOK_FALLBACKS = [
+    "Today's page from {title} is ready — a fresh idea, five minutes long.",
+    "{title} has something new waiting for you.",
+    "One more idea from {title}, picked out just for today.",
+    "Your next bite of {title} is ready when you are.",
+]
+
+
+def _fallback_hook(item_title: str, bite_id: str) -> str:
+    """Deterministic per-bite pick — the SAME bite always gets the SAME
+    fallback line on every reminder about it, without needing to store one."""
+    idx = int(hashlib.sha256(bite_id.encode()).hexdigest(), 16) % len(_HOOK_FALLBACKS)
+    return _HOOK_FALLBACKS[idx].format(title=item_title)
+
+
+def _hook_for(item_title: str, bite) -> str:
+    hook = (bite.headline or "").strip()
+    return hook if hook else _fallback_hook(item_title, bite.id)
+
+
+# Varied reminder framing for a bite that's been unread across multiple
+# cycles (Task 3 item 12: "send VARIED reminders for the same unread
+# nibble... using stored hook data and deterministic templates"). Picked by
+# how many days it's been held, not randomly, so the SAME day-offset always
+# produces the SAME prefix (reproducible/testable) while consecutive days
+# genuinely read differently instead of repeating one fixed reminder line.
+_REMINDER_PREFIXES = [
+    "Still here waiting for you —",
+    "Nibbler's holding your spot —",
+    "No rush, but it's still there —",
+    "Whenever you're ready —",
+]
+
+
+def build_notification_copy(kind: str, item_title: str, bite, today=None) -> tuple[str, str]:
+    """(title, body) for one specific featured bite. `kind` is 'fresh' (the
+    normal daily push), 'forgotten' (a reminder about a still-unread bite
+    from a prior cycle — same stored hook, no regeneration) or 'streak' (the
+    T-65 urgency push). Title is always the book itself — the whole point of
+    Task 3 is that the notification is ABOUT a specific book, not app
+    branding — with a short framing suffix so the three kinds still read
+    differently from each other and, for a repeatedly-forgotten bite, from
+    day to day too."""
+    hook = _hook_for(item_title, bite)
+    if kind == "streak":
+        return (f"{item_title} — streak ends in 1 hour 🔥", hook)
+    if kind == "forgotten":
+        days_held = max(0, (today - bite.date).days) if today else 0
+        prefix = _REMINDER_PREFIXES[days_held % len(_REMINDER_PREFIXES)]
+        return (f"{item_title} 🐱", f"{prefix} {hook}")
+    return (f"{item_title} 🐱", hook)
+
+
+def _notification_data(item_id: str, bite) -> dict:
+    """Task 3 item 7: the exact nibble AND source id, so a tap can open the
+    precise nibble directly instead of guessing "whatever is unread"."""
+    return {"screen": "Session", "bookId": item_id, "biteId": bite.id}
+
+
+def _feature_bite(db: Session, user, candidates: list, today) -> tuple:
+    """Among several unread bites (a Premium account can have up to 3 active
+    sources' worth prepared the same cycle), pick ONE to feature in the
+    push — Task 3 item 14: "feature one rotating nibble ... while keeping
+    the others available normally inside the app." The pick is a pure
+    function of (the set of eligible book ids, today's date) — no new
+    persisted rotation state, the same date-derived-fairness approach
+    `_select_sources_for_today` already uses for scheduled generation, so
+    which book gets featured shifts day to day rather than always being
+    the same one. Returns (bite, item_title, item_id) or (None, None, None)."""
+    from app.models.library import LibraryItem
+    if not candidates:
+        return (None, None, None)
+    by_item = {b.library_item_id: b for b in candidates if b.library_item_id}
+    if not by_item:
+        return (None, None, None)
+    ordered_ids = sorted(by_item.keys())
+    chosen_id = ordered_ids[today.toordinal() % len(ordered_ids)]
+    bite = by_item[chosen_id]
+    item = db.query(LibraryItem).filter(LibraryItem.id == chosen_id, LibraryItem.user_id == user.id).first()
+    if not item:
+        return (None, None, None)
+    return (bite, item.title, item.id)
+
 
 # APScheduler instance (started in main.py lifespan)
 scheduler = AsyncIOScheduler()
 
 
-async def send_push_notifications(
-    tokens: list[str],
-    title: str,
-    body: str,
-    data: Optional[dict] = None,
-    expo_access_token: str = "",
-) -> list[dict]:
-    """
-    Send push notifications to a list of Expo push tokens.
-    Expo batches up to 100 tokens per request; we chunk accordingly.
-    Returns a list of Expo push ticket responses.
-    """
-    if not tokens:
+async def send_push_messages(messages: list[dict], expo_access_token: str = "") -> list[dict]:
+    """Low-level: send already-built, independent Expo message dicts (each
+    with its own `to`/title/body/data) — chunked 100/request, per Expo's
+    limit. Task 3 needs this: once notification copy is dynamic and
+    book-specific PER USER, a batch of pushes can no longer share one
+    title/body the way the old flat-copy sends did, but Expo's endpoint
+    itself already accepts a heterogeneous array in one call, so this is
+    still one HTTP round trip per 100 sends, just no longer uniform
+    content within it."""
+    if not messages:
         return []
 
     headers = {"Content-Type": "application/json", "Accept": "application/json"}
     if expo_access_token:
         headers["Authorization"] = f"Bearer {expo_access_token}"
 
-    messages = [
-        {
-            "to": token,
-            "title": title,
-            "body": body,
-            "sound": "default",
-            "data": data or {},
-        }
-        for token in tokens
-    ]
-
-    # Expo allows max 100 messages per request
     chunk_size = 100
     tickets = []
     async with httpx.AsyncClient(timeout=10.0) as client:
@@ -84,6 +153,26 @@ async def send_push_notifications(
                 logger.error("Expo push batch failed: %s", exc)
 
     return tickets
+
+
+async def send_push_notifications(
+    tokens: list[str],
+    title: str,
+    body: str,
+    data: Optional[dict] = None,
+    expo_access_token: str = "",
+) -> list[dict]:
+    """The SAME title/body/data to every token in `tokens` — correct when
+    they all belong to ONE user's own devices (the on-demand test button)
+    or, historically, when copy was uniform across users. Delegates to
+    send_push_messages for the actual chunked HTTP call."""
+    if not tokens:
+        return []
+    messages = [
+        {"to": token, "title": title, "body": body, "sound": "default", "data": data or {}}
+        for token in tokens
+    ]
+    return await send_push_messages(messages, expo_access_token)
 
 
 # ── Session-lifecycle helpers (see NIBBLE_SESSION_LIFECYCLE.md) ───────────────
@@ -331,20 +420,22 @@ def _prepare_user_nibbles(db_factory, user_id: str) -> None:
         logger.info("Prepared %d scheduled nibble(s) for user %s", made, user_id)
 
 
-def preview_notification_for_user(db: Session, user, now) -> tuple[str, str]:
-    """The exact (title, body) this user's real state would produce right
-    now, reusing the SAME selection logic as the real scheduled pushes
-    (`_notify_delivery_slot`/`_notify_streak_alert_slot`) — just without the
-    delivery-time-slot gate, so it can fire on demand instead of waiting for
-    a real tick. Never returns nothing: an account with no live condition
-    yet (nothing generated, no streak at risk) falls back to the everyday
-    "ready" copy, so the on-demand test button always has something real to
-    show rather than erroring out on a fresh/idle account.
+def preview_notification_for_user(db: Session, user, now) -> tuple[str, str, dict]:
+    """The exact (title, body, data) this user's real state would produce
+    right now, reusing the SAME selection logic as the real scheduled
+    pushes (`_notify_delivery_slot`/`_notify_streak_alert_slot`) — just
+    without the delivery-time-slot gate, so it can fire on demand instead
+    of waiting for a real tick.
 
-    This is a TEST-ONLY entry point (see POST /notifications/send-test) — it
-    still sends through the real `send_push_notifications` call, so what
-    arrives on-device is byte-identical to what the real scheduler would
-    have sent for this exact state, not a client-side mockup that can drift.
+    This is a TEST-ONLY entry point (see POST /notifications/send-test) —
+    it still sends through the real `send_push_notifications` call, so
+    what arrives on-device is byte-identical to what the real scheduler
+    would have sent for this exact state, not a client-side mockup that
+    can drift. Raises SessionGenerationError-free ValueError when there is
+    genuinely nothing to preview (no unread bite at all — an idle/fresh
+    account with nothing generated yet); the caller surfaces this as a
+    clear "nothing to send yet" rather than fabricating a fake example
+    with no real book or bite behind it.
 
     Streak is checked BEFORE forgotten-nibble, not after: in the real
     scheduler these are two independent ticks at two different times of day,
@@ -362,7 +453,14 @@ def preview_notification_for_user(db: Session, user, now) -> tuple[str, str]:
     reconcile_free_lock_state(db, user)
 
     unread_list = _live_unread_query(db, user)
-    unread = unread_list[0] if unread_list else None
+    if not unread_list:
+        raise ValueError(
+            "Nothing to preview yet — this account has no unread nibble. "
+            "Open the app once to generate today's bite, then try again."
+        )
+    bite, item_title, item_id = _feature_bite(db, user, unread_list, today)
+    if not bite:
+        raise ValueError("Nothing to preview yet — the unread bite's source is no longer available.")
 
     streak = db.query(Streak).filter(Streak.user_id == user.id).first()
     streak_at_risk = (
@@ -370,20 +468,16 @@ def preview_notification_for_user(db: Session, user, now) -> tuple[str, str]:
         and not (streak.last_active_date and streak.last_active_date >= today)
         and any(b.date < today for b in unread_list)
     )
-    if streak_at_risk:
-        return (STREAK_TITLE, STREAK_BODY)
-
-    if unread and unread.date >= today:
-        return (FRESH_TITLE, FRESH_BODY)
-    if unread and unread.date < today:
-        return (FORGOTTEN_TITLE, FORGOTTEN_BODY)
-
-    return (FRESH_TITLE, FRESH_BODY)
+    kind = "streak" if streak_at_risk else ("fresh" if bite.date >= today else "forgotten")
+    title, body = build_notification_copy(kind, item_title, bite, today)
+    return (title, body, _notification_data(item_id, bite))
 
 
 async def _notify_delivery_slot(db_factory, now) -> None:
-    """Notify users whose delivery time is `now`, with copy that depends on
-    whether their held set is fresh (prepared today) or forgotten (older)."""
+    """Notify users whose delivery time is `now`, with dynamic, book-specific
+    copy (Task 3) — one message PER USER now, not a shared title/body batch,
+    since each user's featured book/hook differs. Still one chunked HTTP
+    call to Expo at the end via send_push_messages."""
     from app.models.push_token import PushToken
     from app.models.user import User
     from app.config import get_settings
@@ -393,7 +487,7 @@ async def _notify_delivery_slot(db_factory, now) -> None:
     hour, slot = _slot(now)
     today = now.date()
 
-    fresh_tokens, forgotten_tokens = [], []
+    messages = []
     with db_factory() as db:
         rows = (
             db.query(PushToken)
@@ -418,30 +512,20 @@ async def _notify_delivery_slot(db_factory, now) -> None:
             # Origin-agnostic: a session the user generated themselves (manual/
             # prefetched) is still today's session — remind about it the same way.
             unread_list = _live_unread_query(db, user)
-            unread = unread_list[0] if unread_list else None
-            if not unread:
+            if not unread_list:
                 continue  # nothing prepared (no active/unlocked sources or gen failed) → no push
-            (fresh_tokens if unread.date >= today else forgotten_tokens).extend(toks)
+            bite, item_title, item_id = _feature_bite(db, user, unread_list, today)
+            if not bite:
+                continue
+            kind = "fresh" if bite.date >= today else "forgotten"
+            title, body = build_notification_copy(kind, item_title, bite, today)
+            data = _notification_data(item_id, bite)
+            for tok in toks:
+                messages.append({"to": tok, "title": title, "body": body, "sound": "default", "data": data})
 
-    expo = getattr(settings, "expo_access_token", "")
-    if fresh_tokens:
-        logger.info("Delivering fresh nibble to %d tokens (%02d:%02d UTC)", len(fresh_tokens), hour, slot)
-        await send_push_notifications(
-            tokens=fresh_tokens,
-            title=FRESH_TITLE,
-            body=FRESH_BODY,
-            data={"screen": "Home"},
-            expo_access_token=expo,
-        )
-    if forgotten_tokens:
-        logger.info("Reminding %d tokens of a held nibble (%02d:%02d UTC)", len(forgotten_tokens), hour, slot)
-        await send_push_notifications(
-            tokens=forgotten_tokens,
-            title=FORGOTTEN_TITLE,
-            body=FORGOTTEN_BODY,
-            data={"screen": "Home"},
-            expo_access_token=expo,
-        )
+    if messages:
+        logger.info("Delivering %d dynamic delivery-slot push(es) (%02d:%02d UTC)", len(messages), hour, slot)
+        await send_push_messages(messages, getattr(settings, "expo_access_token", ""))
 
 
 async def _notify_streak_alert_slot(db_factory, now) -> None:
@@ -463,7 +547,7 @@ async def _notify_streak_alert_slot(db_factory, now) -> None:
     hour, slot = _slot(now + timedelta(minutes=65))
     today = now.date()
 
-    at_risk_tokens = []
+    messages = []
     with db_factory() as db:
         rows = (
             db.query(PushToken)
@@ -493,20 +577,20 @@ async def _notify_streak_alert_slot(db_factory, now) -> None:
             # become locked (that bite is unreachable — see
             # _live_unread_query — so "finish it now" would be a dead end).
             reconcile_free_lock_state(db, user)
-            held = next((b for b in _live_unread_query(db, user) if b.date < today), None)
-            if not held:
+            held_list = [b for b in _live_unread_query(db, user) if b.date < today]
+            if not held_list:
                 continue  # no session whose window is closing
-            at_risk_tokens.extend(toks)
+            bite, item_title, item_id = _feature_bite(db, user, held_list, today)
+            if not bite:
+                continue
+            title, body = build_notification_copy("streak", item_title, bite, today)
+            data = _notification_data(item_id, bite)
+            for tok in toks:
+                messages.append({"to": tok, "title": title, "body": body, "sound": "default", "data": data})
 
-    if at_risk_tokens:
-        logger.info("Streak alert to %d tokens (%02d:%02d UTC delivery)", len(at_risk_tokens), hour, slot)
-        await send_push_notifications(
-            tokens=at_risk_tokens,
-            title=STREAK_TITLE,
-            body=STREAK_BODY,
-            data={"screen": "Home"},
-            expo_access_token=getattr(settings, "expo_access_token", ""),
-        )
+    if messages:
+        logger.info("Streak alert: %d dynamic push(es) (%02d:%02d UTC delivery)", len(messages), hour, slot)
+        await send_push_messages(messages, getattr(settings, "expo_access_token", ""))
 
 
 async def _run_delivery_cycle(db_factory) -> None:
