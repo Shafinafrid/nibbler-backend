@@ -198,7 +198,7 @@ def _ensure_mixed_version_fencing(conn) -> None:
                     SET entitlement_status = 'released',
                         processed = 0,
                         reconciliation_generation = lower(hex(randomblob(16)))
-                    WHERE id = NEW.id;
+                    WHERE id = NEW.id AND entitlement_status IS NULL;
                 INSERT INTO reconciliation_tasks (id, item_id, generation, state, retry_count, created_at, updated_at)
                     SELECT lower(hex(randomblob(16))), NEW.id, reconciliation_generation, 'pending', 0,
                            CURRENT_TIMESTAMP, CURRENT_TIMESTAMP

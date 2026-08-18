@@ -849,6 +849,48 @@ def run_all():
                 probe = mkitem(probe_id, user_id, processed=False)
                 ent.reserve_free_capacity(db, probe, user_id)
 
+            def _expire_worker_attempt_claim(item_id):
+                """Companion to `real_reap`, for the narrow set of sections
+                (G, O) that reap a REAL, admitted worker's (one that went
+                through `admit_worker_attempt`, not a bare `reserve_free_
+                capacity` call) stale RESERVATION while simulating that
+                worker as genuinely, fully abandoned.
+
+                `real_reap` — and the raw `reservation_lease_expires_at`
+                force-stale write every "supersede A" section performs —
+                only ever touches the CAPACITY-reservation timer
+                (`reservation_lease_expires_at`). Task 2's final
+                consolidated backend pass added a SECOND, independent
+                timer for worker-attempt admission (`worker_attempt_id`/
+                `worker_attempt_expires_at`, `WORKER_ATTEMPT_TTL_MINUTES`
+                — deliberately the SAME magnitude as the reservation's own
+                `RESERVATION_TTL_MINUTES`, and always renewed in lockstep
+                with it by the SAME `_AttemptGuard.renew_now()` heartbeat
+                tick). In real production these two timers can only drift
+                apart from a genuine crash — at which point BOTH lapse
+                together after the same ~30 real minutes, since nothing is
+                renewing either one anymore. This harness's own technique
+                of directly forcing `reservation_lease_expires_at` into
+                the past (rather than waiting out a real 30 minutes)
+                accelerates only ONE of the two timers, leaving
+                `worker_attempt_id` artificially fresh — a state that
+                cannot otherwise arise from any real code path. Left
+                uncorrected, `admit_worker_attempt` (which checks
+                `worker_attempt_id`/`worker_attempt_expires_at`, not
+                `entitlement_status`) then genuinely, correctly refuses to
+                admit a real "attempt B", because the OLD attempt still
+                looks "live" by that timer alone — not because production
+                is wrong, but because this accelerated simulation of "A is
+                genuinely gone" left one of the two things that must be
+                true for that to hold un-simulated. This helper completes
+                the simulation by also clearing the worker-attempt claim,
+                matching what a real ~30-minute-elapsed abandonment would
+                leave for BOTH timers, not just the one this harness can
+                cheaply force."""
+                db.query(LibraryItem).filter(LibraryItem.id == item_id).update(
+                    {"worker_attempt_id": None, "worker_attempt_expires_at": None})
+                db.commit()
+
             def _poll_for_heartbeat_renewal(item_id, user_id, attempt_token, forced_stale_expiry,
                                              deadline_seconds=_HEARTBEAT_POLL_DEADLINE_SECONDS,
                                              interval_seconds=_HEARTBEAT_POLL_INTERVAL_SECONDS):
@@ -2090,6 +2132,12 @@ def run_all():
                             real_reap("repro_g_u", "repro_g_probe1")
                             if refresh_item("repro_g_item").entitlement_status != "released":
                                 raise RuntimeError("expected the real reaper to release repro_g_item")
+                            # Attempt A went through the REAL admission path
+                            # (process_pdf_embeddings -> admit_worker_attempt),
+                            # so completing its simulated abandonment also
+                            # requires releasing its worker-attempt claim —
+                            # see _expire_worker_attempt_claim's docstring.
+                            _expire_worker_attempt_claim("repro_g_item")
 
                             library_router.process_pdf_embeddings(
                                 "repro_g_item", b"%PDF-fake-bytes-B", "repro_g_u")
@@ -2765,12 +2813,34 @@ def run_all():
                     return "OCR'd fake text from attempt A, stale, must not be committed"
 
                 def _fake_embedding_service_init_h3s(self):
-                    later_call_began_h3s.set()
+                    # Correction: do NOT set `later_call_began_h3s` here.
+                    # `EmbeddingService()` is instantiated for TWO different
+                    # reasons once ownership is genuinely lost: (1) the
+                    # UNSAFE one this check exists to catch — the stale
+                    # attempt's own `index_text()` call beginning a LATER
+                    # external upsert it no longer owns — and (2) the SAFE,
+                    # EXPECTED, CORRECT one — `_run_ocr`'s own
+                    # `except AttemptOwnershipLost` handler running
+                    # compensating cleanup via `_compensate_failed_attempt`
+                    # -> `_cleanup_vectors_after_abandoned_processing` ->
+                    # `EmbeddingService().delete_item_vectors(...)`, which
+                    # legitimately constructs a NEW EmbeddingService too.
+                    # Flagging at `__init__` conflated the two and produced
+                    # a false positive: proven, via direct stack-trace
+                    # capture, that the ONLY construction in this exact
+                    # scenario is (2) — production's `guard.check()`
+                    # correctly raises `AttemptOwnershipLost` (via
+                    # `renew_reservation_lease`'s real token mismatch)
+                    # BEFORE `index_text()`'s own `EmbeddingService()` call
+                    # is ever reached. The real signal for "a later external
+                    # call began" is a WRITE (`upsert`), never mere
+                    # construction — `delete_item_vectors`'s compensating
+                    # cleanup only ever calls `.delete()`.
                     self.pinecone_available = True
 
                     class _NoOpIndex:
                         def upsert(self, vectors, namespace):
-                            pass
+                            later_call_began_h3s.set()
 
                         def delete(self, filter, namespace=None):
                             pass
@@ -2932,7 +3002,20 @@ def run_all():
                             raise RuntimeError("worker never reached the first upsert call")
 
                         item_mid_i1 = refresh_item("repro_i1_item")
-                        tok_i1_a = item_mid_i1.reservation_lease_token
+                        # `last_processing_attempt_id`, NOT
+                        # `reservation_lease_token`: `process_pdf_embeddings`
+                        # calls `reserve_free_capacity` (which mints the
+                        # lease token) and THEN `admit_worker_attempt`
+                        # (Task 2 final consolidated backend pass), which
+                        # re-stamps `last_processing_attempt_id` with its
+                        # OWN, independently-minted worker-attempt id — the
+                        # exact identity `_compensate_failed_attempt`'s
+                        # cleanup-ledger writes below are actually scoped
+                        # to. Capturing the lease token here instead made
+                        # the later `find_cleanup_record(..., tok_i1_a, ...)`
+                        # query for an identity the ledger record was never
+                        # written under, so it always missed.
+                        tok_i1_a = item_mid_i1.last_processing_attempt_id
                         observe("attempt A token, captured while A's worker is still the current owner",
                                 tok_i1_a)
                         if not tok_i1_a:
@@ -3301,17 +3384,35 @@ def run_all():
                         # touch a 'premium' row's status or attempt id).
                         #
                         # Per the task's own narrow-modeling option: reassign
-                        # ONLY `last_processing_attempt_id` directly — the
-                        # exact atomic ownership-boundary field this whole
-                        # section is about — leaving `entitlement_status`
-                        # ('premium') and every other field UNCHANGED and
-                        # UNINVENTED. This models the single atomic instant
-                        # a real replacement/ownership-handoff operation
-                        # would perform, without claiming any existing
-                        # function performs the surrounding transition.
+                        # the ownership-boundary fields directly — leaving
+                        # `entitlement_status` ('premium') and every other
+                        # field UNCHANGED and UNINVENTED. This models the
+                        # single atomic instant a real replacement/
+                        # ownership-handoff operation would perform, without
+                        # claiming any existing function performs the
+                        # surrounding transition.
+                        #
+                        # Correction: reassign BOTH `last_processing_
+                        # attempt_id` AND `worker_attempt_id` together, not
+                        # `last_processing_attempt_id` alone. Every REAL
+                        # ownership-handoff this codebase actually performs
+                        # (`admit_worker_attempt`) stamps them with the
+                        # SAME new id in the SAME atomic write — they are
+                        # not two independently-authoritative identities.
+                        # `_AttemptGuard.renew_now()`'s tier-agnostic
+                        # ownership check (`renew_worker_attempt`, added by
+                        # the Task 2 final consolidated backend pass
+                        # specifically to close the "Premium has no lease
+                        # to reap" gap this section is about) reads
+                        # `worker_attempt_id`, NOT `last_processing_
+                        # attempt_id` — reassigning only the latter left
+                        # the field the running guard actually checks
+                        # unchanged, so attempt A's own guard still saw
+                        # itself as the current owner and never detected
+                        # the handoff this section means to simulate.
                         tok_k_b = str(__import__("uuid").uuid4())
                         db.query(LibraryItem).filter(LibraryItem.id == "repro_k_item").update(
-                            {"last_processing_attempt_id": tok_k_b})
+                            {"last_processing_attempt_id": tok_k_b, "worker_attempt_id": tok_k_b})
                         db.commit()
                         item_after_b = refresh_item("repro_k_item")
                         if item_after_b.entitlement_status != "premium":
@@ -3587,9 +3688,28 @@ def run_all():
                 b_finalized = refresh_item("repro_m_item")
                 observe("attempt B's real state after its own end-to-end worker finished",
                         (b_finalized.processed, b_finalized.chunk_count, b_finalized.entitlement_status,
-                         b_finalized.content))
+                         b_finalized.content, b_finalized.last_processing_attempt_id))
+                # NOT `last_processing_attempt_id == tok_m_b`: `tok_m_b` is
+                # the bare RESERVATION token minted by `ent.
+                # reserve_free_capacity(...)` above, captured BEFORE the
+                # real end-to-end worker ever ran. `process_item_embeddings`
+                # itself then calls `admit_worker_attempt` (Task 2 final
+                # consolidated backend pass), which re-stamps
+                # `last_processing_attempt_id` with its OWN, independently-
+                # minted worker-attempt id — a deliberately SEPARATE
+                # identity space from the reservation lease (worker-attempt
+                # admission and capacity reservation are explicitly
+                # decoupled so a later legitimate continuation, e.g. OCR
+                # after empty-text extraction, gets its own new worker
+                # attempt under the SAME reservation). The real, current-
+                # code-correct proof that B's own worker genuinely
+                # (re-)established ownership is that `last_processing_
+                # attempt_id` is real and DIFFERS from A's preserved token
+                # — not that it equals a reservation token B's own worker
+                # never actually used as its attempt identity.
                 if not (b_finalized.processed and b_finalized.entitlement_status == "consumed"
-                        and b_finalized.last_processing_attempt_id == tok_m_b):
+                        and b_finalized.last_processing_attempt_id
+                        and b_finalized.last_processing_attempt_id != tok_m_a):
                     raise RuntimeError("attempt B's real end-to-end worker did not finalize as expected")
                 b_snapshot = {
                     "content": b_finalized.content,
@@ -3881,6 +4001,12 @@ def run_all():
                         real_reap("repro_o_u", "repro_o_probe1")
                         if refresh_item("repro_o_item").entitlement_status != "released":
                             raise RuntimeError("expected the real reaper to release repro_o_item")
+                        # Attempt A went through the REAL admission path
+                        # (process_pdf_embeddings -> admit_worker_attempt),
+                        # so completing its simulated abandonment also
+                        # requires releasing its worker-attempt claim —
+                        # see _expire_worker_attempt_claim's docstring.
+                        _expire_worker_attempt_claim("repro_o_item")
 
                         library_router.process_pdf_embeddings(
                             "repro_o_item", b"%PDF-fake-bytes-O-B", "repro_o_u")
@@ -3905,8 +4031,36 @@ def run_all():
                     # `upload_calls` immediately after returning from its
                     # own block, before the worker does anything else, so
                     # this is populated regardless of what A does next.
-                    if store_o["upload_calls"]:
-                        key_a_o = store_o["upload_calls"][0]
+                    #
+                    # NOT index [0]: that only identified A's call back
+                    # when B's real admission was rejected (the pre-fix
+                    # admission-liveness gap this section's OWN earlier
+                    # checks exist to exercise), so A's was the ONLY
+                    # upload ever recorded. Now that B is genuinely
+                    # admitted and completes its OWN full upload WHILE A
+                    # is still deliberately paused mid-call (blocked
+                    # BEFORE it appends to this same log), B's entry lands
+                    # at index 0 and A's — appended only once A resumes,
+                    # later — at index 1; call COMPLETION order, not call
+                    # START order. `key_b_o` is already known (captured
+                    # directly from B's own real, committed `file_url`
+                    # above), so A's key is simply whichever of the (at
+                    # most two) real recorded uploads is NOT that one.
+                    #
+                    # `release_upload_o.set()` only WAKES attempt A's own
+                    # blocked thread — it does not wait for that thread to
+                    # actually resume and append its own entry to this
+                    # same log, so a bounded poll (not an unsynchronized
+                    # single read) is required here to avoid a genuine
+                    # race against A's own scheduling.
+                    _key_a_o_deadline = time.monotonic() + 10
+                    while key_a_o is None and time.monotonic() < _key_a_o_deadline:
+                        for _uk in store_o["upload_calls"]:
+                            if _uk != key_b_o:
+                                key_a_o = _uk
+                                break
+                        if key_a_o is None:
+                            time.sleep(0.05)
                     observe("attempt A's real archive key, discovered from the actual upload-call "
                             "log (never constructed)", key_a_o)
 
@@ -4110,10 +4264,22 @@ def run_all():
                 release_finalize_p2 = threading.Event()
                 real_finalize_p2 = ent.finalize_successful_processing
 
-                def _gated_finalize_p2(db_arg, item, user_id, chunk_count, lease_token=None):
+                def _gated_finalize_p2(db_arg, item, user_id, chunk_count, lease_token=None, attempt_token=None):
+                    # `attempt_token` must be accepted and forwarded — every
+                    # real caller (`_run_ocr` included) calls
+                    # finalize_successful_processing with this keyword
+                    # argument (Task 2 consolidated backend pass, the
+                    # per-tier-agnostic attempt-identity check); a gate
+                    # wrapper missing it raises TypeError at the call
+                    # boundary BEFORE `reached_finalize_p2.set()` ever runs,
+                    # which is a harness bug (a stale mock signature that
+                    # predates the wider `attempt_token` rollout), not a
+                    # product one — see section P's completion-report note.
                     reached_finalize_p2.set()
                     release_finalize_p2.wait(timeout=15)
-                    return real_finalize_p2(db_arg, item, user_id, chunk_count, lease_token=lease_token)
+                    return real_finalize_p2(
+                        db_arg, item, user_id, chunk_count,
+                        lease_token=lease_token, attempt_token=attempt_token)
 
                 def _fake_embedding_service_init_p2(self):
                     self.pinecone_available = True
@@ -5952,7 +6118,19 @@ def run_all():
                                 "immediately, synchronously, within the SAME transaction as the "
                                 "old-worker write — no reboot or manual sweep required, even "
                                 "though the real earlier sweep already ran once and found nothing",
-                                row_snapshot_m4[0] is True and row_snapshot_m4[1] == "released",
+                                # `processed` must be FALSE, not True, after fencing — this is
+                                # the trigger's own documented, deliberate design (see
+                                # `_ensure_mixed_version_fencing`'s docstring in app/database.py:
+                                # "Clearing `processed` too ... is required so an old,
+                                # processed-only reader ... genuinely cannot find the row"), and
+                                # it is exactly what the SQLite sibling of this same fencing
+                                # behavior (MIXED-1, above) already correctly asserts and passes
+                                # (`not old_reader_sees_it`, which only holds because
+                                # `processed` becomes False). This assertion previously expected
+                                # `is True` — inverted relative to the trigger's real, intended,
+                                # cross-verified behavior; a stale copy/paste, not a real
+                                # invariant that ever held.
+                                row_snapshot_m4[0] is False and row_snapshot_m4[1] == "released",
                                 detail=f"row={row_snapshot_m4!r}",
                             )
 

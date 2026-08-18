@@ -1775,6 +1775,17 @@ def _cleanup_ledger_resolve(
     named in `cleanup_detail`, so a stale attempt's late resolution can
     never clear or overwrite a newer attempt's own marker.
 
+    On a successful ('s3') resolution, also clears `LibraryItem.file_url`/
+    `archive_status` when they still literally equal the exact key that
+    was just deleted — mirroring the SAME identity check the DIRECT
+    compensation path (`_cleanup_archive_after_abandoned_processing`)
+    already uses. Without this, a successful AUTONOMOUS retry (the
+    scheduled `retry_cleanup_tasks` runner, which calls this — not that
+    direct path — to resolve) deleted the real S3 object but left the row
+    still claiming an archived file at that now-deleted key. Gated on the
+    literal key match (not on `cleanup_detail`/attempt ownership) so it
+    can never clear a NEWER attempt's own, different archive key.
+
     Returns whether this call's state transition actually COMMITTED
     (Task 2 closeout, Verified Blocker 4) — `False` for a missing row or
     a claim mismatch, so a caller (in particular the autonomous runner)
@@ -1824,6 +1835,9 @@ def _cleanup_ledger_resolve(
                 item.cleanup_detail = None
             else:
                 item.cleanup_state = "failed"
+        if ok and artifact_kind == "s3" and norm_key and item and item.file_url == norm_key:
+            item.file_url = None
+            item.archive_status = None
         db.commit()
         return True
     except Exception:
@@ -1898,7 +1912,7 @@ def _cleanup_vectors_after_abandoned_processing(
 
 
 def _cleanup_archive_after_abandoned_processing(
-    item_id: str, attempt_token: str, s3_key: str, reason: str = None,
+    item_id: str, attempt_token: str, s3_key: str, reason: str = None, user_id: str = None,
 ) -> bool:
     """Delete an attempt-owned S3 archive file after that attempt
     terminally failed. Task 2 lifecycle remediation, Follow-up 2A: PDF/
@@ -1919,20 +1933,36 @@ def _cleanup_archive_after_abandoned_processing(
     S3Service.delete_file is now durable failure too, not silently treated
     as success.
 
+    `user_id` (Task 2 closeout follow-up): every real caller
+    (`_compensate_failed_attempt`) already knows the owning user — passing
+    it directly means this function no longer needs to look up the
+    `library_items` row just to learn it. Without this, a `library_items`
+    row that has ALREADY been deleted (a real, independent deletion racing
+    this attempt's own compensation) made the old row-lookup-only path
+    silently `return True` — claiming success — without ever attempting
+    the S3 delete or writing a durable ledger record, because it had no
+    other way to learn `user_id`. `item_id`/`attempt_token`/`s3_key` fully
+    identify the artifact regardless of whether the row still exists, so
+    once `user_id` is supplied directly there is nothing left that
+    requires the row to still be there. Falls back to the row lookup only
+    when `user_id` is omitted (legacy/defensive callers), preserving the
+    old row-required behavior for that narrower case.
+
     Task 2 closeout (Verified Blocker 4): persists the durable ledger
     record and atomically claims it BEFORE calling S3 — see the matching
     note on `_cleanup_vectors_after_abandoned_processing`."""
     if not s3_key:
         return True
     from app.database import SessionLocal
-    db = SessionLocal()
-    try:
-        item = db.query(LibraryItem).filter(LibraryItem.id == item_id).first()
-        if not item:
-            return True  # the item itself is gone — nothing left to clean up under it
-        user_id = item.user_id
-    finally:
-        db.close()
+    if user_id is None:
+        db = SessionLocal()
+        try:
+            item = db.query(LibraryItem).filter(LibraryItem.id == item_id).first()
+            if not item:
+                return True  # no known owner and the item itself is gone — nothing left to clean up under it
+            user_id = item.user_id
+        finally:
+            db.close()
 
     outcome = _cleanup_ledger_upsert_pending(item_id, user_id, attempt_token, "s3", s3_key, reason or "archive cleanup")
     if outcome == "failed":
@@ -2026,7 +2056,8 @@ def _compensate_failed_attempt(
     ok_vectors = _cleanup_vectors_after_abandoned_processing(item_id, user_id, attempt_token, reason=reason)
     ok_s3 = True
     if s3_key:
-        ok_s3 = _cleanup_archive_after_abandoned_processing(item_id, attempt_token, s3_key, reason=reason)
+        ok_s3 = _cleanup_archive_after_abandoned_processing(
+            item_id, attempt_token, s3_key, reason=reason, user_id=user_id)
     return ok_vectors and ok_s3
 
 
@@ -2262,6 +2293,20 @@ def process_pdf_embeddings(item_id: str, pdf_bytes: bytes, user_id: str):
                 filename=s3_key,
                 content_type="application/pdf",
             )
+            # `archived` (used below to decide whether compensating cleanup
+            # gets `s3_key`) must track whether the S3 OBJECT itself was
+            # actually written — set the instant `upload_file` returns,
+            # not after the row write that follows also succeeds. Setting
+            # it only on a successful `_atomic_ownership_write` (Section O,
+            # real repro) let a genuinely-uploaded object become
+            # unreachable: the row write can legitimately fail with
+            # `AttemptOwnershipLost` (this attempt was superseded between
+            # the upload starting and it returning) even though the upload
+            # itself already committed a real, live S3 object — every
+            # downstream cleanup call below gates on `archived`, so leaving
+            # it False orphaned that object with no compensating delete and
+            # no durable ledger record, forever.
+            archived = True
             # Task 2 final consolidated backend pass (Verified Blocker 2):
             # ATOMIC, ownership-bound write — the upload itself takes real
             # time, during which ownership can change; locking the row,
@@ -2275,7 +2320,6 @@ def process_pdf_embeddings(item_id: str, pdf_bytes: bytes, user_id: str):
             )
             if not applied:
                 raise AttemptOwnershipLost(item_id, attempt_token)
-            archived = True
         except AttemptOwnershipLost:
             raise
         except Exception as e:
@@ -2537,6 +2581,14 @@ def process_epub_embeddings(item_id: str, epub_bytes: bytes, user_id: str):
                 filename=s3_key,
                 content_type="application/epub+zip",
             )
+            # `archived` must track whether the S3 OBJECT itself was
+            # actually written, not whether the row write that follows
+            # also succeeded — see process_pdf_embeddings's matching note
+            # (Section O, real repro: a genuinely-uploaded object was
+            # silently orphaned because this flag was set only after a
+            # row write that can legitimately fail with
+            # AttemptOwnershipLost on its own).
+            archived = True
             # Atomic, ownership-bound write — see process_pdf_embeddings for
             # why a separate check-then-write is not sufficient here.
             applied = _atomic_ownership_write(
@@ -2546,7 +2598,6 @@ def process_epub_embeddings(item_id: str, epub_bytes: bytes, user_id: str):
             )
             if not applied:
                 raise AttemptOwnershipLost(item_id, attempt_token)
-            archived = True
         except AttemptOwnershipLost:
             raise
         except Exception as e:
