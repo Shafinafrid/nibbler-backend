@@ -5,7 +5,7 @@ from sqlalchemy.orm import Session
 import firebase_admin
 from firebase_admin import auth as firebase_auth, credentials
 from app.database import get_db
-from app.models.user import User
+from app.models.user import User, EmailAccountHistory, normalize_email
 from app.config import get_settings
 from app.services.entitlement_service import reconcile_free_lock_state
 import logging
@@ -56,11 +56,23 @@ def get_or_create_user(decoded_token: dict, db: Session) -> User:
     user = db.query(User).filter(User.id == firebase_uid).first()
 
     if not user:
+        email = decoded_token.get("email", "")
         user = User(
             id=firebase_uid,
-            email=decoded_token.get("email", ""),
+            email=email,
             display_name=decoded_token.get("name"),
         )
+        # Task 7 (Aug 2026): if this email has been through account deletion
+        # before, seed the new row from the durable guard so a delete+
+        # resignup loop can't farm a fresh trial or fresh free uploads.
+        # Content is genuinely wiped (nothing else is seeded) — only these
+        # two anti-abuse fields carry forward.
+        guard = db.query(EmailAccountHistory).filter(
+            EmailAccountHistory.email == normalize_email(email)
+        ).first()
+        if guard:
+            user.trial_anchor_at = guard.trial_anchor_at
+            user.successful_sources_total = guard.lifetime_successful_sources_total
         db.add(user)
         try:
             db.commit()

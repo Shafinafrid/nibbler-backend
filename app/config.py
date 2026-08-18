@@ -125,6 +125,21 @@ class Settings(BaseSettings):
     # Shafin's shared Drive folder that holds the yearly bug-report folders
     bug_drive_folder_id: str = "1cGuEbgMMIzi2hCIpXIpyTw0M4PgLhkQM"
 
+    # Account-deletion Google Sheet operational record (Task 7, Aug 2026).
+    # Same credential path as bug-report sheets_service — no separate
+    # Sheets/Drive credential needed. Hardcoded constants (not Railway env
+    # vars), same precedent as bug_drive_folder_id above — a fixed,
+    # already-shared spreadsheet needs no per-environment override.
+    account_deletion_sheet_id: str = "16txTS6d_rDYk2AZWudW91DVuBZO1qvLnM10e05xA-V8"
+    account_deletion_sheet_tab: str = "Deletion Log"
+    account_deletion_snapshot_tab: str = "User Snapshot"
+    account_deletion_alert_email: str = "support@getnibbler.com"
+    # Gates ONLY the Sheet-sync side effects (append/update rows) — account
+    # deletion itself is unconditional and always-on (required for App Store
+    # 5.1.1(v) self-service deletion). Lets the Sheet-writer code ship inert,
+    # verified via a non-destructive connection test, before being flipped on.
+    account_deletion_automation_enabled: bool = False
+
     # App
     app_env: str = "development"
     secret_key: str = "changeme"

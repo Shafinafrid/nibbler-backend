@@ -200,6 +200,8 @@ class IdentityIn(BaseModel):
     locale: Optional[str] = Field(default=None, max_length=16)
     platform: Optional[str] = Field(default=None, max_length=16)
     app_version: Optional[str] = Field(default=None, max_length=32)
+    device_model: Optional[str] = Field(default=None, max_length=64)
+    os_version: Optional[str] = Field(default=None, max_length=32)
 
 
 class AvatarIn(BaseModel):

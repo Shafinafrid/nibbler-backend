@@ -29,7 +29,18 @@ class User(Base):
     locale = Column(String, nullable=True)         # e.g. "en-GB"
     platform = Column(String, nullable=True)       # 'ios' | 'android'
     app_version = Column(String, nullable=True)
+    device_model = Column(String, nullable=True)   # e.g. "iPhone 15 Pro", "Pixel 7" (expo-device)
+    os_version = Column(String, nullable=True)      # e.g. "17.5", "14"
     last_seen_at = Column(DateTime, nullable=True)
+
+    # Trial anchor, SEPARATE from created_at (Task 7, Aug 2026). Normally
+    # equal to created_at, but seeded from email_account_history.trial_anchor_at
+    # on a fresh row for an email that has been through account deletion
+    # before — see get_or_create_user. Keeping this distinct from created_at
+    # means created_at always means "this row's real creation time" (useful
+    # for records/support), while trial eligibility can be backdated without
+    # touching that meaning.
+    trial_anchor_at = Column(DateTime, nullable=True)
 
     # ── Free lifetime source entitlement (Task 2, Aug 2026) ───────────────────
     # A PERMANENT, monotonic count of library_items that have ever reached
@@ -78,7 +89,8 @@ class User(Base):
         # precisely so this check works.
         if self.premium_until:
             return False
-        if self.created_at and (now - self.created_at) < timedelta(days=TRIAL_DAYS):
+        anchor = self.trial_anchor_at or self.created_at
+        if anchor and (now - anchor) < timedelta(days=TRIAL_DAYS):
             return True
         return False
 
@@ -97,3 +109,37 @@ class User(Base):
     completions = relationship("Completion", back_populates="user", cascade="all, delete-orphan")
     settings = relationship("UserSettings", back_populates="user", uselist=False, cascade="all, delete-orphan")
     state = relationship("UserState", back_populates="user", uselist=False, cascade="all, delete-orphan")
+
+
+def normalize_email(email: str) -> str:
+    return (email or "").strip().lower()
+
+
+class EmailAccountHistory(Base):
+    """Task 7 (Aug 2026): a durable, per-email anti-abuse guard that
+    deliberately OUTLIVES account deletion — no ForeignKey to users.id, same
+    survives-erasure pattern as AccountErasure/CleanupTask in library.py.
+
+    Deleting an account must give the user a genuinely fresh, empty account
+    on re-signup with the same email — but it must NOT reset their 7-day
+    signup trial or their lifetime free-upload count, or "delete and
+    recreate" becomes an unlimited-trials/unlimited-free-uploads loop.
+
+    Written ONCE, atomically with the user row's deletion, only on a FULLY
+    successful erasure (see _attempt_account_erasure_cleanup in
+    routers/auth.py) — there is no earlier point at which the same email
+    could be reused anyway, since Firebase itself refuses a duplicate email
+    until the old Firebase Auth record is actually gone.
+
+    Read on every new-row signup in get_or_create_user (middleware/auth.py)
+    to seed the new row's trial_anchor_at / successful_sources_total instead
+    of leaving them at their fresh defaults.
+    """
+    __tablename__ = "email_account_history"
+
+    email = Column(String, primary_key=True)  # normalize_email() form
+    trial_anchor_at = Column(DateTime, nullable=False)
+    lifetime_successful_sources_total = Column(Integer, default=0, nullable=False)
+    first_seen_user_id = Column(String, nullable=True)  # informational only
+    deletions_count = Column(Integer, default=1, nullable=False)
+    updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now())

@@ -336,3 +336,15 @@ class AccountErasure(Base):
     retry_count = Column(Integer, nullable=False, default=0)
     requested_at = Column(DateTime, server_default=func.now())
     updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now())
+
+    # ── Google Sheet operational-log mirror (Task 7, Aug 2026) ──────────────
+    # Row NUMBERS on the "Deletion Log" / "User Snapshot" tabs this job's row
+    # lives at, captured once on first successful write so later syncs UPDATE
+    # the same row instead of appending duplicates. Postgres stays the
+    # source of truth throughout — the Sheet is a best-effort mirror, never
+    # read back to make a decision.
+    sheet_row = Column(Integer, nullable=True)
+    snapshot_sheet_row = Column(Integer, nullable=True)
+    deletion_started_at = Column(DateTime, nullable=True)
+    deletion_completed_at = Column(DateTime, nullable=True)
+    personal_data_redacted_at = Column(DateTime, nullable=True)

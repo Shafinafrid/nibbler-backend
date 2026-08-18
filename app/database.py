@@ -474,6 +474,20 @@ def _run_migrations():
         "ALTER TABLE users ADD COLUMN IF NOT EXISTS platform VARCHAR",
         "ALTER TABLE users ADD COLUMN IF NOT EXISTS app_version VARCHAR",
         "ALTER TABLE users ADD COLUMN IF NOT EXISTS last_seen_at TIMESTAMP",
+        # Task 7 (Aug 2026): device context + trial-anchor for the account-
+        # deletion abuse guard. email_account_history is a brand-new table,
+        # picked up automatically by create_all() — no ALTER needed for it.
+        "ALTER TABLE users ADD COLUMN IF NOT EXISTS device_model VARCHAR",
+        "ALTER TABLE users ADD COLUMN IF NOT EXISTS os_version VARCHAR",
+        "ALTER TABLE users ADD COLUMN IF NOT EXISTS trial_anchor_at TIMESTAMP",
+        # Task 7: account_erasures already existed (Task2 Closeout) — these
+        # ARE new columns on an existing table, so (unlike email_account_history,
+        # which is brand-new and picked up by create_all()) they need entries here.
+        "ALTER TABLE account_erasures ADD COLUMN IF NOT EXISTS sheet_row INTEGER",
+        "ALTER TABLE account_erasures ADD COLUMN IF NOT EXISTS snapshot_sheet_row INTEGER",
+        "ALTER TABLE account_erasures ADD COLUMN IF NOT EXISTS deletion_started_at TIMESTAMP",
+        "ALTER TABLE account_erasures ADD COLUMN IF NOT EXISTS deletion_completed_at TIMESTAMP",
+        "ALTER TABLE account_erasures ADD COLUMN IF NOT EXISTS personal_data_redacted_at TIMESTAMP",
         "CREATE UNIQUE INDEX IF NOT EXISTS uq_users_username ON users (username) WHERE username IS NOT NULL",
         # ── notes / highlights identity (rewritten 2026-07-26) ────────────────
         # See the block comment in app/models/user_data.py. The old key
