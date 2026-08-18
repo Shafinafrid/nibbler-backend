@@ -9,7 +9,9 @@ Expo Push API docs: https://docs.expo.dev/push-notifications/sending-notificatio
 
 import hashlib
 import logging
+from datetime import timezone as dt_timezone
 from typing import Optional
+from zoneinfo import ZoneInfo
 import httpx
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from sqlalchemy.orm import Session
@@ -183,6 +185,31 @@ async def send_push_notifications(
 def _slot(dt):
     """(hour, 5-minute-slot) in UTC — matches how delivery times are stored."""
     return dt.hour, (dt.minute // 5) * 5
+
+
+def _effective_utc_slot(local_hour, local_minute, tz_name, fallback_hour, fallback_minute, now_utc) -> tuple:
+    """Task 4 (items 13/14 — timezone-safe delivery, no frozen UTC value):
+    recompute TODAY's UTC delivery slot from the user's stored LOCAL
+    wall-clock pick + their CURRENT `users.timezone` (already kept fresh by
+    `PATCH /sync/identity` on every launch — see app/routers/bites.py for the
+    same ZoneInfo pattern). Because this runs fresh on every 5-minute tick,
+    a DST shift or a trip to a new timezone reconciles automatically on the
+    very next tick — nothing needs to notice the change or write a
+    correction. Falls back to the cached UTC columns (pre-Task-4 behavior,
+    unaffected) when there's no local time on record yet (legacy token) or
+    the timezone is missing/unrecognized."""
+    if local_hour is None or not tz_name:
+        return fallback_hour, fallback_minute
+    try:
+        tz = ZoneInfo(tz_name)
+    except Exception:
+        return fallback_hour, fallback_minute
+    local_now = now_utc.astimezone(tz)
+    local_target = local_now.replace(
+        hour=local_hour, minute=local_minute or 0, second=0, microsecond=0
+    )
+    utc_target = local_target.astimezone(dt_timezone.utc)
+    return utc_target.hour, (utc_target.minute // 5) * 5
 
 
 def _load_growth_state(db, user_id: str) -> dict:
@@ -477,7 +504,13 @@ async def _notify_delivery_slot(db_factory, now) -> None:
     """Notify users whose delivery time is `now`, with dynamic, book-specific
     copy (Task 3) — one message PER USER now, not a shared title/body batch,
     since each user's featured book/hook differs. Still one chunked HTTP
-    call to Expo at the end via send_push_messages."""
+    call to Expo at the end via send_push_messages.
+
+    Task 4: gated on `notifications_enabled` (a disabled token is kept, not
+    deleted, so it must be actively excluded here) and matched via
+    `_effective_utc_slot` — recomputed per token from the user's CURRENT
+    timezone every tick, not a cached UTC value fetched once at
+    registration time, so this can no longer be a plain indexed SQL filter."""
     from app.models.push_token import PushToken
     from app.models.user import User
     from app.config import get_settings
@@ -490,19 +523,28 @@ async def _notify_delivery_slot(db_factory, now) -> None:
     messages = []
     with db_factory() as db:
         rows = (
-            db.query(PushToken)
-            .filter(PushToken.notification_hour == hour, PushToken.notification_minute == slot)
+            db.query(PushToken, User)
+            .join(User, User.id == PushToken.user_id)
+            .filter(PushToken.notifications_enabled.is_(True))
             .all()
         )
         if not rows:
             return
         by_user: dict[str, list[str]] = {}
-        for r in rows:
-            by_user.setdefault(r.user_id, []).append(r.token)
-        for user_id, toks in by_user.items():
-            user = db.query(User).filter(User.id == user_id).first()
-            if not user:
+        user_by_id = {}
+        for tok, user in rows:
+            eff_hour, eff_minute = _effective_utc_slot(
+                tok.notification_local_hour, tok.notification_local_minute,
+                user.timezone, tok.notification_hour, tok.notification_minute, now,
+            )
+            if (eff_hour, eff_minute) != (hour, slot):
                 continue
+            by_user.setdefault(user.id, []).append(tok.token)
+            user_by_id[user.id] = user
+        if not by_user:
+            return
+        for user_id, toks in by_user.items():
+            user = user_by_id[user_id]
             # This tick never goes through get_current_user, so lock state
             # must be reconciled here too — a user whose trial/subscription
             # expired since the last _prepare_user_nibbles tick must not
@@ -550,10 +592,10 @@ async def _notify_streak_alert_slot(db_factory, now) -> None:
     messages = []
     with db_factory() as db:
         rows = (
-            db.query(PushToken)
+            db.query(PushToken, User)
+            .join(User, User.id == PushToken.user_id)
             .filter(
-                PushToken.notification_hour == hour,
-                PushToken.notification_minute == slot,
+                PushToken.notifications_enabled.is_(True),
                 PushToken.streak_alerts_enabled.is_(True),
             )
             .all()
@@ -561,17 +603,25 @@ async def _notify_streak_alert_slot(db_factory, now) -> None:
         if not rows:
             return
         by_user: dict[str, list[str]] = {}
-        for r in rows:
-            by_user.setdefault(r.user_id, []).append(r.token)
+        user_by_id = {}
+        for tok, user in rows:
+            eff_hour, eff_minute = _effective_utc_slot(
+                tok.notification_local_hour, tok.notification_local_minute,
+                user.timezone, tok.notification_hour, tok.notification_minute, now,
+            )
+            if (eff_hour, eff_minute) != (hour, slot):
+                continue
+            by_user.setdefault(user.id, []).append(tok.token)
+            user_by_id[user.id] = user
+        if not by_user:
+            return
         for user_id, toks in by_user.items():
             streak = db.query(Streak).filter(Streak.user_id == user_id).first()
             if not streak or not streak.current_streak:
                 continue
             if streak.last_active_date and streak.last_active_date >= today:
                 continue  # already read today — nothing at risk
-            user = db.query(User).filter(User.id == user_id).first()
-            if not user:
-                continue
+            user = user_by_id[user_id]
             # Same reasoning as _notify_delivery_slot: this tick must not
             # alert about a streak-saving session on a source that's since
             # become locked (that bite is unreachable — see

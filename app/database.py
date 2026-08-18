@@ -460,6 +460,10 @@ def _run_migrations():
         # push_tokens — minute-precision delivery (July 2026)
         "ALTER TABLE push_tokens ADD COLUMN IF NOT EXISTS notification_minute INTEGER DEFAULT 0",
         "ALTER TABLE push_tokens ADD COLUMN IF NOT EXISTS streak_alerts_enabled BOOLEAN DEFAULT TRUE",
+        # push_tokens — truthful/recoverable/timezone-safe settings (Task 4, Aug 2026)
+        "ALTER TABLE push_tokens ADD COLUMN IF NOT EXISTS notification_local_hour INTEGER",
+        "ALTER TABLE push_tokens ADD COLUMN IF NOT EXISTS notification_local_minute INTEGER",
+        "ALTER TABLE push_tokens ADD COLUMN IF NOT EXISTS notifications_enabled BOOLEAN DEFAULT TRUE",
         "ALTER TABLE streaks ADD COLUMN IF NOT EXISTS last_completed_at TIMESTAMP",
         "ALTER TABLE daily_bites ADD COLUMN IF NOT EXISTS chunk_ids JSON",
         # users — identity + device context (July 2026, full-account sync)
