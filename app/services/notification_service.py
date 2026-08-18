@@ -25,6 +25,16 @@ EXPO_PUSH_URL = "https://exp.host/--/api/v2/push/send"
 # changed one only re-fires the next day.
 NIBBLE_LOCK_HOURS = 23
 
+# ── Push copy — single source of truth ────────────────────────────────────
+# Shared between the real scheduled sends below and preview_notification_for_
+# user (the owner's on-demand test button), so the two can never drift apart.
+FRESH_TITLE = "Your daily nibble is ready 🐱"
+FRESH_BODY = "Nibbler prepared something fresh for you — tap to dig in."
+FORGOTTEN_TITLE = "Psst… you forgot yesterday's nibble 🐱"
+FORGOTTEN_BODY = "No worries — Nibbler kept it warm for you. Tap to finish it."
+STREAK_TITLE = "Your streak ends in 1 hour 🔥"
+STREAK_BODY = "Yesterday's nibble is still waiting — finish it now to keep your streak alive."
+
 # APScheduler instance (started in main.py lifespan)
 scheduler = AsyncIOScheduler()
 
@@ -321,6 +331,56 @@ def _prepare_user_nibbles(db_factory, user_id: str) -> None:
         logger.info("Prepared %d scheduled nibble(s) for user %s", made, user_id)
 
 
+def preview_notification_for_user(db: Session, user, now) -> tuple[str, str]:
+    """The exact (title, body) this user's real state would produce right
+    now, reusing the SAME selection logic as the real scheduled pushes
+    (`_notify_delivery_slot`/`_notify_streak_alert_slot`) — just without the
+    delivery-time-slot gate, so it can fire on demand instead of waiting for
+    a real tick. Never returns nothing: an account with no live condition
+    yet (nothing generated, no streak at risk) falls back to the everyday
+    "ready" copy, so the on-demand test button always has something real to
+    show rather than erroring out on a fresh/idle account.
+
+    This is a TEST-ONLY entry point (see POST /notifications/send-test) — it
+    still sends through the real `send_push_notifications` call, so what
+    arrives on-device is byte-identical to what the real scheduler would
+    have sent for this exact state, not a client-side mockup that can drift.
+
+    Streak is checked BEFORE forgotten-nibble, not after: in the real
+    scheduler these are two independent ticks at two different times of day,
+    so the same underlying state (an unread bite from a prior day, streak
+    still alive) legitimately produces BOTH pushes on different ticks. This
+    function only returns one, and `streak_at_risk` is a strict SUBSET of
+    the forgotten condition (it additionally requires a live streak) — so
+    checking forgotten first would make the streak variant unreachable
+    through this button whenever it's actually true, exactly the case worth
+    previewing."""
+    from app.models.streak import Streak
+    from app.services.entitlement_service import reconcile_free_lock_state
+
+    today = now.date()
+    reconcile_free_lock_state(db, user)
+
+    unread_list = _live_unread_query(db, user)
+    unread = unread_list[0] if unread_list else None
+
+    streak = db.query(Streak).filter(Streak.user_id == user.id).first()
+    streak_at_risk = (
+        streak and streak.current_streak
+        and not (streak.last_active_date and streak.last_active_date >= today)
+        and any(b.date < today for b in unread_list)
+    )
+    if streak_at_risk:
+        return (STREAK_TITLE, STREAK_BODY)
+
+    if unread and unread.date >= today:
+        return (FRESH_TITLE, FRESH_BODY)
+    if unread and unread.date < today:
+        return (FORGOTTEN_TITLE, FORGOTTEN_BODY)
+
+    return (FRESH_TITLE, FRESH_BODY)
+
+
 async def _notify_delivery_slot(db_factory, now) -> None:
     """Notify users whose delivery time is `now`, with copy that depends on
     whether their held set is fresh (prepared today) or forgotten (older)."""
@@ -368,8 +428,8 @@ async def _notify_delivery_slot(db_factory, now) -> None:
         logger.info("Delivering fresh nibble to %d tokens (%02d:%02d UTC)", len(fresh_tokens), hour, slot)
         await send_push_notifications(
             tokens=fresh_tokens,
-            title="Your daily nibble is ready 🐱",
-            body="Nibbler prepared something fresh for you — tap to dig in.",
+            title=FRESH_TITLE,
+            body=FRESH_BODY,
             data={"screen": "Home"},
             expo_access_token=expo,
         )
@@ -377,8 +437,8 @@ async def _notify_delivery_slot(db_factory, now) -> None:
         logger.info("Reminding %d tokens of a held nibble (%02d:%02d UTC)", len(forgotten_tokens), hour, slot)
         await send_push_notifications(
             tokens=forgotten_tokens,
-            title="Psst… you forgot yesterday's nibble 🐱",
-            body="No worries — Nibbler kept it warm for you. Tap to finish it.",
+            title=FORGOTTEN_TITLE,
+            body=FORGOTTEN_BODY,
             data={"screen": "Home"},
             expo_access_token=expo,
         )
@@ -442,8 +502,8 @@ async def _notify_streak_alert_slot(db_factory, now) -> None:
         logger.info("Streak alert to %d tokens (%02d:%02d UTC delivery)", len(at_risk_tokens), hour, slot)
         await send_push_notifications(
             tokens=at_risk_tokens,
-            title="Your streak ends in 1 hour 🔥",
-            body="Yesterday's nibble is still waiting — finish it now to keep your streak alive.",
+            title=STREAK_TITLE,
+            body=STREAK_BODY,
             data={"screen": "Home"},
             expo_access_token=getattr(settings, "expo_access_token", ""),
         )

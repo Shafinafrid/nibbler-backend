@@ -180,10 +180,18 @@ svc.pinecone_available = True
 svc.index = _Boom()
 check("a genuine Pinecone failure returns False", svc.delete_user_namespace("u1") is False)
 
-from app.routers.auth import delete_account
+from app.routers.auth import delete_account, _attempt_account_erasure_cleanup
 src = _inspect.getsource(delete_account)
-check("the endpoint reports per-system erasure status", '"erased": erased' in src)
-check("and logs loudly when erasure is incomplete", "ERASURE INCOMPLETE" in src)
+cleanup_src = _inspect.getsource(_attempt_account_erasure_cleanup)
+# Task 2 closeout (Verified Blocker 8) replaced the old single-pass endpoint
+# with a durable erasure state machine: the response now reports a single
+# truthful `complete` flag rather than a per-system `erased` breakdown (the
+# old shape), and per-subsystem failures are logged individually (below)
+# rather than behind one generic "ERASURE INCOMPLETE" line.
+check("the endpoint reports a truthful complete flag on both outcomes",
+      '"complete": True' in src and '"complete": False' in src)
+check("logs loudly, per subsystem, when a piece of erasure fails",
+      cleanup_src.count('logger.error("Erasure:') >= 3)
 
 section("ITEM 8/29/39 — archive status is recorded, not conflated with `processed`")
 from sqlalchemy import inspect as sa_inspect
@@ -191,7 +199,11 @@ from app.database import engine
 cols = {col["name"] for col in sa_inspect(engine).get_columns("library_items")}
 check("library_items.archive_status exists", "archive_status" in cols)
 lib_src = open(f"{BACKEND}/app/routers/library.py").read()
-check("archival success is recorded", 'archive_status = "stored"' in lib_src)
+# Blocker 2 moved this into an atomic-ownership-write lambda (setattr, not a
+# bare attribute assignment) to close a real race between the upload and a
+# concurrent ownership change — same effect, different call shape.
+check("archival success is recorded",
+      '"archive_status", "stored")' in lib_src)
 check("archival failure is recorded rather than only printed",
       'archive_status = "failed"' in lib_src and "S3 archive FAILED" in lib_src)
 

@@ -1,3 +1,4 @@
+from datetime import datetime
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 from pydantic import BaseModel
@@ -109,6 +110,50 @@ def update_streak_alerts(
         row.streak_alerts_enabled = data.enabled
     db.commit()
     return {"success": True, "message": "Streak alerts updated."}
+
+
+class SendTestResponse(BaseModel):
+    success: bool
+    title: str
+    body: str
+
+
+@router.post("/send-test", response_model=SendTestResponse)
+async def send_test_notification(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Owner-facing test button: sends the CURRENT user a real push, right
+    now, using their actual current state — not a canned example. Reuses
+    the exact same title/body selection the real scheduled delivery and
+    streak-alert pushes use (`preview_notification_for_user`), just without
+    waiting for their configured delivery time or the T-65 streak slot.
+    A real Expo push, so what arrives on-device matches production exactly."""
+    from app.services.notification_service import (
+        preview_notification_for_user, send_push_notifications,
+    )
+    from app.config import get_settings
+
+    tokens = [
+        t.token for t in
+        db.query(PushToken).filter(PushToken.user_id == current_user.id).all()
+    ]
+    if not tokens:
+        raise HTTPException(
+            status_code=400,
+            detail="No push token registered on this device yet — enable notifications first.",
+        )
+
+    title, body = preview_notification_for_user(db, current_user, datetime.utcnow())
+    settings = get_settings()
+    await send_push_notifications(
+        tokens=tokens,
+        title=title,
+        body=body,
+        data={"screen": "Home"},
+        expo_access_token=getattr(settings, "expo_access_token", ""),
+    )
+    return {"success": True, "title": title, "body": body}
 
 
 @router.put("/time", response_model=RegisterTokenResponse)
