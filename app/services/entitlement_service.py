@@ -115,7 +115,7 @@ from sqlalchemy.orm import Session
 
 from app.config import get_settings
 from app.models.library import LibraryItem
-from app.models.user import User
+from app.models.user import User, TRIAL_DAYS
 
 logger = logging.getLogger(__name__)
 settings = get_settings()
@@ -135,6 +135,77 @@ def free_source_limit() -> int:
     """The permanent lifetime count of successful sources a Free account may
     keep unlocked. Reuses the existing `free_upload_limit` setting (3)."""
     return settings.free_upload_limit
+
+
+# ── Canonical entitlement resolver (Task 8, Aug 2026) ───────────────────────
+# The ONE place that turns is_premium/premium_until/entitlement_source/
+# trial_anchor_at into a human-facing result. `GET /entitlement` returns this
+# directly; `effective_premium`/`is_source_unlocked` remain the enforcement
+# gates (unchanged) — this function never gates anything itself, it only
+# REPORTS what the gates already decided, plus provenance the boolean gates
+# don't carry (why access exists, since when, whether it was ever paid).
+
+def resolve_entitlement(user: User) -> dict:
+    """Returns the canonical entitlement result — access, source, dates,
+    whether paid access has ever been held, and last-sync state. Every
+    consumer (backend response, mobile display) must use this instead of
+    re-deriving its own reading of is_premium/premium_until."""
+    now = datetime.utcnow()
+    access = "premium" if user.effective_premium else "free"
+
+    if user.effective_premium:
+        if user.entitlement_source == "complimentary":
+            source = "complimentary"
+        elif user.entitlement_source == "paid":
+            source = "paid"
+        elif user.premium_until:
+            # entitlement_source is unset but premium_until IS — only the
+            # paid/webhook write paths ever set premium_until, so this is a
+            # pre-Task-8 real-subscriber row the one-time backfill (see
+            # database.py) doesn't touch (that backfill only targets
+            # is_premium=True rows). Correctly 'paid', not a guess.
+            source = "paid"
+        elif user.is_premium:
+            # Audit finding (Aug 2026): bare is_premium=True with NEITHER
+            # entitlement_source NOR premium_until set is exactly the shape
+            # of a PRE-Task-8 manual comp — is_premium had no writer at all
+            # before this task, so every existing True row was set by hand,
+            # which is precisely what "reserved for comps" (the pre-
+            # existing convention _plan_label in routers/auth.py already
+            # encodes) means. The one-time backfill in database.py should
+            # already have set entitlement_source='complimentary' for these
+            # on boot; this branch is the safety net for whatever it
+            # doesn't yet cover. Reporting 'paid' here (an earlier version
+            # of this function did) would mislabel exactly the accounts
+            # this whole feature exists to serve — e.g. the founder's own.
+            source = "complimentary"
+        else:
+            source = "trial"
+    else:
+        source = "free"
+
+    # Start/expiry are only meaningful for a currently-active grant — a
+    # lapsed premium_until or a cleared trial has no "current" window.
+    starts_at = None
+    expires_at = None
+    if source == "trial":
+        anchor = user.trial_anchor_at or user.created_at
+        starts_at = anchor
+        expires_at = (anchor + timedelta(days=TRIAL_DAYS)) if anchor else None
+    elif source in ("paid", "complimentary"):
+        expires_at = user.premium_until if (user.premium_until and user.premium_until > now) else None
+        # is_premium with no premium_until is a LIFETIME grant (e.g. the
+        # founder's own account) — genuinely no expiry, not "unknown".
+
+    return {
+        "access": access,                                   # 'free' | 'premium'
+        "source": source,                                    # 'free' | 'trial' | 'paid' | 'complimentary'
+        "starts_at": starts_at.isoformat() if starts_at else None,
+        "expires_at": expires_at.isoformat() if expires_at else None,
+        "is_lifetime": source in ("paid", "complimentary") and user.is_premium and not user.premium_until,
+        "has_held_paid_entitlement": bool(user.has_held_paid_entitlement),
+        "last_synced_at": user.premium_synced_at.isoformat() if user.premium_synced_at else None,
+    }
 
 
 # ── Effective access (the one function every enforcement point must use) ────

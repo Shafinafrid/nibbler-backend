@@ -1,5 +1,5 @@
 from datetime import datetime, timedelta
-from sqlalchemy import Column, String, Boolean, DateTime, Integer, func
+from sqlalchemy import Column, String, Boolean, DateTime, Integer, BigInteger, func
 from sqlalchemy.orm import relationship
 from app.database import Base
 
@@ -16,6 +16,31 @@ class User(Base):
     premium_until = Column(DateTime, nullable=True)
     created_at = Column(DateTime, server_default=func.now())
     updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now())
+
+    # ── Canonical entitlement provenance (Task 8, Aug 2026) ───────────────────
+    # `is_premium`/`premium_until` alone can't say WHY a grant exists — a real
+    # subscription and a founder/tester promotional grant look identical.
+    # Written explicitly by the ONE place that grants access (the RevenueCat
+    # webhook, and sync-premium's REST read) — never inferred elsewhere.
+    # 'paid' | 'complimentary' | None (nothing currently active/never set).
+    entitlement_source = Column(String, nullable=True)
+    # Permanent, monotonic — set True the FIRST time a REAL (non-promotional)
+    # purchase is observed, and never cleared. Answers "has this account ever
+    # held paid access", independent of trial_anchor_at (which only governs
+    # whether the signup trial can re-open).
+    has_held_paid_entitlement = Column(Boolean, default=False, nullable=False)
+    # Last time an entitlement write path (webhook OR sync-premium) actually
+    # confirmed state with RevenueCat — surfaced in the entitlement resolver
+    # so a client can tell "confirmed 2 minutes ago" from "never synced".
+    premium_synced_at = Column(DateTime, nullable=True)
+    # Idempotency/ordering guard for the webhook specifically (Task 8): RC
+    # webhooks carry no per-user sequence number, only their own event id +
+    # timestamp — both must be tracked to reject an exact-duplicate redelivery
+    # AND a genuinely-older event arriving after a newer one was already
+    # applied (retries reuse the same id/timestamp per RC's own docs, so a
+    # duplicate is caught by id and a stale reorder is caught by timestamp).
+    last_webhook_event_id = Column(String, nullable=True)
+    last_webhook_event_at_ms = Column(BigInteger, nullable=True)  # ms epoch — too large for 32-bit INTEGER
 
     # ── Identity + device context (July 2026) ────────────────────────────────
     # Everything here is either user-supplied or a technical attribute of their

@@ -21,6 +21,7 @@ from app.schemas.user import UserResponse
 from app.services.s3_service import S3Service
 from app.services.embedding_service import EmbeddingService
 from app.services import mixpanel_service, deletion_sheets_service, email_service
+from app.services.entitlement_service import resolve_entitlement
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 
 logger = logging.getLogger(__name__)
@@ -87,7 +88,23 @@ def sync_premium(
             .astimezone(timezone.utc)
             .replace(tzinfo=None)  # model timestamps are naive UTC
         )
+        # Task 8: parity with the webhook's promotional detection. RC's REST
+        # subscriber response has no top-level "store" field on the
+        # entitlement object the way webhook events do — a promotional
+        # grant is instead identifiable by its product_identifier, which RC
+        # generates with an "rc_promo_" prefix (confirmed against RC's own
+        # docs, not assumed). A lifetime promotional grant still returns a
+        # real expires_date here (RC's REST representation always has one,
+        # unlike the webhook payload) — is_lifetime therefore isn't
+        # derivable from this endpoint; sync-premium always writes
+        # premium_until, and the webhook remains authoritative for the
+        # is_premium/lifetime distinction, which it can actually observe.
+        is_promotional = str(entitlement.get("product_identifier") or "").startswith("rc_promo_")
         current_user.premium_until = expires
+        current_user.entitlement_source = "complimentary" if is_promotional else "paid"
+        if not is_promotional:
+            current_user.has_held_paid_entitlement = True
+        current_user.premium_synced_at = datetime.utcnow()
     # No entitlement in the payload → leave premium_until untouched. RevenueCat
     # keeps expired entitlements in the subscriber object, so "missing" means
     # the user never subscribed — and wiping a stored past expiry would wrongly
@@ -97,6 +114,17 @@ def sync_premium(
     db.refresh(current_user)
     logger.info("sync-premium: user %s premium_until=%s", current_user.id, current_user.premium_until)
     return current_user
+
+
+@router.get("/entitlement")
+def get_entitlement(current_user: User = Depends(get_current_user)):
+    """Task 8 (Aug 2026): the ONE canonical entitlement result — access,
+    source (free/trial/paid/complimentary), start/expiry, whether paid
+    access has ever been held, and last-sync time. This is what the mobile
+    app must treat as authoritative for tier display/gating; RevenueCat
+    stays responsible only for offerings and the purchase/restore
+    transaction itself (see resolve_entitlement's docstring)."""
+    return resolve_entitlement(current_user)
 
 
 def _plan_label(user: User) -> str:

@@ -488,6 +488,23 @@ def _run_migrations():
         "ALTER TABLE account_erasures ADD COLUMN IF NOT EXISTS deletion_started_at TIMESTAMP",
         "ALTER TABLE account_erasures ADD COLUMN IF NOT EXISTS deletion_completed_at TIMESTAMP",
         "ALTER TABLE account_erasures ADD COLUMN IF NOT EXISTS personal_data_redacted_at TIMESTAMP",
+        # Task 8 (Aug 2026): canonical entitlement provenance + webhook idempotency.
+        "ALTER TABLE users ADD COLUMN IF NOT EXISTS entitlement_source VARCHAR",
+        "ALTER TABLE users ADD COLUMN IF NOT EXISTS has_held_paid_entitlement BOOLEAN DEFAULT FALSE",
+        "ALTER TABLE users ADD COLUMN IF NOT EXISTS premium_synced_at TIMESTAMP",
+        "ALTER TABLE users ADD COLUMN IF NOT EXISTS last_webhook_event_id VARCHAR",
+        "ALTER TABLE users ADD COLUMN IF NOT EXISTS last_webhook_event_at_ms BIGINT",
+        # One-time data backfill (audit finding, Aug 2026): every existing
+        # is_premium=True row predates entitlement_source's existence — it
+        # was set by hand (there was never any code path that wrote it
+        # before this task), which is EXACTLY the pre-existing "manual comp"
+        # meaning _plan_label already encodes ("premium (comp)" for any
+        # is_premium=True user, unconditionally). Without this, the new
+        # resolver's back-compat branch had no way to distinguish that from
+        # a paid grant and misreported it as 'paid'. Safe to re-run every
+        # boot — a no-op once entitlement_source is populated.
+        "UPDATE users SET entitlement_source = 'complimentary' "
+        "WHERE is_premium = TRUE AND entitlement_source IS NULL",
         "CREATE UNIQUE INDEX IF NOT EXISTS uq_users_username ON users (username) WHERE username IS NOT NULL",
         # ── notes / highlights identity (rewritten 2026-07-26) ────────────────
         # See the block comment in app/models/user_data.py. The old key
