@@ -1640,6 +1640,99 @@ def retry_item_deletions(db: Session, batch_size: int = 25) -> tuple:
     return resolved, failed
 
 
+# ── Grace-period promotion (Aug 2026) ────────────────────────────
+def promote_scheduled_erasures(db: Session, batch_size: int = 25) -> int:
+    """A 'scheduled' account erasure (see AccountErasure's docstring and
+    `app/routers/auth.py`'s delete_account) sits inert for its grace
+    period — account fully usable, nothing gated, no identity captured
+    yet. Once that window elapses, THIS function captures the account's
+    CURRENT identity (fresh, not whatever it looked like the moment the
+    user first tapped delete — the account was usable that whole time,
+    so a new upload or a deleted book since then must be accounted for)
+    and flips the row to 'pending', handing off to the existing
+    `retry_account_erasures` machinery for the actual cleanup — run
+    immediately after this in the same maintenance-cycle tick, so a
+    freshly-promoted row gets its first cleanup attempt right away
+    rather than waiting a further 5 minutes.
+
+    Audit finding (Aug 2026): `_capture_erasure_identity` calls RevenueCat's
+    REST API (`_capture_erasure_snapshot` -> `_revenuecat_subscriber_detail`,
+    a real `requests.get(..., timeout=10)`), so it must NEVER run while
+    holding this row's lock — up to 10s of a live Postgres lock held across
+    live network I/O, exactly the discipline `retry_account_erasures` above
+    already avoids by committing its claim BEFORE calling its own slow
+    cleanup function. Fixed to match: claim under lock and commit (releasing
+    the lock) BEFORE the slow call, then re-acquire and re-verify the state
+    is still 'scheduled' before writing the captured identity — a
+    concurrent `POST /auth/cancel-deletion` (which doesn't respect
+    claimed_until; it's user-facing, not a runner) can freely delete the
+    row while identity capture is in flight, and this discards the
+    now-orphaned result rather than resurrecting a cancelled row."""
+    from app.models.library import AccountErasure
+    from app.models.user import User
+    from app.routers.auth import _capture_erasure_identity
+
+    runner_id = str(uuid.uuid4())
+    claim_ttl = timedelta(minutes=5)
+    grace = timedelta(hours=settings.account_deletion_grace_hours)
+    cutoff = datetime.utcnow() - grace
+
+    candidate_ids = [
+        eid for (eid,) in db.query(AccountErasure.id)
+        .filter(
+            AccountErasure.state == "scheduled",
+            AccountErasure.requested_at <= cutoff,
+            (AccountErasure.claimed_until.is_(None)) | (AccountErasure.claimed_until < datetime.utcnow()),
+        )
+        .order_by(AccountErasure.requested_at.asc())
+        .limit(batch_size)
+        .all()
+    ]
+
+    promoted = 0
+    for erasure_id in candidate_ids:
+        erasure = (
+            db.query(AccountErasure).filter(AccountErasure.id == erasure_id)
+            .populate_existing().with_for_update().first()
+        )
+        if not erasure or erasure.state != "scheduled":
+            continue  # cancelled (or already promoted by a concurrent runner) since the scan above
+        if erasure.claimed_until is not None and erasure.claimed_until >= datetime.utcnow():
+            continue  # a concurrent runner already holds this exact row
+
+        user = db.query(User).filter(User.id == erasure.user_id).first()
+        if user is None:
+            # Account row is gone some other way — nothing left to erase.
+            db.delete(erasure)
+            db.commit()
+            continue
+
+        # Claim and release the lock BEFORE the slow network call.
+        erasure.claimed_by = runner_id
+        erasure.claimed_until = datetime.utcnow() + claim_ttl
+        db.commit()
+
+        identity = _capture_erasure_identity(db, user)
+
+        # Re-acquire and re-verify: a cancel could have deleted this row
+        # entirely while identity capture was in flight above.
+        erasure = (
+            db.query(AccountErasure).filter(AccountErasure.id == erasure_id)
+            .populate_existing().with_for_update().first()
+        )
+        if not erasure or erasure.state != "scheduled":
+            continue  # cancelled while capturing identity — discard the result
+
+        erasure.identity = identity
+        erasure.state = "pending"
+        erasure.claimed_by = None
+        erasure.claimed_until = None
+        db.commit()
+        promoted += 1
+
+    return promoted
+
+
 # ── Autonomous account-erasure retry (Task 2 closeout, Verified Blocker 8) ──
 def retry_account_erasures(db: Session, batch_size: int = 25) -> tuple:
     """Discover and retry `account_erasures` rows in 'pending'/'failed'

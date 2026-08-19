@@ -311,6 +311,16 @@ class AccountErasure(Base):
     gate `get_current_user` checks on every authenticated request for
     this account (see app/middleware/auth.py).
 
+    Deletion grace period (Aug 2026) added a 'scheduled' state ahead of 'pending': a
+    24-hour (configurable) grace period during which the account stays
+    FULLY USABLE and un-gated (deliberately NOT one of the fail-closed
+    states below — `identity` is empty `{}` at this point, since capturing
+    it now would go stale if the user uploads/deletes something during
+    the window). `entitlement_service.promote_scheduled_erasures` captures
+    the real identity and flips the row to 'pending' once the grace
+    period elapses, at which point everything below is unchanged from
+    before this grace period was added.
+
     `identity` never holds credentials, source text, embeddings, or
     tokens — only the artifact identities (ids/keys) needed to find and
     delete them."""
@@ -321,7 +331,12 @@ class AccountErasure(Base):
 
     id = Column(String, primary_key=True)
     user_id = Column(String, index=True, nullable=False)
-    state = Column(String, nullable=False, default="pending")  # 'pending' | 'failed' | 'resolved'
+    state = Column(String, nullable=False, default="pending")  # 'scheduled' | 'pending' | 'failed' | 'resolved'
+    # NOTE: 'cancelled' also appears in the Google Sheet's Status column
+    # (see cancel_deletion) but is NEVER a real value here — cancellation
+    # deletes the Postgres row outright, matching the "zero trace left"
+    # design; 'cancelled' only exists on a detached, never-persisted copy
+    # built purely to log the event to the Sheet.
     # {"source_keys": [...], "image_keys": [...], "avatar_key": str|None,
     #  "pinecone_namespace": str, "cleanup_ledger_ids": [...],
     #  "firebase_uid": str}

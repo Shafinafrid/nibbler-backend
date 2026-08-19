@@ -725,6 +725,13 @@ async def _run_task2_maintenance_cycle(db_factory) -> None:
 
     def _run_account_erasures():
         with db_factory() as db:
+            # Deletion grace period (Aug 2026): promote any 'scheduled' erasure whose grace
+            # period just elapsed into 'pending' BEFORE this same tick's
+            # retry pass, so it gets its first real cleanup attempt right
+            # away instead of waiting a further 5 minutes.
+            promoted = ent.promote_scheduled_erasures(db)
+            if promoted:
+                logger.info("[task2-maintenance] account-erasure grace period elapsed: promoted=%d", promoted)
             resolved, failed = ent.retry_account_erasures(db)
             if resolved or failed:
                 logger.info("[task2-maintenance] account-erasure retry: resolved=%d failed=%d", resolved, failed)

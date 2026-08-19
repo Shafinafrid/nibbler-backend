@@ -1,7 +1,7 @@
 import asyncio
 import logging
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import requests
 from fastapi import APIRouter, Depends, HTTPException
@@ -538,6 +538,17 @@ def _attempt_account_erasure_cleanup(db: Session, erasure: AccountErasure) -> bo
 
     try:
         deletion_sheets_service.sync_erasure_to_sheet(erasure, snapshot)
+        # Bug found while implementing The grace period's scheduling-log write (Aug
+        # 2026): sync_erasure_to_sheet mutates erasure.sheet_row/
+        # snapshot_sheet_row IN MEMORY (via _allocate_sheet_rows) but never
+        # commits — get_db() only closes the session, it doesn't commit on
+        # exit. Without this, the row number never actually persisted, so
+        # every retry re-allocated a BRAND NEW sheet row instead of
+        # updating the one already assigned — silently defeating the
+        # "create-or-update" behavior sync_erasure_to_sheet's own docstring
+        # promises. Confirmed by direct reproduction (a fresh session after
+        # a mutate-then-close-without-commit sees sheet_row still None).
+        db.commit()
     except Exception as e:
         logger.warning("Deletion-sheet sync failed for %s: %s", user_id, e)
 
@@ -548,126 +559,165 @@ def _attempt_account_erasure_cleanup(db: Session, erasure: AccountErasure) -> bo
     return False
 
 
+def _capture_erasure_identity(db: Session, user: User) -> dict:
+    """Builds the durable erasure identity dict for a user — every current
+    source-file key, every image key, the avatar key, the Pinecone
+    namespace, every still-unresolved cleanup-ledger artifact, the
+    Firebase uid, and a privacy-safe snapshot. Frozen at the moment this
+    is called, so it MUST be called right before erasure work actually
+    begins (grace-period expiry — see entitlement_service.
+    promote_scheduled_erasures), not at the moment deletion is first
+    requested: Deletion grace period (Aug 2026) made the account stay fully usable for
+    the whole grace period, so a new upload or a deleted book in the
+    meantime would make an identity captured earlier stale."""
+    user_id = user.id
+    library_items = db.query(LibraryItem).filter(LibraryItem.user_id == user_id).all()
+    # Task 2 closeout (Verified Blocker 8): keys are checked against
+    # this user's own S3 prefix before being captured into the
+    # durable erasure identity — the SAME safety property
+    # `_delete_item_images`/`get_book_image` already enforce. Without
+    # this, a tombstoned-but-not-yet-hard-deleted item still carrying
+    # a tampered or stale out-of-prefix key (its own cleanup never
+    # fully succeeded, so `item.images`/`file_url` were never
+    # corrected) would hand this account's own erasure the ability
+    # to delete a DIFFERENT account's object.
+    source_keys = [
+        i.file_url for i in library_items
+        if i.file_url and str(i.file_url).startswith("%s/" % user_id)
+    ]
+    image_keys = [
+        img.get("key") for i in library_items for img in (i.images or [])
+        if isinstance(img, dict) and img.get("key")
+        and str(img.get("key")).startswith("book-images/%s/" % user_id)
+    ]
+    _refused = [
+        img.get("key") for i in library_items for img in (i.images or [])
+        if isinstance(img, dict) and img.get("key")
+        and not str(img.get("key")).startswith("book-images/%s/" % user_id)
+    ]
+    if _refused:
+        logger.error("Erasure identity capture refused %d out-of-scope image key(s) for user %s: %s",
+                     len(_refused), user_id, _refused)
+    cleanup_ledger_ids = [
+        r.id for r in db.query(CleanupTask).filter(
+            CleanupTask.user_id == user_id, CleanupTask.cleanup_state != "resolved",
+        ).all()
+    ]
+    # Task 7 (Aug 2026): rich, privacy-safe (metadata/counts only)
+    # snapshot of the account as it stood at THIS moment — same
+    # immutability rationale as source_keys/image_keys above. Feeds
+    # the "User Snapshot" Sheet tab and the trial/upload abuse guard.
+    snapshot = _capture_erasure_snapshot(db, user)
+
+    return {
+        "source_keys": source_keys,
+        "image_keys": image_keys,
+        "avatar_key": user.avatar_url,
+        "pinecone_namespace": user_id,
+        "cleanup_ledger_ids": cleanup_ledger_ids,
+        "firebase_uid": user_id,
+        "snapshot": snapshot,
+    }
+
+
 @router.delete("/me")
 def delete_account(
     current_user: User = Depends(get_current_user_allow_pending_erasure),
     db: Session = Depends(get_db),
 ):
     """
-    Permanently delete the user account and all associated data.
-    GDPR Article 17 — Right to Erasure.
+    Schedule permanent deletion of the user account and all associated
+    data. GDPR Article 17 — Right to Erasure.
 
-    Task 2 closeout (Verified Blocker 8): a durable state machine, not a
-    single unconditional pass. The FIRST call captures the complete
-    cleanup identity (every current source-file key, every image key,
-    the avatar key, the Pinecone namespace, every still-unresolved
-    cleanup-ledger artifact, the Firebase uid) into a persisted
-    `AccountErasure` row BEFORE any external deletion is attempted — if
-    that persistence itself fails, this returns an error and touches
-    NOTHING external. From that instant, `get_current_user`'s fail-closed
-    gate refuses this account everywhere else, even though the Postgres
-    `User` row (and the still-valid Firebase token) survive until cleanup
-    actually completes. A repeated call (the user tapping delete again,
-    or this exact route being hit again) is idempotent: it re-attempts
-    whatever remains, using this SAME durable identity, and reports
-    truthfully — 'complete: false' with "still in progress" wording,
-    never a false "everything is permanently deleted", unless it
-    genuinely is.
+    Deletion grace period (Aug 2026): a 24-hour (configurable) grace period, so tapping
+    delete on impulse isn't instantly irreversible. This FIRST call only
+    creates a 'scheduled' AccountErasure row (no identity captured yet,
+    account stays fully usable, nothing gated) and sends a confirmation
+    email with a cancel-anytime notice. `POST /auth/cancel-deletion`
+    removes it cleanly with zero trace. Nothing external is touched, and
+    no Postgres/Firebase/S3/Pinecone cleanup happens, until
+    entitlement_service.promote_scheduled_erasures moves it to 'pending'
+    once the grace period elapses — from that point on, this is the same
+    durable state machine as before this grace period was added (Task 2 closeout, Verified
+    Blocker 8): every artifact class attempted regardless of an earlier
+    one failing, fail-closed gate applies, retried automatically, and a
+    repeated call here is idempotent and reports truthfully.
     """
     user_id = current_user.id
+    grace = timedelta(hours=settings.account_deletion_grace_hours)
 
     erasure = db.query(AccountErasure).filter(AccountErasure.user_id == user_id).first()
-    if erasure is None:
-        library_items = db.query(LibraryItem).filter(LibraryItem.user_id == user_id).all()
-        # Task 2 closeout (Verified Blocker 8): keys are checked against
-        # this user's own S3 prefix before being captured into the
-        # durable erasure identity — the SAME safety property
-        # `_delete_item_images`/`get_book_image` already enforce. Without
-        # this, a tombstoned-but-not-yet-hard-deleted item still carrying
-        # a tampered or stale out-of-prefix key (its own cleanup never
-        # fully succeeded, so `item.images`/`file_url` were never
-        # corrected) would hand this account's own erasure the ability
-        # to delete a DIFFERENT account's object.
-        source_keys = [
-            i.file_url for i in library_items
-            if i.file_url and str(i.file_url).startswith("%s/" % user_id)
-        ]
-        image_keys = [
-            img.get("key") for i in library_items for img in (i.images or [])
-            if isinstance(img, dict) and img.get("key")
-            and str(img.get("key")).startswith("book-images/%s/" % user_id)
-        ]
-        _refused = [
-            img.get("key") for i in library_items for img in (i.images or [])
-            if isinstance(img, dict) and img.get("key")
-            and not str(img.get("key")).startswith("book-images/%s/" % user_id)
-        ]
-        if _refused:
-            logger.error("Erasure identity capture refused %d out-of-scope image key(s) for user %s: %s",
-                         len(_refused), user_id, _refused)
-        cleanup_ledger_ids = [
-            r.id for r in db.query(CleanupTask).filter(
-                CleanupTask.user_id == user_id, CleanupTask.cleanup_state != "resolved",
-            ).all()
-        ]
-        # Task 7 (Aug 2026): rich, privacy-safe (metadata/counts only)
-        # snapshot of the account as it stood at THIS moment — same
-        # immutability rationale as source_keys/image_keys above. Feeds
-        # the "User Snapshot" Sheet tab and the trial/upload abuse guard.
-        snapshot = _capture_erasure_snapshot(db, current_user)
 
-        identity = {
-            "source_keys": source_keys,
-            "image_keys": image_keys,
-            "avatar_key": current_user.avatar_url,
-            "pinecone_namespace": user_id,
-            "cleanup_ledger_ids": cleanup_ledger_ids,
-            "firebase_uid": user_id,
-            "snapshot": snapshot,
-        }
-        erasure = AccountErasure(id=str(uuid.uuid4()), user_id=user_id, state="pending", identity=identity)
+    if erasure is None:
+        erasure = AccountErasure(id=str(uuid.uuid4()), user_id=user_id, state="scheduled", identity={})
         db.add(erasure)
         try:
             db.commit()
         except Exception as e:
             db.rollback()
-            logger.error("Could not persist durable erasure identity for %s: %s", user_id, e)
+            logger.error("Could not schedule account deletion for %s: %s", user_id, e)
             raise HTTPException(
                 status_code=503,
-                detail="Could not start account deletion right now — please try again.",
+                detail="Could not schedule account deletion right now — please try again.",
             )
         db.refresh(erasure)
 
-        # Acknowledgement email + initial "pending" Sheet row — both
-        # best-effort, never blocking the response on failure. Sent
-        # SYNCHRONOUSLY (not a BackgroundTask, which only runs after the
-        # response is returned) because the completion email below is
-        # also sent synchronously, inside _attempt_account_erasure_cleanup
-        # — a BackgroundTask here raced against that and lost for any
-        # deletion fast enough to complete within one request, so users
-        # got "your account has been deleted" before "request received".
-        if snapshot.get("email"):
+        scheduled_for = erasure.requested_at + grace
+        if current_user.email:
             _send_email_sync(
-                to=snapshot["email"],
-                subject="Nibbler account deletion received",
-                html="<p>We've received your request to permanently delete your "
-                     "Nibbler account. Your account is now deactivated and your "
-                     "data is being erased — this cannot be undone. You'll get "
-                     "another email once it's fully complete.</p>",
-                text="We've received your request to permanently delete your "
-                     "Nibbler account. Your account is now deactivated and your "
-                     "data is being erased — this cannot be undone. You'll get "
-                     "another email once it's fully complete.",
+                to=current_user.email,
+                subject="Nibbler account deletion scheduled",
+                html=f"<p>Your Nibbler account is scheduled to be permanently deleted on "
+                     f"{scheduled_for.strftime('%B %d, %Y at %H:%M UTC')}. Your account stays fully "
+                     f"usable until then. Changed your mind? Open the app and go to Profile to cancel "
+                     f"anytime before that date — after it passes, deletion cannot be undone.</p>",
+                text=f"Your Nibbler account is scheduled to be permanently deleted on "
+                     f"{scheduled_for.strftime('%B %d, %Y at %H:%M UTC')}. Your account stays fully "
+                     f"usable until then. Changed your mind? Open the app and go to Profile to cancel "
+                     f"anytime before that date — after it passes, deletion cannot be undone.",
             )
+
+        # Founder decision (Aug 2026): log the scheduling event itself, not
+        # just the eventual completion/failure — a cancelled deletion would
+        # otherwise leave literally zero trace anywhere, including in the
+        # ops-facing audit trail. This is a LIGHTWEIGHT display-only
+        # snapshot (email/plan/device/counts) purely for the Sheet row —
+        # NOT the durable cleanup identity, which still only gets captured
+        # fresh at promote_scheduled_erasures, per the whole point of the
+        # grace period (avoiding a stale target for the actual deletion).
         try:
-            deletion_sheets_service.sync_erasure_to_sheet(erasure, snapshot)
+            display_snapshot = _capture_erasure_snapshot(db, current_user)
+            deletion_sheets_service.sync_erasure_to_sheet(erasure, display_snapshot)
+            db.commit()  # persists sheet_row/snapshot_sheet_row so later syncs update this SAME row
         except Exception as e:
-            logger.warning("Deletion-sheet initial sync failed for %s: %s", user_id, e)
-    elif erasure.state == "resolved":
+            logger.warning("Deletion-sheet scheduling sync failed for %s: %s", user_id, e)
+
+        return {
+            "message": f"Account scheduled for deletion on {scheduled_for.isoformat()}. "
+                       f"You can cancel anytime before then from Profile.",
+            "complete": False,
+            "scheduled": True,
+            "scheduled_for": scheduled_for.isoformat(),
+        }
+
+    if erasure.state == "scheduled":
+        # Idempotent repeat: report the existing schedule, don't reset the timer.
+        scheduled_for = erasure.requested_at + grace
+        return {
+            "message": f"Account already scheduled for deletion on {scheduled_for.isoformat()}. "
+                       f"You can cancel anytime before then from Profile.",
+            "complete": False,
+            "scheduled": True,
+            "scheduled_for": scheduled_for.isoformat(),
+        }
+
+    if erasure.state == "resolved":
         # Should be unreachable in practice — a fully resolved erasure
         # deletes its own row in the same commit — but idempotent either way.
         return {"message": "Account and all associated data have been permanently deleted.", "complete": True}
 
+    # state in ("pending", "failed") — the grace period has already elapsed
+    # and real cleanup is underway/being retried, exactly as before this grace period was added.
     complete = _attempt_account_erasure_cleanup(db, erasure)
 
     if complete:
@@ -687,4 +737,97 @@ def delete_account(
     return {
         "message": "Account deletion accepted and still in progress — remaining cleanup is being retried automatically.",
         "complete": False,
+    }
+
+
+@router.post("/cancel-deletion")
+def cancel_deletion(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Deletion grace period (Aug 2026): cancels a still-'scheduled' deletion — no trace
+    left, account carries on exactly as if delete was never tapped. Uses
+    the NORMAL get_current_user dependency (not allow_pending_erasure):
+    a 'scheduled' row deliberately doesn't trip the fail-closed gate, so
+    this is reachable throughout the whole grace period; once the grace
+    period elapses and the row becomes 'pending'/'failed', the gate has
+    already locked the account out before this could ever be called, and
+    there is nothing left to cancel by then anyway.
+
+    Row-locked (matches the codebase's existing lock-order convention,
+    e.g. the RevenueCat webhook's user-row lock) against
+    promote_scheduled_erasures promoting this SAME row in the scheduler
+    thread at the same instant — without the lock and the re-check of
+    `state` after acquiring it, a cancel racing the exact moment the
+    grace period elapses could delete a row that promotion had just
+    populated with a freshly-captured identity and moved to 'pending'.
+
+    Founder decision (Aug 2026): a cancellation is also logged to the
+    Sheet audit trail (updates the SAME row scheduling wrote, using the
+    saved sheet_row/snapshot_sheet_row — no new row). The row is deleted
+    from Postgres and committed FIRST, releasing this lock, BEFORE any
+    Sheets network call runs — matching the exact discipline
+    promote_scheduled_erasures was fixed to follow (audit finding: never
+    hold a Postgres row lock across live network I/O). `_capture_erasure_
+    snapshot` alone calls RevenueCat's API, so it must run unlocked too."""
+    erasure = (
+        db.query(AccountErasure)
+        .filter(AccountErasure.user_id == current_user.id)
+        .with_for_update()
+        .first()
+    )
+    if erasure is None or erasure.state != "scheduled":
+        return {"cancelled": False, "message": "No scheduled deletion to cancel."}
+
+    # Freeze what the Sheet log needs into a plain, DETACHED copy — never
+    # added to any session, so it stays safely readable after the real row
+    # is deleted and committed below (the real `erasure` ORM object would
+    # be expired/gone by then).
+    cancelled_copy = AccountErasure(
+        id=erasure.id, user_id=erasure.user_id, state="cancelled", identity={},
+        sheet_row=erasure.sheet_row, snapshot_sheet_row=erasure.snapshot_sheet_row,
+        requested_at=erasure.requested_at,
+    )
+
+    db.delete(erasure)
+    db.commit()
+
+    try:
+        cancel_snapshot = _capture_erasure_snapshot(db, current_user)
+        deletion_sheets_service.sync_erasure_to_sheet(cancelled_copy, cancel_snapshot)
+    except Exception as e:
+        logger.warning("Deletion-sheet cancellation sync failed for %s: %s", current_user.id, e)
+
+    return {"cancelled": True, "message": "Account deletion cancelled."}
+
+
+@router.get("/deletion-status")
+def deletion_status(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Deletion grace period (Aug 2026): lets the app show a persistent 'scheduled for
+    deletion' banner across app restarts, not just right after the
+    DELETE /auth/me response. Only ever reports a 'scheduled' row — once
+    promoted to 'pending'/'failed' the fail-closed gate already blocks
+    this account everywhere, this endpoint included.
+
+    Audit finding (Aug 2026): grace_period_hours is ALWAYS included, not
+    just alongside a real scheduled deletion — the app's pre-confirmation
+    dialog (shown BEFORE any DELETE /auth/me call, so it has nothing else
+    to read the real number from) fetches this on Profile mount and uses
+    it instead of a hardcoded "24 hours" that would silently go stale the
+    moment this setting is ever reconfigured."""
+    grace = timedelta(hours=settings.account_deletion_grace_hours)
+    erasure = (
+        db.query(AccountErasure)
+        .filter(AccountErasure.user_id == current_user.id, AccountErasure.state == "scheduled")
+        .first()
+    )
+    if erasure is None:
+        return {"scheduled": False, "grace_period_hours": settings.account_deletion_grace_hours}
+    return {
+        "scheduled": True,
+        "scheduled_for": (erasure.requested_at + grace).isoformat(),
+        "grace_period_hours": settings.account_deletion_grace_hours,
     }

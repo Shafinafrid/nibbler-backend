@@ -139,6 +139,12 @@ class Settings(BaseSettings):
     # 5.1.1(v) self-service deletion). Lets the Sheet-writer code ship inert,
     # verified via a non-destructive connection test, before being flipped on.
     account_deletion_automation_enabled: bool = False
+    # Deletion grace period (Aug 2026): a scheduled deletion sits inert — account fully
+    # usable, nothing locked — until this many hours have passed, giving
+    # someone who taps delete on impulse a real window to cancel. Cleanup
+    # itself only starts once the window elapses (see
+    # entitlement_service.promote_scheduled_erasures).
+    account_deletion_grace_hours: int = 24
 
     # App
     app_env: str = "development"

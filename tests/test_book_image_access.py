@@ -250,6 +250,20 @@ db.commit()
 deleted_keys.clear()
 image_count = auth_router  # keep the import referenced for readers
 as_user("owner")
+# Task 9 (Aug 2026): DELETE /auth/me now only SCHEDULES deletion (a grace
+# period during which the account stays usable) — actual cleanup happens
+# once entitlement_service.promote_scheduled_erasures moves it to
+# 'pending' after the window elapses. Backdate requested_at past the
+# grace period and drive that transition directly, matching how the real
+# production scheduler does it, rather than sleeping in a test.
+from app.models.library import AccountErasure  # noqa: E402
+from app.services import entitlement_service as _ent  # noqa: E402
+
+client.delete("/auth/me")
+scheduled = db.query(AccountErasure).filter(AccountErasure.user_id == "owner").first()
+scheduled.requested_at = datetime.datetime.utcnow() - datetime.timedelta(hours=48)
+db.commit()
+_ent.promote_scheduled_erasures(db)
 try:
     client.delete("/auth/me")
 except Exception as e:  # Firebase/Pinecone are absent in the harness
