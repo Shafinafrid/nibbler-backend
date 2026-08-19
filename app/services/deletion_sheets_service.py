@@ -167,14 +167,18 @@ def _write_row(client: httpx.Client, headers: dict, sheet_id: str, tab_name: str
 
 def deletion_log_row_values(erasure, snapshot: dict) -> list:
     """Build the Deletion Log row from current DB state — always the full
-    row, positionally, so a re-sync after a retry just overwrites in place."""
+    row, positionally, so a re-sync after a retry just overwrites in place.
+
+    Founder decision (Aug 2026): email/Firebase UID are kept permanently
+    for support lookups, NOT redacted once personal_data_redacted_at is
+    set — that field still records when cleanup completed, it just no
+    longer blanks anything here."""
     progress = erasure.progress or {}
-    redacted = bool(erasure.personal_data_redacted_at)
     return [
         erasure.id,
         (erasure.requested_at.isoformat() if erasure.requested_at else ""),
-        "" if redacted else snapshot.get("email", ""),
-        "" if redacted else snapshot.get("firebase_uid", ""),
+        snapshot.get("email", ""),
+        snapshot.get("firebase_uid", ""),
         snapshot.get("plan", ""),
         erasure.state,
         (erasure.deletion_started_at.isoformat() if erasure.deletion_started_at else ""),
@@ -212,15 +216,13 @@ def _short(value, limit=60) -> str:
 
 
 def snapshot_row_values(erasure, snapshot: dict) -> list:
-    # Audit finding: this tab must redact the same way the Deletion Log tab
-    # already does — the whole point of "Personal Data Redacted At" is that
-    # NO tab keeps raw email/uid after that timestamp is set, not just one.
-    redacted = bool(erasure.personal_data_redacted_at)
+    # Founder decision (Aug 2026): email/Firebase UID kept permanently for
+    # support lookups — see deletion_log_row_values' docstring above.
     return [
         erasure.id,
         (erasure.requested_at.isoformat() if erasure.requested_at else ""),
-        "" if redacted else snapshot.get("email", ""),
-        "" if redacted else snapshot.get("firebase_uid", ""),
+        snapshot.get("email", ""),
+        snapshot.get("firebase_uid", ""),
         snapshot.get("created_at_iso", ""),
         snapshot.get("plan", ""),
         snapshot.get("premium_until_iso", ""),

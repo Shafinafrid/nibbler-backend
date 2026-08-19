@@ -4,7 +4,7 @@ import uuid
 from datetime import datetime, timezone
 
 import requests
-from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 from app.config import get_settings
 from app.database import get_db
@@ -550,7 +550,6 @@ def _attempt_account_erasure_cleanup(db: Session, erasure: AccountErasure) -> bo
 
 @router.delete("/me")
 def delete_account(
-    background_tasks: BackgroundTasks,
     current_user: User = Depends(get_current_user_allow_pending_erasure),
     db: Session = Depends(get_db),
 ):
@@ -640,11 +639,15 @@ def delete_account(
         db.refresh(erasure)
 
         # Acknowledgement email + initial "pending" Sheet row — both
-        # best-effort, dispatched only after the durable row is safely
-        # persisted, never blocking the response either way.
+        # best-effort, never blocking the response on failure. Sent
+        # SYNCHRONOUSLY (not a BackgroundTask, which only runs after the
+        # response is returned) because the completion email below is
+        # also sent synchronously, inside _attempt_account_erasure_cleanup
+        # — a BackgroundTask here raced against that and lost for any
+        # deletion fast enough to complete within one request, so users
+        # got "your account has been deleted" before "request received".
         if snapshot.get("email"):
-            background_tasks.add_task(
-                email_service.send_email,
+            _send_email_sync(
                 to=snapshot["email"],
                 subject="Nibbler account deletion received",
                 html="<p>We've received your request to permanently delete your "

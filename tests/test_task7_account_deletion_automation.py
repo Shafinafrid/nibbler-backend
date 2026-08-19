@@ -9,8 +9,9 @@ already-existing durable erasure state machine (Task2 Closeout: Blocker 8):
   C — _plan_label correctness across is_premium / active sub / lapsed / trial / free.
   D — _capture_erasure_snapshot: growth-profile count (multi-profile is real),
       library/streak/engagement stats, privacy-safe (no note/chat TEXT content).
-  E — deletion_sheets_service row-builders: correct column positions,
-      email/uid redaction once personal_data_redacted_at is set.
+  E — deletion_sheets_service row-builders: correct column positions;
+      email/uid are kept permanently (founder decision, Aug 2026) even
+      once personal_data_redacted_at is set.
   F — RevenueCat/Mixpanel erasure calls: blank credentials -> False, no
       network attempt (hermetic-safe), never raise.
   G — Full erasure success (all artifact classes mocked True): guard is
@@ -192,15 +193,17 @@ fake_erasure = AccountErasure(
 row = deletion_sheets_service.deletion_log_row_values(fake_erasure, {"email": "e@x.com", "plan": "free"})
 check("Deletion Log row has exactly 20 columns (matches the live Sheet header)",
       len(row) == len(deletion_sheets_service.DELETION_LOG_COLUMNS) == 20, len(row))
-check("email is in the User Email column (index 2) before redaction",
+check("email is in the User Email column (index 2)",
       row[2] == "e@x.com", row[2])
 check("retry_count lands in the Retry Count column (index 16)",
       row[16] == 2, row[16])
 
 fake_erasure.personal_data_redacted_at = NOW
-redacted_row = deletion_sheets_service.deletion_log_row_values(fake_erasure, {"email": "e@x.com", "plan": "free"})
-check("email/uid are BLANKED once personal_data_redacted_at is set",
-      redacted_row[2] == "" and redacted_row[3] == "", redacted_row[:4])
+still_row = deletion_sheets_service.deletion_log_row_values(fake_erasure, {"email": "e@x.com", "plan": "free"})
+check("founder decision (Aug 2026): email/uid are KEPT even after "
+      "personal_data_redacted_at is set — that field only records the "
+      "cleanup-completed timestamp now, it no longer blanks anything",
+      still_row[2] == "e@x.com", still_row[:4])
 
 snap_row = deletion_sheets_service.snapshot_row_values(fake_erasure, snap)
 check("User Snapshot row column count matches its own header exactly",
@@ -385,21 +388,22 @@ db.expire_all()
 check("the erasure row is genuinely gone after the fix (not stuck retrying UserNotFoundError forever)",
       db.query(AccountErasure).filter(AccountErasure.id == "erasure-i1").first() is None)
 
-# I2 — CONFIRMED GAP fix: the User Snapshot tab must redact email/uid too,
-# the same as the Deletion Log tab already did — it did NOT before the fix.
+# I2 — founder decision (Aug 2026, superseding the earlier redact-on-completion
+# audit fix): email/uid are kept PERMANENTLY in both Sheet tabs for support
+# lookups, regardless of personal_data_redacted_at, in both tabs consistently.
 fake_erasure_i2 = AccountErasure(id="erasure-i2", user_id="x", state="resolved",
                                   identity={}, progress={}, requested_at=NOW)
 snap_row_before = deletion_sheets_service.snapshot_row_values(
-    fake_erasure_i2, {"email": "leaky@example.com", "firebase_uid": "uid-x"})
-check("BEFORE personal_data_redacted_at is set, snapshot row still carries email (sanity check)",
-      snap_row_before[2] == "leaky@example.com")
+    fake_erasure_i2, {"email": "kept@example.com", "firebase_uid": "uid-x"})
+check("BEFORE personal_data_redacted_at is set, snapshot row carries email (sanity check)",
+      snap_row_before[2] == "kept@example.com")
 
 fake_erasure_i2.personal_data_redacted_at = NOW
 snap_row_after = deletion_sheets_service.snapshot_row_values(
-    fake_erasure_i2, {"email": "leaky@example.com", "firebase_uid": "uid-x"})
-check("User Snapshot tab NOW redacts email/uid once personal_data_redacted_at is set "
-      "(this tab used to never redact at all)",
-      snap_row_after[2] == "" and snap_row_after[3] == "", snap_row_after[:4])
+    fake_erasure_i2, {"email": "kept@example.com", "firebase_uid": "uid-x"})
+check("User Snapshot tab still carries email/uid AFTER personal_data_redacted_at is set "
+      "(founder decision: keep permanently for support lookups)",
+      snap_row_after[2] == "kept@example.com" and snap_row_after[3] == "uid-x", snap_row_after[:4])
 
 # I3 — length cap on client-controlled growth_state free text landing in the Sheet.
 long_area = "x" * 500
