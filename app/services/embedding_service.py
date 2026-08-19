@@ -434,5 +434,20 @@ class EmbeddingService:
             self.index.delete(delete_all=True, namespace=user_id)
             return True
         except Exception as e:
+            # Bug found in production (Aug 2026): Pinecone answers delete_all
+            # on a namespace that was NEVER CREATED — i.e. an account that
+            # never uploaded/embedded anything, which is common (free/trial/
+            # test accounts) — with a 404 NotFoundException, not a no-op
+            # success. That was being treated identically to a genuine
+            # failure, which permanently stuck every such account's erasure
+            # in retry forever (23 retries and counting on one test account,
+            # 'vectors' as the sole failing class). A namespace that never
+            # existed IS "no vectors for this user" — the same end state as
+            # one just emptied — so it counts as success here, exactly like
+            # Firebase's UserNotFoundError and RevenueCat's 404 already do
+            # elsewhere in this erasure flow.
+            from pinecone.exceptions import NotFoundException
+            if isinstance(e, NotFoundException):
+                return True
             print(f"[EmbeddingService] Namespace delete error: {e}")
             return False

@@ -180,6 +180,21 @@ svc.pinecone_available = True
 svc.index = _Boom()
 check("a genuine Pinecone failure returns False", svc.delete_user_namespace("u1") is False)
 
+# Production bug (Aug 2026): a namespace that was never created (account
+# never uploaded/embedded anything — common for free/trial/test accounts)
+# made Pinecone's delete_all raise a 404 NotFoundException, which the
+# broad except was treating identically to a real failure — permanently
+# stranding every such account's erasure in retry forever (reproduced live:
+# 23 retries, 'vectors' as the sole failing class, on an account that had
+# never uploaded a book).
+from pinecone.exceptions import NotFoundException
+class _NeverCreated:
+    def delete(self, **kw): raise NotFoundException(status=404, reason="Not Found")
+svc.index = _NeverCreated()
+check("a namespace that never existed (404) counts as success, not failure — "
+      "same end state as one just emptied",
+      svc.delete_user_namespace("u1") is True)
+
 from app.routers.auth import delete_account, _attempt_account_erasure_cleanup
 src = _inspect.getsource(delete_account)
 cleanup_src = _inspect.getsource(_attempt_account_erasure_cleanup)
