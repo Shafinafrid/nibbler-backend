@@ -114,6 +114,72 @@ class ChatMessage(Base):
     user = relationship("User", back_populates="chat_messages")
 
 
+class ChatTurn(Base):
+    """Idempotency/turn-tracking primitive for POST /connect/chat (Task 16,
+    Aug 2026) — deliberately NOT the same table as ChatMessage above.
+    ChatMessage is the durable conversation HISTORY, written by the client
+    via /sync/chat once it has a confirmed reply; ChatTurn exists purely so
+    the /connect/chat endpoint itself can recognise "have I already
+    answered this exact question" and "is a generation for this question
+    already in flight" BEFORE calling the LLM, closing the double-billing
+    risk a plain retry (or a client that gave up on a slow-but-still-
+    running request and asked again) would otherwise create.
+
+    One row per (user, client-generated turn id) — `turn_id` is the
+    client's own id (see connect.py's `_claim_chat_turn`), which is what
+    makes a retry with the SAME id recognisable as the same logical
+    question rather than a new one. `id` stays a server-minted uuid, NOT
+    `turn_id` itself: a client-generated value must never be a bare
+    PRIMARY KEY on a table shared across every account, or two different
+    users independently generating the same turn_id (not actually rare —
+    see this codebase's own `hl-<ts>-<rand>`/`turn-<ts>-<rand>` minting
+    convention, which has no cross-account collision guarantee at all)
+    would collide at the database level for one user and could even 409
+    for the other. `(user_id, turn_id)` is the real uniqueness the
+    idempotency check needs, enforced as a proper composite constraint —
+    see `__table_args__`.
+
+    `status`: 'pending' (claimed, generation in progress or its worker
+    died before finishing — see `claimed_until`) | 'completed' (`reply` is
+    the canonical, cacheable answer — any later request for this same id
+    gets this back with no further LLM call) | 'failed' (`error_code`/
+    `error_message` are safe to show the user; a fresh POST with this same
+    id re-opens it for exactly one more attempt).
+
+    `claimed_by`/`claimed_until`: the same claim-lease pattern used
+    elsewhere in this codebase (CleanupTask, AccountErasure, the Free-
+    entitlement reservation) — a worker that dies mid-generation leaves a
+    'pending' row whose lease simply expires, safely reclaimable by the
+    user's own next attempt (there is no scheduled sweep for this one,
+    unlike Task 15's reservations — an unanswered chat message just sits
+    until the user taps Retry, which is the only thing that can ever
+    re-open it; nothing needs to proactively revisit it in the meantime).
+
+    `question` is kept only for operator debugging of a stuck/failed turn,
+    never surfaced to another user or logged in a way `_fail_chat_turn`'s
+    own docstring/section 5.8 in the task spec disallows (no excerpts, no
+    generated content, no provider internals — only the user's own
+    question text, already known to that same user)."""
+    __tablename__ = "chat_turns"
+    __table_args__ = (
+        UniqueConstraint("user_id", "turn_id", name="uq_chat_turn_user_turn"),
+    )
+
+    id = Column(String, primary_key=True, default=_uuid)   # server-minted surrogate key
+    turn_id = Column(String, nullable=False, index=True)    # the client-generated id
+    user_id = Column(String, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    book_id = Column(String, nullable=False, index=True)
+    status = Column(String, nullable=False, default="pending")  # 'pending' | 'completed' | 'failed'
+    question = Column(Text, nullable=True)
+    reply = Column(Text, nullable=True)              # canonical answer once 'completed'
+    error_code = Column(String, nullable=True)        # e.g. 'no_content' | 'generation_failed'
+    error_message = Column(String, nullable=True)     # user-safe, already-sanitised text
+    claimed_by = Column(String, nullable=True)
+    claimed_until = Column(DateTime, nullable=True)
+    created_at = Column(DateTime, server_default=func.now())
+    updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now())
+
+
 class Completion(Base):
     """One finished reading session. Append-only log; the per-book aggregate
     (how many times, when last) is derived from it."""

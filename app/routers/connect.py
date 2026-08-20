@@ -15,8 +15,13 @@ Connect — chat with your own books (premium).
                             the answer isn't in the book.
 """
 import math
+import os
+import uuid
+import logging
+from datetime import datetime, timedelta
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 from typing import Optional, List
 from pydantic import BaseModel, Field
@@ -25,6 +30,7 @@ from app.middleware.auth import get_current_user
 from app.models.user import User
 from app.models.library import LibraryItem
 from app.models.bite import DailyBite
+from app.models.user_data import ChatTurn
 from app.rate_limit import limiter
 from app.services.llm import LLMService
 from app.services.embedding_service import EmbeddingService, EmbeddingError
@@ -32,6 +38,16 @@ from app.services import mixpanel_service
 from app.services.entitlement_service import is_source_unlocked
 
 router = APIRouter(prefix="/connect", tags=["connect"])
+logger = logging.getLogger(__name__)
+
+# ── Chat-turn idempotency (Task 16, Aug 2026) ───────────────────────────────
+# 3 minutes is a deliberately generous upper bound on a single chat
+# generation (LLMService's own fallback chain can try up to 3 providers plus
+# one same-provider retry each — see this backend's own CLAUDE.md), so a
+# lease this long is very unlikely to expire out from under a request that
+# is genuinely still working, while still self-healing a dead worker inside
+# one user-visible retry's timeframe.
+CHAT_TURN_LEASE_MINUTES = 3
 
 # ── Goal-match calibration ────────────────────────────────────────────────────
 # Measured July 2026 on real voyage-3-lite query→document cosines against an
@@ -99,10 +115,155 @@ class ChatRequest(BaseModel):
     # the last 8 history turns anyway.
     message: str = Field(..., max_length=2000)
     history: List[dict] = Field(default_factory=list, max_length=20)
+    # Task 16 remediation: a client-generated, per-question id, reused
+    # UNCHANGED on Retry (never re-minted). This is what lets this endpoint
+    # recognise "I already answered this" or "I'm already working on this"
+    # instead of paying for a second generation every time a slow request
+    # gets retried. Optional so an old, not-yet-updated client (mid-OTA-
+    # rollout) keeps working exactly as before — it just doesn't get the
+    # new protection until it updates.
+    turn_id: Optional[str] = None
 
 
 class ChatResponse(BaseModel):
     reply: str
+
+
+class _ChatTurnClaim:
+    """Result of `_claim_chat_turn` — exactly one of these is meaningful:
+    `worker_id` set → caller is cleared to generate (fresh turn, a re-
+    claimed dead-worker's stale lease, or an explicit retry of a 'failed'
+    turn). `replay_reply` set → this exact question was already answered;
+    return it verbatim, no LLM call. `in_progress` → a still-live worker
+    (this same request racing itself, another device, or a client bug)
+    already owns this turn; the caller must not start a second generation.
+    `conflict` → this turn id is already bound to a DIFFERENT book — a
+    client bug or turn-id reuse, refused outright rather than guessed at."""
+    def __init__(self, worker_id=None, replay_reply=None, in_progress=False, conflict=False):
+        self.worker_id = worker_id
+        self.replay_reply = replay_reply
+        self.in_progress = in_progress
+        self.conflict = conflict
+
+
+def _claim_chat_turn(db: Session, turn_id: str, user_id: str, book_id: str, question: str) -> _ChatTurnClaim:
+    """Idempotency/turn-claim primitive for POST /connect/chat (Task 16).
+
+    One row per (user, client-generated turn id) — see ChatTurn's own
+    docstring in app/models/user_data.py for the full design rationale.
+    ALWAYS commits (releasing the row lock) before returning — the caller
+    does the slow, uncancellable LLM call OUTSIDE any lock, exactly like
+    every other claim-lease primitive in this codebase (Free-entitlement
+    reservations, account erasure, item-deletion cleanup)."""
+    now = datetime.utcnow()
+    worker_id = f"{os.getpid()}-{uuid.uuid4().hex[:8]}"
+    lease_until = now + timedelta(minutes=CHAT_TURN_LEASE_MINUTES)
+
+    turn = (
+        db.query(ChatTurn)
+        .filter(ChatTurn.turn_id == turn_id, ChatTurn.user_id == user_id)
+        .with_for_update()
+        .first()
+    )
+
+    if turn is not None and turn.book_id != book_id:
+        return _ChatTurnClaim(conflict=True)
+
+    if turn is not None and turn.status == "completed":
+        return _ChatTurnClaim(replay_reply=turn.reply)
+
+    if turn is not None and turn.status == "pending":
+        if turn.claimed_until and turn.claimed_until > now:
+            return _ChatTurnClaim(in_progress=True)
+        # Lease expired — the worker that claimed it died before finishing.
+        # Re-claim for THIS attempt (crash recovery).
+        turn.claimed_by = worker_id
+        turn.claimed_until = lease_until
+        turn.question = question
+        db.commit()
+        return _ChatTurnClaim(worker_id=worker_id)
+
+    if turn is not None and turn.status == "failed":
+        # Explicit retry of a definitively-failed turn — re-open it for
+        # exactly one more attempt, same claim as a fresh turn.
+        turn.status = "pending"
+        turn.claimed_by = worker_id
+        turn.claimed_until = lease_until
+        turn.question = question
+        turn.error_code = None
+        turn.error_message = None
+        db.commit()
+        return _ChatTurnClaim(worker_id=worker_id)
+
+    # No existing row at all — a brand-new turn. `id` is left to its
+    # server-minted default; `turn_id` (not `id`) is the client's own value
+    # — see ChatTurn's docstring for why the two must never be the same
+    # column (a client-generated value cannot safely be a global PK).
+    turn = ChatTurn(
+        turn_id=turn_id, user_id=user_id, book_id=book_id, status="pending",
+        question=question, claimed_by=worker_id, claimed_until=lease_until,
+    )
+    db.add(turn)
+    try:
+        db.commit()
+    except IntegrityError:
+        # Two near-simultaneous requests for a turn id that didn't exist
+        # yet when both SELECTs ran (a genuine duplicate tap racing the
+        # client's own in-flight guard). Whoever loses the insert re-reads
+        # under lock and defers to whoever won, rather than erroring out.
+        db.rollback()
+        turn = (
+            db.query(ChatTurn)
+            .filter(ChatTurn.turn_id == turn_id, ChatTurn.user_id == user_id)
+            .with_for_update()
+            .first()
+        )
+        if turn is None:
+            raise
+        if turn.status == "completed":
+            return _ChatTurnClaim(replay_reply=turn.reply)
+        return _ChatTurnClaim(in_progress=True)
+    return _ChatTurnClaim(worker_id=worker_id)
+
+
+def _complete_chat_turn(db: Session, turn_id: str, user_id: str, worker_id: str, reply: str) -> None:
+    """Write the canonical result — only if THIS worker still owns the
+    lease. A worker whose generation ran long enough for its lease to
+    expire and be reclaimed by a newer attempt must not overwrite that
+    newer attempt's in-progress or already-completed state with its own
+    late, stale result (the same TOCTOU-safety shape as every other
+    claim-lease writer in this codebase)."""
+    turn = (
+        db.query(ChatTurn)
+        .filter(ChatTurn.turn_id == turn_id, ChatTurn.user_id == user_id)
+        .with_for_update()
+        .first()
+    )
+    if not turn or turn.claimed_by != worker_id:
+        return
+    turn.status = "completed"
+    turn.reply = reply
+    turn.error_code = None
+    turn.error_message = None
+    db.commit()
+
+
+def _fail_chat_turn(db: Session, turn_id: str, user_id: str, worker_id: str, error_code: str, error_message: str) -> None:
+    """Same lease-ownership guard as `_complete_chat_turn` — see its
+    docstring. `error_message` must already be the exact, user-safe text
+    the client will display; never provider internals or a raw exception."""
+    turn = (
+        db.query(ChatTurn)
+        .filter(ChatTurn.turn_id == turn_id, ChatTurn.user_id == user_id)
+        .with_for_update()
+        .first()
+    )
+    if not turn or turn.claimed_by != worker_id:
+        return
+    turn.status = "failed"
+    turn.error_code = error_code
+    turn.error_message = error_message
+    db.commit()
 
 
 def _require_premium(user: User):
@@ -298,6 +459,30 @@ def chat(
 
     item = _get_item(data.library_item_id, current_user, db)
 
+    # Task 16 remediation: claim/replay/reject BEFORE any paid work begins —
+    # no ChatTurn row is ever created for a request that was always going to
+    # be refused on entitlement/validation grounds (mirrors this backend's
+    # own Free-entitlement convention of reserving capacity only after
+    # every non-cost check has already passed).
+    turn_id = data.turn_id or str(uuid.uuid4())
+    claim = _claim_chat_turn(db, turn_id, current_user.id, item.id, message)
+    if claim.conflict:
+        raise HTTPException(status_code=409, detail={
+            "code": "chat_turn_conflict",
+            "message": "This question's id is already associated with a different book.",
+        })
+    if claim.replay_reply is not None:
+        # Idempotent replay: the exact same question, already answered —
+        # a retry after the client never heard back, or a duplicate tap.
+        # No embeddings call, no LLM call.
+        return ChatResponse(reply=claim.replay_reply)
+    if claim.in_progress:
+        raise HTTPException(status_code=409, detail={
+            "code": "chat_turn_processing",
+            "message": "Still working on your last question — hang tight.",
+        })
+    worker_id = claim.worker_id
+
     embeddings = EmbeddingService()
     try:
         excerpts = embeddings.search_item(
@@ -308,7 +493,9 @@ def chat(
     if not excerpts and item.content:
         excerpts = [item.content[:8000]]
     if not excerpts:
-        raise HTTPException(status_code=422, detail="No indexed content found for this book.")
+        no_content_msg = "No indexed content found for this book."
+        _fail_chat_turn(db, turn_id, current_user.id, worker_id, "no_content", no_content_msg)
+        raise HTTPException(status_code=422, detail={"code": "no_content", "message": no_content_msg})
 
     llm = LLMService()
     try:
@@ -319,9 +506,15 @@ def chat(
             history=data.history,
             message=message,
         )
-    except Exception as e:
-        raise HTTPException(status_code=502, detail=f"Chat failed: {e}")
+    except Exception:
+        # Never leak the raw exception to the client (provider internals,
+        # model names, stack detail) — a fixed, safe message only.
+        logger.exception("Connect chat generation failed for turn %s", turn_id)
+        gen_failed_msg = "Something went wrong generating a reply — you can try again."
+        _fail_chat_turn(db, turn_id, current_user.id, worker_id, "generation_failed", gen_failed_msg)
+        raise HTTPException(status_code=502, detail={"code": "generation_failed", "message": gen_failed_msg})
 
+    _complete_chat_turn(db, turn_id, current_user.id, worker_id, reply)
     background_tasks.add_task(mixpanel_service.track, "book_chat_message", current_user.id, {
         "item_id": item.id, "mode": item.mode or "wisdom",
     })

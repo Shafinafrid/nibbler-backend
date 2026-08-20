@@ -6,11 +6,11 @@ from app.models.streak import Streak
 from app.models.push_token import PushToken
 from app.models.bug_report import BugReport
 from app.models.user_data import (
-    Note, Highlight, ChatMessage, Completion, UserSettings, UserState,
+    Note, Highlight, ChatMessage, ChatTurn, Completion, UserSettings, UserState,
 )
 
 __all__ = [
     "User", "Profile", "LibraryItem", "DailyBite", "SavedBite", "Streak",
     "PushToken", "BugReport",
-    "Note", "Highlight", "ChatMessage", "Completion", "UserSettings", "UserState",
+    "Note", "Highlight", "ChatMessage", "ChatTurn", "Completion", "UserSettings", "UserState",
 ]
