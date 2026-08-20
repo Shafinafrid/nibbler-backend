@@ -547,6 +547,40 @@ class GuardShutdownFailed(RuntimeError):
     successful shutdown while its own guard thread survives it."""
 
 
+# In-process counter for `_record_guard_shutdown_failure` below — resets on
+# restart, deliberately not a durable DB row: this is a rare (a heartbeat
+# renewal call would need to genuinely hang for _HEARTBEAT_INTERVAL_SECONDS+
+# to trigger it), operationally-observable-only condition with zero data-
+# correctness impact (the item's own processing outcome is already correct
+# by the time this fires), so a full durable ledger table is disproportionate
+# — the structured CRITICAL log line below is what actually needs to exist
+# for alerting; this counter is a cheap, secondary same-process signal.
+_guard_shutdown_failures_total = 0
+
+
+def _record_guard_shutdown_failure(item_id: str, user_id: str, exc: "GuardShutdownFailed") -> None:
+    """Every worker's `finally` block calls this instead of a plain log
+    line when `guard.stop()` raises `GuardShutdownFailed` — found by an
+    independent audit's adversarial harness (tests/test_task2_attempt_
+    lifecycle_repro.py, section S): the exception WAS already correctly
+    raised by `stop()` on a failed join, but every caller just logged and
+    swallowed it, so a genuinely stuck heartbeat thread (still running,
+    still holding its own open DB session) was invisible to anything
+    outside a human reading logs — no durable/observable signal at all.
+    Deliberately still non-fatal: re-raising here would risk skipping this
+    function's own `finally` cleanup (`db.close()` etc.) for a condition
+    that doesn't affect the item's already-correct processing outcome —
+    the fix is making it OBSERVABLE, not making it fail the request.
+    `ATTEMPT_GUARD_LEAK` is a stable, greppable marker for log-based
+    alerting; the counter gives a same-process running total."""
+    global _guard_shutdown_failures_total
+    _guard_shutdown_failures_total += 1
+    logger.critical(
+        "ATTEMPT_GUARD_LEAK item=%s user=%s total_this_process=%d — %s",
+        item_id, user_id, _guard_shutdown_failures_total, exc,
+    )
+
+
 class _AttemptGuard:
     """The ONE reusable heartbeat/ownership-guard abstraction every
     ingestion worker uses for its complete lifetime, replacing what used to
@@ -921,9 +955,11 @@ def _run_ocr(item_id: str, user_id: str, attempt_token: str = None):
             except GuardShutdownFailed as e:
                 # Task 2 final consolidated backend pass (Verified Blocker
                 # 2): a surviving guard thread is a real operational
-                # problem — logged loudly, never silently swallowed — but
-                # must not skip this function's own db.close() below.
-                logger.error("[attempt-guard] %s", e)
+                # problem — recorded durably/observably (not just a log
+                # line an audit found effectively invisible — see
+                # _record_guard_shutdown_failure) — but must not skip this
+                # function's own db.close() below.
+                _record_guard_shutdown_failure(item_id, user_id, e)
         # Release the worker-attempt claim on EVERY terminal outcome
         # (success or failure) — idempotent (a no-op if this attempt is no
         # longer the current owner) — so a legitimate future retry (the
@@ -2202,9 +2238,11 @@ def process_item_embeddings(item_id: str, user_id: str):
             except GuardShutdownFailed as e:
                 # Task 2 final consolidated backend pass (Verified Blocker
                 # 2): a surviving guard thread is a real operational
-                # problem — logged loudly, never silently swallowed — but
-                # must not skip this function's own db.close() below.
-                logger.error("[attempt-guard] %s", e)
+                # problem — recorded durably/observably (not just a log
+                # line an audit found effectively invisible — see
+                # _record_guard_shutdown_failure) — but must not skip this
+                # function's own db.close() below.
+                _record_guard_shutdown_failure(item_id, user_id, e)
         if attempt_token is not None:
             # Release the worker-attempt claim on EVERY terminal outcome —
             # idempotent (a no-op if this attempt is no longer the current
@@ -2450,9 +2488,11 @@ def process_pdf_embeddings(item_id: str, pdf_bytes: bytes, user_id: str):
             except GuardShutdownFailed as e:
                 # Task 2 final consolidated backend pass (Verified Blocker
                 # 2): a surviving guard thread is a real operational
-                # problem — logged loudly, never silently swallowed — but
-                # must not skip this function's own db.close() below.
-                logger.error("[attempt-guard] %s", e)
+                # problem — recorded durably/observably (not just a log
+                # line an audit found effectively invisible — see
+                # _record_guard_shutdown_failure) — but must not skip this
+                # function's own db.close() below.
+                _record_guard_shutdown_failure(item_id, user_id, e)
         if attempt_token is not None:
             # Release the worker-attempt claim on EVERY terminal outcome —
             # idempotent (a no-op if this attempt is no longer the current
@@ -2692,9 +2732,11 @@ def process_epub_embeddings(item_id: str, epub_bytes: bytes, user_id: str):
             except GuardShutdownFailed as e:
                 # Task 2 final consolidated backend pass (Verified Blocker
                 # 2): a surviving guard thread is a real operational
-                # problem — logged loudly, never silently swallowed — but
-                # must not skip this function's own db.close() below.
-                logger.error("[attempt-guard] %s", e)
+                # problem — recorded durably/observably (not just a log
+                # line an audit found effectively invisible — see
+                # _record_guard_shutdown_failure) — but must not skip this
+                # function's own db.close() below.
+                _record_guard_shutdown_failure(item_id, user_id, e)
         if attempt_token is not None:
             # Release the worker-attempt claim on EVERY terminal outcome —
             # idempotent (a no-op if this attempt is no longer the current
@@ -2873,9 +2915,11 @@ def process_url_embeddings(item_id: str, url: str, user_id: str):
             except GuardShutdownFailed as e:
                 # Task 2 final consolidated backend pass (Verified Blocker
                 # 2): a surviving guard thread is a real operational
-                # problem — logged loudly, never silently swallowed — but
-                # must not skip this function's own db.close() below.
-                logger.error("[attempt-guard] %s", e)
+                # problem — recorded durably/observably (not just a log
+                # line an audit found effectively invisible — see
+                # _record_guard_shutdown_failure) — but must not skip this
+                # function's own db.close() below.
+                _record_guard_shutdown_failure(item_id, user_id, e)
         if attempt_token is not None:
             # Release the worker-attempt claim on EVERY terminal outcome —
             # idempotent (a no-op if this attempt is no longer the current

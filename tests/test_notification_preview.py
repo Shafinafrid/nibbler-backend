@@ -208,8 +208,17 @@ check("notification_service.py never imports/constructs an LLM service — "
       and "generate_story_metadata" not in notif_src)
 
 # ─────────────────────────────────────────────────────────────────────────
-section("rotation fairness: two unread books (Premium-style) — the featured pick shifts with the date")
+section("sticky-until-read featured pick: two unread books (Premium-style) — Task 3 item 12/13 fix")
 # ─────────────────────────────────────────────────────────────────────────
+# Rewritten after an independent audit confirmed the ORIGINAL implementation
+# violated Task 3 item 12 verbatim ("Do not advance to another book until
+# the current featured nibble is read"): a pure date-hash pick could — and,
+# over any 10-day window with 2 candidates, reliably did — switch which
+# book was featured while BOTH remained fully unread. `_feature_bite` now
+# persists its pick on `User.last_featured_bite_id` and only re-picks when
+# that bite is no longer among the candidates (i.e. it was read/removed) —
+# proven below, replacing the old "rotates over 10 days" assertion this
+# section used to make.
 from app.services.notification_service import _feature_bite  # noqa: E402
 db.query(DailyBite).delete()
 db.add(LibraryItem(id="book3", user_id="u1", title="Sapiens", type="pdf", processed=True))
@@ -220,17 +229,42 @@ biteB = DailyBite(id="biteB", user_id="u1", title="t", insight="i", reflection="
                    date=TODAY, library_item_id="book3", headline="B")
 db.add_all([biteA, biteB])
 db.commit()
+u1 = db.query(User).get("u1")
+u1.last_featured_bite_id = None
+db.commit()
 
-picks = set()
+picks_while_both_unread = set()
 for offset in range(10):
     d = TODAY + datetime.timedelta(days=offset)
     _, title, _ = _feature_bite(db, db.query(User).get("u1"), [biteA, biteB], d)
-    picks.add(title)
-check("the featured pick among multiple unread bites rotates rather than always picking the same one",
-      len(picks) == 2, picks)
+    picks_while_both_unread.add(title)
+check("Task 3 item 12: the featured pick NEVER changes across 10 days while both bites "
+      "remain unread — no advancing to another book until the current one is read",
+      len(picks_while_both_unread) == 1, picks_while_both_unread)
+
 check("the pick for a given date is deterministic (stable across repeated calls)",
       _feature_bite(db, db.query(User).get("u1"), [biteA, biteB], TODAY)[1]
       == _feature_bite(db, db.query(User).get("u1"), [biteA, biteB], TODAY)[1])
+
+# Both fixtures share the same `title="t"` field, so identify which bite
+# actually stuck by reading the persisted pointer directly.
+u1_after = db.query(User).get("u1")
+still_featured_bite = biteA if u1_after.last_featured_bite_id == biteA.id else biteB
+other_bite = biteB if still_featured_bite is biteA else biteA
+
+check("Task 3 item 13: once the featured bite is read (no longer a candidate), "
+      "the NEXT pick advances to the other eligible book",
+      _feature_bite(db, db.query(User).get("u1"), [other_bite], TODAY)[0].id == other_bite.id)
+
+# And the new pick becomes sticky too — proven across several more days.
+picks_after_advance = set()
+for offset in range(5):
+    d = TODAY + datetime.timedelta(days=offset)
+    _, _, item_id = _feature_bite(db, db.query(User).get("u1"), [other_bite], d)
+    picks_after_advance.add(item_id)
+check("the newly-advanced pick is ALSO sticky, not just the first one",
+      len(picks_after_advance) == 1 and list(picks_after_advance)[0] == other_bite.library_item_id,
+      picks_after_advance)
 
 db.close()
 print("\n" + "=" * 62)

@@ -117,22 +117,42 @@ def _feature_bite(db: Session, user, candidates: list, today) -> tuple:
     """Among several unread bites (a Premium account can have up to 3 active
     sources' worth prepared the same cycle), pick ONE to feature in the
     push — Task 3 item 14: "feature one rotating nibble ... while keeping
-    the others available normally inside the app." The pick is a pure
-    function of (the set of eligible book ids, today's date) — no new
-    persisted rotation state, the same date-derived-fairness approach
-    `_select_sources_for_today` already uses for scheduled generation, so
-    which book gets featured shifts day to day rather than always being
-    the same one. Returns (bite, item_title, item_id) or (None, None, None)."""
+    the others available normally inside the app." Returns (bite,
+    item_title, item_id) or (None, None, None).
+
+    Sticky until read (Task 3 item 12/13 fix, Aug 2026): "rotating" in item
+    14 means WHICH book gets featured changes over time as different
+    nibbles are read — it does NOT mean the choice may drift day to day
+    while the SAME nibble is still sitting there unread, which is exactly
+    what a pure date-hash pick (the original implementation) did, and item
+    12 explicitly forbids: "Do not advance to another book until the
+    current featured nibble is read." `user.last_featured_bite_id` is the
+    persisted pointer: if it's still among today's unread candidates,
+    keep featuring it — no rotation, no new pick. Only when it's gone
+    (read, deleted, or never set) does this fall back to the date-derived
+    fairness pick `_select_sources_for_today` uses, and the new choice
+    becomes the persisted pointer — satisfying item 13 ("once read, advance
+    the rotation") for free, since a read bite is no longer a candidate at
+    all and naturally falls out of `by_bite_id`.
+    """
     from app.models.library import LibraryItem
     if not candidates:
         return (None, None, None)
     by_item = {b.library_item_id: b for b in candidates if b.library_item_id}
     if not by_item:
         return (None, None, None)
-    ordered_ids = sorted(by_item.keys())
-    chosen_id = ordered_ids[today.toordinal() % len(ordered_ids)]
-    bite = by_item[chosen_id]
-    item = db.query(LibraryItem).filter(LibraryItem.id == chosen_id, LibraryItem.user_id == user.id).first()
+    by_bite_id = {b.id: b for b in candidates if b.library_item_id}
+
+    bite = by_bite_id.get(user.last_featured_bite_id) if user.last_featured_bite_id else None
+    if bite is None:
+        ordered_ids = sorted(by_item.keys())
+        chosen_item_id = ordered_ids[today.toordinal() % len(ordered_ids)]
+        bite = by_item[chosen_item_id]
+        if user.last_featured_bite_id != bite.id:
+            user.last_featured_bite_id = bite.id
+            db.commit()
+
+    item = db.query(LibraryItem).filter(LibraryItem.id == bite.library_item_id, LibraryItem.user_id == user.id).first()
     if not item:
         return (None, None, None)
     return (bite, item.title, item.id)

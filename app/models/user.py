@@ -58,6 +58,19 @@ class User(Base):
     os_version = Column(String, nullable=True)      # e.g. "17.5", "14"
     last_seen_at = Column(DateTime, nullable=True)
 
+    # Task 3 fix (Aug 2026): which unread bite is currently "the" featured
+    # nibble for this user's reminder pushes — see notification_service.
+    # _feature_bite(). Before this, the featured pick among several unread
+    # candidates (a Premium account can have more than one active source's
+    # nibble unread at once) was a PURE function of today's date, so it
+    # could silently switch to a different still-unread book day to day —
+    # violating the task's own explicit rule ("do not advance to another
+    # book until the current featured nibble is read"). No FK: a deleted/
+    # since-read bite just means this pointer is stale and gets replaced on
+    # the next pick, exactly like `LibraryItem.last_processing_attempt_id`'s
+    # own no-FK precedent elsewhere in this codebase.
+    last_featured_bite_id = Column(String, nullable=True)
+
     # Trial anchor, SEPARATE from created_at (Task 7, Aug 2026). Normally
     # equal to created_at, but seeded from email_account_history.trial_anchor_at
     # on a fresh row for an email that has been through account deletion

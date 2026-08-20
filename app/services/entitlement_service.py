@@ -1036,6 +1036,32 @@ def finalize_successful_processing(
         )
         return False
 
+    # A caller presenting a lease_token but NO attempt_token has no way to
+    # prove it's the SAME attempt that may have already finalized this item
+    # (that proof is exactly what the attempt_token check above provides,
+    # and it was skipped here because attempt_token was None) — so the
+    # `processed` idempotency shortcut immediately below must not be
+    # allowed to wave a stale lease_token through unchecked. Validate it
+    # HERE, before that shortcut, using the same "current owner" test the
+    # normal (not-yet-processed) lease_token check below already uses.
+    # Every current production caller passes both tokens together (so this
+    # branch is unreached in practice today), but the primitive itself
+    # must not depend on that discipline to stay correct — found by an
+    # independent audit's adversarial harness (tests/test_task2_attempt_
+    # lifecycle_repro.py, section M): calling this function directly with
+    # only a stale lease_token, after a different newer attempt had
+    # already finalized the item, incorrectly returned True.
+    if lease_token is not None and attempt_token is None:
+        if locked_item.entitlement_status != "pending" or locked_item.reservation_lease_token != lease_token:
+            logger.warning(
+                "finalize_successful_processing: item %s presented a lease "
+                "token with no attempt_token to verify identity, and the "
+                "token no longer matches the current owner — refusing an "
+                "unverifiable retry rather than trusting the `processed` "
+                "shortcut below", item.id,
+            )
+            return False
+
     if locked_item.processed:
         return True  # idempotent retry by the SAME, still-current attempt
 

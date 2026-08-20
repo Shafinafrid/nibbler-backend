@@ -641,6 +641,9 @@ def _run_migrations():
         # streaks — Task 20 (Aug 2026): per-day idempotency/catch-up marker
         # for the streak alert, see notification_service._notify_streak_alert_slot.
         "ALTER TABLE streaks ADD COLUMN IF NOT EXISTS last_alert_sent_date DATE",
+        # users — Task 3 fix (Aug 2026): sticky-until-read featured-nibble
+        # pointer, see notification_service._feature_bite().
+        "ALTER TABLE users ADD COLUMN IF NOT EXISTS last_featured_bite_id VARCHAR",
         # Task 2's own schema (successful_sources_total, free_lock_state_token,
         # is_unlocked_selection, the reservation/provenance columns, and their
         # backfill) moved to TASK2_REQUIRED_MIGRATIONS below — kept on its own
