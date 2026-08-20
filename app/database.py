@@ -39,12 +39,54 @@ def create_tables():
     Base.metadata.create_all(bind=engine)
     _run_migrations()
     _run_task2_required_migrations_and_backfill()
+    # Task 19 (Aug 2026): deterministic readiness gate. A migration statement
+    # not raising is not proof the effective schema is correct — it only
+    # proves that one SQL call succeeded. This re-derives the real schema
+    # from the database itself (information_schema/pg_catalog on Postgres,
+    # PRAGMA/sqlite_master on SQLite) and refuses to finish startup if
+    # anything this app actually relies on is missing, instead of letting a
+    # partially-migrated database serve traffic that looks healthy on
+    # `/health` (liveness) right up until the first request that touches the
+    # missing column/constraint 500s. See `get_readiness_status()` / `/ready`
+    # in main.py for the corresponding per-request contract.
+    ok, missing = verify_required_schema()
+    global _boot_schema_verified
+    if not ok:
+        _boot_schema_verified = False
+        raise RuntimeError(
+            "[readiness] required schema verification FAILED — refusing to finish "
+            f"startup. Missing: {', '.join(missing)}. See nibbler-backend/CLAUDE.md, "
+            "'Deployment readiness (Task 19)'."
+        )
+    _boot_schema_verified = True
+    print(f"[readiness] schema verification passed — {len(REQUIRED_TABLES)} table(s), "
+          f"{len(REQUIRED_COLUMNS)} column(s), "
+          f"{len(REQUIRED_PG_CONSTRAINTS) if engine.dialect.name == 'postgresql' else 0} "
+          "constraint(s)/index(es) checked")
 
 
 # Arbitrary but stable Postgres advisory-lock key, scoped to this one
 # migration+backfill sequence. Session-level (pg_advisory_lock/unlock, not
 # the xact variant) and held on ONE connection for the whole block below.
 TASK2_ADVISORY_LOCK_KEY = 918_273_645
+
+# Task 19: a second, distinct advisory-lock key for `_run_migrations()`'s
+# (pre-Task-2, general) statement list — kept separate from
+# TASK2_ADVISORY_LOCK_KEY so the two sequences don't contend with each other
+# for no reason; both still run strictly in sequence within one boot either
+# way (create_tables() calls them one after another), this only matters for
+# two DIFFERENT processes racing the SAME sequence during a rolling deploy.
+MIGRATIONS_ADVISORY_LOCK_KEY = 918_273_646
+
+# Set True only once `create_tables()` has run `verify_required_schema()`
+# and it passed. `get_readiness_status()` (used by GET /ready) reads this —
+# never re-derived per request, since the schema doesn't change at runtime
+# and information_schema/pg_catalog queries aren't free. Starts False so a
+# request arriving before startup finishes (shouldn't happen — lifespan
+# awaits create_tables() before the app accepts traffic — but a defensive
+# default matters more than an optimistic one here) reports not-ready
+# rather than ready.
+_boot_schema_verified = False
 
 
 def _ensure_mixed_version_fencing(conn) -> None:
@@ -406,15 +448,58 @@ TASK2_REQUIRED_MIGRATIONS = [
 
 def _run_migrations():
     """
-    Safe column-level migrations — adds missing columns without touching
+    Column-level migrations — adds missing columns/indexes without touching
     existing data. Add new ALTER statements here whenever the models gain
     new columns so Railway auto-applies them on next deploy.
 
-    Each statement runs on its OWN autocommit connection so a single failure
-    can never poison the rest (a failed statement inside a shared transaction
-    aborts every statement after it — which is how production drifted before).
+    Task 19 (Aug 2026): every statement in this list backs a column, index,
+    or data-backfill that live code already reads or writes — there is no
+    "cosmetic" entry here (an unused column would just be deleted, not left
+    in this list). Before Task 19 a failed statement was only logged, never
+    raised, so a deploy could boot "successfully" onto a database silently
+    missing something the app relies on and fail hours later on whichever
+    endpoint touches it first — a false-green deployment.
+
+    **This is fail-closed on Postgres only.** Every statement still RUNS on
+    every dialect (unchanged from before Task 19) — only what happens AFTER
+    a failure differs:
+      - **Postgres (production):** the whole sequence runs behind a
+        session-level advisory lock (MIGRATIONS_ADVISORY_LOCK_KEY, distinct
+        from Task 2's own key, so the two sequences don't contend for no
+        reason) so a rolling deploy's overlapping old+new workers can't
+        race the same ALTER — see TASK2_ADVISORY_LOCK_KEY's docstring above
+        for why that race is real, not theoretical (a reproduced Postgres
+        catalog error, checked in at tests/test_task2_pg_harness.py). A
+        failed statement does not abort the connection for the rest
+        (AUTOCOMMIT — matches the Task 2 block): every statement still gets
+        a chance to run, and every failure is reported together, before the
+        whole sequence raises and stops startup (see `create_tables()`'s
+        caller in main.py's `lifespan()`, which has no try/except around
+        it).
+      - **Every other dialect (SQLite — local/test):** stays lenient, on
+        purpose, not merely un-updated. A large share of these statements
+        are Postgres-only syntax that `Base.metadata.create_all()` already
+        made unnecessary on SQLite — `ALTER TABLE ... ADD COLUMN IF NOT
+        EXISTS` isn't valid SQLite at all (no IF NOT EXISTS there), and
+        `DROP CONSTRAINT` doesn't exist in SQLite full stop — so those
+        entries are EXPECTED to fail here and that failure carries no
+        signal about the real schema. But NOT every statement is like
+        that: several `CREATE [UNIQUE] INDEX IF NOT EXISTS ...` and
+        `UPDATE ...` backfill statements in this list ARE valid, dialect-
+        agnostic SQL that several existing test suites depend on actually
+        running against their SQLite fixtures (confirmed the hard way —
+        an earlier version of this Task 19 change made SQLite skip the
+        whole list outright and broke test_backend_primary.py,
+        test_batch_b.py and test_task8_entitlement_unification.py, all of
+        which assert on real side effects of specific statements in this
+        exact list). So SQLite still executes everything, exactly as
+        before, and simply never raises on a failure — the per-statement
+        try/except below is unconditional; only the raise at the very
+        bottom is dialect-gated.
     """
     from sqlalchemy import text
+
+    is_postgres = engine.dialect.name == "postgresql"
 
     migrations = [
         # library_items — embedding pipeline (May 2026)
@@ -555,9 +640,10 @@ def _run_migrations():
         "ALTER TABLE user_settings ADD COLUMN IF NOT EXISTS theme_mode VARCHAR",
         # Task 2's own schema (successful_sources_total, free_lock_state_token,
         # is_unlocked_selection, the reservation/provenance columns, and their
-        # backfill) moved to TASK2_REQUIRED_MIGRATIONS below — those must
-        # succeed or the app refuses to start (fail-closed), unlike every
-        # lenient, best-effort statement in this list. The original backfill
+        # backfill) moved to TASK2_REQUIRED_MIGRATIONS below — kept on its own
+        # advisory lock + backfill sequence rather than merged into this list
+        # (both are fail-closed on Postgres as of Task 19; TASK2's block also
+        # runs a Python data backfill this one doesn't). The original backfill
         # here (a raw COUNT(*) of every processed row) was ALSO semantically
         # wrong after the entitlement-accounting remediation: it counted
         # Premium-created successes against the Free counter too, which is
@@ -565,13 +651,196 @@ def _run_migrations():
         # to race the correct Python backfill.
     ]
 
-    applied, failed = 0, 0
-    for sql in migrations:
+    applied, failures = 0, []
+    with engine.connect().execution_options(isolation_level="AUTOCOMMIT") as conn:
+        # pg_advisory_lock is a Postgres builtin — calling it on SQLite would
+        # itself be a hard error, so the lock is Postgres-only, same as the
+        # raise-on-failure behavior below (both branches still run every
+        # statement in `migrations` either way).
+        if is_postgres:
+            conn.execute(text("SELECT pg_advisory_lock(:k)"), {"k": MIGRATIONS_ADVISORY_LOCK_KEY})
         try:
-            with engine.connect().execution_options(isolation_level="AUTOCOMMIT") as conn:
-                conn.execute(text(sql))
-            applied += 1
-        except Exception as e:
-            failed += 1
-            print(f"[migration] FAILED: {sql[:70]}… → {e}")
-    print(f"[migration] done: {applied} applied/verified, {failed} failed")
+            for sql in migrations:
+                try:
+                    conn.execute(text(sql))
+                    applied += 1
+                except Exception as e:
+                    failures.append((sql, str(e)))
+                    print(f"[migration] FAILED: {sql[:70]}… → {e}")
+        finally:
+            if is_postgres:
+                conn.execute(text("SELECT pg_advisory_unlock(:k)"), {"k": MIGRATIONS_ADVISORY_LOCK_KEY})
+
+    print(f"[migration] done: {applied} applied/verified, {len(failures)} failed")
+    if failures and is_postgres:
+        summary = "; ".join(f"{sql[:70]}… → {err[:120]}" for sql, err in failures)
+        raise RuntimeError(
+            f"[migration] {len(failures)} required migration statement(s) failed — "
+            f"refusing to finish startup: {summary}"
+        )
+
+
+# ═════════════════════════════════════════════════════════════════════════
+# Task 19 — deterministic schema verification + the /ready contract
+# ═════════════════════════════════════════════════════════════════════════
+# A short, deliberately non-exhaustive list: not "every column this app
+# has", but the constructs whose ABSENCE would silently break integrity
+# guarantees the code assumes hold — idempotency keys, dedupe constraints,
+# the tables backing this session's own audit fixes (chat_turns,
+# deleted_library_items) — the exact kind of gap a migration that "ran
+# without error" doesn't actually prove closed. Extend this list, don't
+# replace it, when a future task adds another constraint of this kind.
+REQUIRED_TABLES = [
+    "users", "library_items", "daily_bites", "chat_turns",
+    "deleted_library_items", "account_erasures", "cleanup_tasks",
+]
+REQUIRED_COLUMNS = [
+    ("chat_turns", "turn_id"), ("chat_turns", "status"),
+    ("chat_turns", "claimed_by"), ("chat_turns", "claimed_until"),
+    ("deleted_library_items", "user_id"), ("deleted_library_items", "deleted_at"),
+    ("library_items", "entitlement_status"), ("library_items", "reservation_lease_token"),
+    ("library_items", "is_active"),
+    ("users", "reserved_sources_count"), ("users", "entitlement_source"),
+    ("daily_bites", "origin"), ("daily_bites", "read_at"),
+]
+# Postgres only — a named UNIQUE constraint/index is how each of these
+# integrity guarantees is actually enforced by the database, not just
+# assumed by application code. Checked via BOTH information_schema.table_
+# constraints and pg_indexes because this codebase creates some via `ADD
+# CONSTRAINT` and others via `CREATE UNIQUE INDEX` (see the migration
+# lists above) — both are valid, and this check doesn't care which style
+# a given one used. Each entry is verified as belonging to ITS table, not
+# just present somewhere in the database — see verify_required_schema().
+REQUIRED_PG_CONSTRAINTS = [
+    ("chat_turns", "uq_chat_turn_user_turn"),
+    ("daily_bites", "uq_daily_bites_user_item_date"),
+    ("saved_bites", "uq_saved_bites_user_bite"),
+    ("cleanup_tasks", "uq_cleanup_task_identity_v2"),
+]
+
+
+def verify_required_schema() -> "tuple[bool, list[str]]":
+    """Re-derive the EFFECTIVE schema from the database itself and compare
+    against REQUIRED_TABLES/REQUIRED_COLUMNS/REQUIRED_PG_CONSTRAINTS, rather
+    than trusting that `_run_migrations()`/`_run_task2_required_migrations_and_backfill()`
+    not raising is proof the schema is correct — the two are usually the
+    same thing, but "the ALTER statement didn't throw" and "the column is
+    actually there with the right name" only coincide because no one has
+    yet hand-run a migration against the wrong database, restored a partial
+    backup mid-migration, or hit a permissions error that a broader except
+    clause upstream swallowed. Returns (ok, sorted list of missing items,
+    each prefixed "table:"/"column:"/"constraint:" for a readable /ready
+    body and log line).
+    """
+    from sqlalchemy import text
+
+    missing = []
+    dialect = engine.dialect.name
+    with engine.connect() as conn:
+        if dialect == "postgresql":
+            existing_tables = {
+                row[0] for row in conn.execute(text(
+                    "SELECT table_name FROM information_schema.tables WHERE table_schema = 'public'"
+                ))
+            }
+            for t in REQUIRED_TABLES:
+                if t not in existing_tables:
+                    missing.append(f"table:{t}")
+
+            existing_cols = {
+                (row[0], row[1]) for row in conn.execute(text(
+                    "SELECT table_name, column_name FROM information_schema.columns "
+                    "WHERE table_schema = 'public'"
+                ))
+            }
+            for t, c in REQUIRED_COLUMNS:
+                if (t, c) not in existing_cols:
+                    missing.append(f"column:{t}.{c}")
+
+            # (table, constraint/index name) pairs — NOT just names. An
+            # earlier version of this query unioned `pg_constraint.conname`
+            # (with no schema filter — pg_constraint spans every schema in
+            # the database) against `pg_indexes.indexname`, and only
+            # compared names, never confirming the matched object actually
+            # belongs to the expected table. `information_schema.table_constraints`
+            # carries `table_schema`/`table_name` directly (unlike raw
+            # pg_constraint, which needs a manual join through pg_class/
+            # pg_namespace to get there), so it replaces the pg_constraint
+            # half here — scoped to `public` and paired with its table, the
+            # same way the tables/columns checks above already are.
+            existing_named = {
+                (row[0], row[1]) for row in conn.execute(text(
+                    "SELECT table_name, constraint_name FROM information_schema.table_constraints "
+                    "WHERE table_schema = 'public' "
+                    "UNION "
+                    "SELECT tablename, indexname FROM pg_indexes WHERE schemaname = 'public'"
+                ))
+            }
+            for t, name in REQUIRED_PG_CONSTRAINTS:
+                if (t, name) not in existing_named:
+                    missing.append(f"constraint:{t}.{name}")
+        else:
+            # SQLite (local/test): tables + columns come straight from the
+            # ORM via Base.metadata.create_all() — checked the same way, for
+            # real coverage, not skipped. Named-constraint introspection is
+            # Postgres-only (REQUIRED_PG_CONSTRAINTS): SQLAlchemy renders a
+            # SQLite UniqueConstraint as inline CREATE TABLE DDL rather than
+            # a separately-named catalog object, so there is nothing to
+            # query it back out of the way pg_constraint allows — the model
+            # definition + this repo's own persistence tests are what prove
+            # that one, not this runtime check.
+            existing_tables = {
+                row[0] for row in conn.execute(text(
+                    "SELECT name FROM sqlite_master WHERE type = 'table'"
+                ))
+            }
+            for t in REQUIRED_TABLES:
+                if t not in existing_tables:
+                    missing.append(f"table:{t}")
+            for t, c in REQUIRED_COLUMNS:
+                if t not in existing_tables:
+                    missing.append(f"column:{t}.{c}")
+                    continue
+                # Table names above are all fixed constants from this
+                # module's own registry, never request/user input — safe to
+                # interpolate into PRAGMA, which doesn't accept bind params.
+                cols = {row[1] for row in conn.execute(text(f"PRAGMA table_info({t})"))}
+                if c not in cols:
+                    missing.append(f"column:{t}.{c}")
+
+    return (len(missing) == 0, sorted(missing))
+
+
+def get_readiness_status() -> "tuple[bool, dict]":
+    """Backing call for `GET /ready` (main.py) — a distinct contract from
+    `/health`, which only ever proves the process is alive. Readiness here
+    is TWO things, both required: (1) the database is reachable RIGHT NOW
+    (a live `SELECT 1` — connectivity can be lost after a clean boot, so
+    this is checked per-call, not cached), and (2) the schema was verified
+    at boot (`_boot_schema_verified` — NOT re-run per call: the schema
+    can't change at runtime, and information_schema/pg_catalog round-trips
+    on every health-check poll would be wasted cost for zero new signal).
+    Never includes the DB URL, credentials, or query text — only a
+    truncated exception message with no bind parameters, since `SELECT 1`
+    carries none to begin with.
+    """
+    from sqlalchemy import text
+
+    db_reachable = False
+    db_error = None
+    try:
+        with engine.connect() as conn:
+            conn.execute(text("SELECT 1"))
+        db_reachable = True
+    except Exception as e:
+        db_error = str(e)[:200]
+
+    ok = db_reachable and _boot_schema_verified
+    detail = {
+        "status": "ready" if ok else "not_ready",
+        "db_reachable": db_reachable,
+        "schema_verified": _boot_schema_verified,
+    }
+    if db_error:
+        detail["db_error"] = db_error
+    return ok, detail

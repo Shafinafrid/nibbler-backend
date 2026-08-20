@@ -105,6 +105,22 @@ async def health():
     return {"status": "ok", "env": settings.app_env}
 
 
+# ── Readiness check (Task 19, Aug 2026) ────────────────────────────────────────
+# Distinct from /health on purpose: /health only ever proves this process is
+# alive (always {"status": "ok"} once uvicorn is up, even mid-outage on the
+# database). /ready additionally proves the database is reachable right now
+# AND the schema this app relies on was verified present at boot — see
+# `get_readiness_status()`/`verify_required_schema()` in app/database.py.
+# NOT wired up as Railway's healthcheckPath by this change — see
+# nibbler-backend/CLAUDE.md, "Deployment readiness (Task 19)" for the
+# proposed (not applied) railway.toml edit and why it's left to Shafin.
+@app.get("/ready")
+async def ready():
+    from app.database import get_readiness_status
+    ok, detail = get_readiness_status()
+    return JSONResponse(detail, status_code=200 if ok else 503)
+
+
 @app.get("/")
 async def root():
     return {"message": "🐱 Nibbler API is running"}
