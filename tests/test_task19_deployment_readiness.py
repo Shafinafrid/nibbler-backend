@@ -224,20 +224,29 @@ check("_run_migrations() on SQLite never raises, even with some inherently "
 
 
 # ═════════════════════════════════════════════════════════════════════════
-section("F — get_readiness_status(): both boot-flag AND live connectivity matter")
+section("F — get_readiness_status(): boot-flag, live connectivity, AND scheduler state all matter")
 # ═════════════════════════════════════════════════════════════════════════
+# Task 20 requirement #11 extended the contract to a THIRD condition
+# (scheduler_initialized()) — mocked True/False here rather than starting
+# a real APScheduler instance, which this hermetic script has no reason to
+# spin up just to prove get_readiness_status()'s own aggregation logic.
+import app.services.notification_service as notif_mod  # noqa: E402
+
 dbmod._boot_schema_verified = True
-ok5, detail5 = _with_swapped_engine(e2e_engine, dbmod.get_readiness_status)
-check("ready when schema_verified=True and DB reachable", ok5, str(detail5))
+with mock.patch.object(notif_mod, "scheduler_initialized", return_value=True):
+    ok5, detail5 = _with_swapped_engine(e2e_engine, dbmod.get_readiness_status)
+check("ready when schema_verified=True, DB reachable, scheduler ready", ok5, str(detail5))
 check("detail reports status=ready", detail5.get("status") == "ready", str(detail5))
 check("detail reports db_reachable=True", detail5.get("db_reachable") is True, str(detail5))
 check("detail reports schema_verified=True", detail5.get("schema_verified") is True, str(detail5))
+check("detail reports scheduler_ready=True", detail5.get("scheduler_ready") is True, str(detail5))
 check("no db_error key when healthy", "db_error" not in detail5, str(detail5))
 
 # Boot flag False (e.g. a migration failed at boot) → not ready even though
-# the DB itself is perfectly reachable.
+# the DB itself is perfectly reachable and the scheduler is up.
 dbmod._boot_schema_verified = False
-ok6, detail6 = _with_swapped_engine(e2e_engine, dbmod.get_readiness_status)
+with mock.patch.object(notif_mod, "scheduler_initialized", return_value=True):
+    ok6, detail6 = _with_swapped_engine(e2e_engine, dbmod.get_readiness_status)
 check("not ready when schema_verified=False even if DB reachable", not ok6, str(detail6))
 check("detail reports status=not_ready", detail6.get("status") == "not_ready", str(detail6))
 dbmod._boot_schema_verified = True  # restore for the next section
@@ -245,13 +254,31 @@ dbmod._boot_schema_verified = True  # restore for the next section
 # DB unreachable (disposed/closed engine pointed at a bogus path) → not
 # ready even though the boot-time schema check passed.
 bad_engine = create_engine("sqlite:////nonexistent/definitely/not/a/real/path/x.db")
-ok7, detail7 = _with_swapped_engine(bad_engine, dbmod.get_readiness_status)
+with mock.patch.object(notif_mod, "scheduler_initialized", return_value=True):
+    ok7, detail7 = _with_swapped_engine(bad_engine, dbmod.get_readiness_status)
 check("not ready when DB unreachable even if schema_verified=True", not ok7, str(detail7))
 check("detail reports db_reachable=False", detail7.get("db_reachable") is False, str(detail7))
 check("detail includes a truncated db_error, not a full traceback dump",
       "db_error" in detail7 and len(detail7["db_error"]) <= 200, str(detail7.get("db_error", "")))
 check("db_error does not leak the sqlite file path pattern unexpectedly long",
       True)  # informational only — real assertion is the length cap above
+
+# Scheduler not initialized (e.g. start_scheduler() never ran, or crashed)
+# → not ready even though DB + schema are both perfectly healthy. This is
+# the Task 20 requirement #11 case specifically.
+with mock.patch.object(notif_mod, "scheduler_initialized", return_value=False):
+    ok8, detail8 = _with_swapped_engine(e2e_engine, dbmod.get_readiness_status)
+check("not ready when scheduler is not initialized, even if DB+schema are healthy", not ok8, str(detail8))
+check("detail reports scheduler_ready=False", detail8.get("scheduler_ready") is False, str(detail8))
+check("detail reports status=not_ready", detail8.get("status") == "not_ready", str(detail8))
+
+# A broken/exception-raising scheduler_initialized() must fail SAFE (not
+# ready), not crash the /ready handler entirely.
+with mock.patch.object(notif_mod, "scheduler_initialized", side_effect=RuntimeError("boom")):
+    ok9, detail9 = _with_swapped_engine(e2e_engine, dbmod.get_readiness_status)
+check("a raising scheduler_initialized() is treated as not-ready, not a crash", not ok9, str(detail9))
+check("detail still reports scheduler_ready=False on the exception path",
+      detail9.get("scheduler_ready") is False, str(detail9))
 
 
 # ═════════════════════════════════════════════════════════════════════════
@@ -268,7 +295,8 @@ import main  # noqa: E402
 # _boot_schema_verified) instead, which is exactly what this section is
 # testing: the /ready HANDLER's own logic, not the lifespan wiring.
 client = TestClient(main.app)
-with mock.patch.object(dbmod, "engine", e2e_engine):
+with mock.patch.object(dbmod, "engine", e2e_engine), \
+     mock.patch.object(notif_mod, "scheduler_initialized", return_value=True):
     dbmod._boot_schema_verified = True
     r_ready = client.get("/ready")
     check("GET /ready → 200 when ready", r_ready.status_code == 200, str(r_ready.status_code))

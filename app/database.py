@@ -34,7 +34,7 @@ def create_tables():
     # have silently stopped creating six tables on any fresh database, failing
     # much later as a 500 on the first /sync call instead of loudly at boot.
     from app.models import (  # noqa
-        user, profile, library, bite, streak, push_token, user_data, bug_report,
+        user, profile, library, bite, streak, push_token, user_data, bug_report, delivery,
     )
     Base.metadata.create_all(bind=engine)
     _run_migrations()
@@ -638,6 +638,9 @@ def _run_migrations():
         # `dark_mode` (bool) stays as-is for older clients still writing it;
         # `theme_mode` is the new source of truth once a client has sent it.
         "ALTER TABLE user_settings ADD COLUMN IF NOT EXISTS theme_mode VARCHAR",
+        # streaks — Task 20 (Aug 2026): per-day idempotency/catch-up marker
+        # for the streak alert, see notification_service._notify_streak_alert_slot.
+        "ALTER TABLE streaks ADD COLUMN IF NOT EXISTS last_alert_sent_date DATE",
         # Task 2's own schema (successful_sources_total, free_lock_state_token,
         # is_unlocked_selection, the reservation/provenance columns, and their
         # backfill) moved to TASK2_REQUIRED_MIGRATIONS below — kept on its own
@@ -693,6 +696,7 @@ def _run_migrations():
 REQUIRED_TABLES = [
     "users", "library_items", "daily_bites", "chat_turns",
     "deleted_library_items", "account_erasures", "cleanup_tasks",
+    "delivery_cycles",
 ]
 REQUIRED_COLUMNS = [
     ("chat_turns", "turn_id"), ("chat_turns", "status"),
@@ -702,6 +706,13 @@ REQUIRED_COLUMNS = [
     ("library_items", "is_active"),
     ("users", "reserved_sources_count"), ("users", "entitlement_source"),
     ("daily_bites", "origin"), ("daily_bites", "read_at"),
+    # Task 20 — the durable delivery-cycle ledger itself must be verified
+    # present/correct at boot, per Task 20's own requirement #11 ("the
+    # backend must not report ready if its required durable delivery
+    # schema cannot be used") — see app/services/delivery_lifecycle.py.
+    ("delivery_cycles", "user_id"), ("delivery_cycles", "cycle_date"),
+    ("delivery_cycles", "state"), ("delivery_cycles", "claimed_by"),
+    ("delivery_cycles", "claimed_until"), ("delivery_cycles", "due_at"),
 ]
 # Postgres only — a named UNIQUE constraint/index is how each of these
 # integrity guarantees is actually enforced by the database, not just
@@ -716,6 +727,7 @@ REQUIRED_PG_CONSTRAINTS = [
     ("daily_bites", "uq_daily_bites_user_item_date"),
     ("saved_bites", "uq_saved_bites_user_bite"),
     ("cleanup_tasks", "uq_cleanup_task_identity_v2"),
+    ("delivery_cycles", "uq_delivery_cycle_user_date"),
 ]
 
 
@@ -814,13 +826,16 @@ def verify_required_schema() -> "tuple[bool, list[str]]":
 def get_readiness_status() -> "tuple[bool, dict]":
     """Backing call for `GET /ready` (main.py) — a distinct contract from
     `/health`, which only ever proves the process is alive. Readiness here
-    is TWO things, both required: (1) the database is reachable RIGHT NOW
+    is THREE things, all required: (1) the database is reachable RIGHT NOW
     (a live `SELECT 1` — connectivity can be lost after a clean boot, so
-    this is checked per-call, not cached), and (2) the schema was verified
-    at boot (`_boot_schema_verified` — NOT re-run per call: the schema
-    can't change at runtime, and information_schema/pg_catalog round-trips
-    on every health-check poll would be wasted cost for zero new signal).
-    Never includes the DB URL, credentials, or query text — only a
+    this is checked per-call, not cached), (2) the schema was verified at
+    boot (`_boot_schema_verified` — NOT re-run per call: the schema can't
+    change at runtime, and information_schema/pg_catalog round-trips on
+    every health-check poll would be wasted cost for zero new signal), and
+    (3) the notification scheduler actually started (Task 20 requirement
+    #11 — a backend whose scheduler silently failed to initialize would
+    otherwise report "ready" while never generating or delivering a single
+    nibble). Never includes the DB URL, credentials, or query text — only a
     truncated exception message with no bind parameters, since `SELECT 1`
     carries none to begin with.
     """
@@ -835,11 +850,20 @@ def get_readiness_status() -> "tuple[bool, dict]":
     except Exception as e:
         db_error = str(e)[:200]
 
-    ok = db_reachable and _boot_schema_verified
+    try:
+        from app.services.notification_service import scheduler_initialized
+        scheduler_ready = scheduler_initialized()
+    except Exception:
+        # A broken import/attribute here is itself a "not ready" signal,
+        # not a reason to crash the /ready handler — safe default is False.
+        scheduler_ready = False
+
+    ok = db_reachable and _boot_schema_verified and scheduler_ready
     detail = {
         "status": "ready" if ok else "not_ready",
         "db_reachable": db_reachable,
         "schema_verified": _boot_schema_verified,
+        "scheduler_ready": scheduler_ready,
     }
     if db_error:
         detail["db_error"] = db_error

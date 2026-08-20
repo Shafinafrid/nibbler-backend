@@ -9,6 +9,9 @@ Expo Push API docs: https://docs.expo.dev/push-notifications/sending-notificatio
 
 import hashlib
 import logging
+import os
+import socket
+import uuid
 from datetime import timezone as dt_timezone
 from typing import Optional
 from zoneinfo import ZoneInfo
@@ -17,6 +20,20 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from sqlalchemy.orm import Session
 
 logger = logging.getLogger(__name__)
+
+# Task 20 — a genuinely unique identity per PROCESS, not per call. An
+# earlier version of this module passed a hardcoded literal ("scheduler")
+# as the DeliveryCycle claim-lease worker_id — an independent audit found
+# that this made the lease's cross-process protection a no-op: `_try_claim`
+# only refuses a claim when `row.claimed_by != worker_id`, so two different
+# processes (a Railway rolling-deploy overlap, or any accidental horizontal
+# scale) sharing the same literal could both "win" a claim on a row the
+# other was actively mid-generation/mid-push on — the exact double-paid-
+# LLM-call / double-push risk Task 20 exists to prevent. Computed once at
+# import time (one value per OS process, matching CLAUDE.md's own "never
+# run uvicorn with multiple workers" constraint for THIS module — but this
+# is a second, independent layer of protection, not a replacement for it).
+_WORKER_ID = f"scheduler-{socket.gethostname()}-{os.getpid()}-{uuid.uuid4().hex[:8]}"
 
 EXPO_PUSH_URL = "https://exp.host/--/api/v2/push/send"
 
@@ -577,19 +594,37 @@ async def _notify_streak_alert_slot(db_factory, now) -> None:
       · the user's streak-alert toggle is on (push_tokens.streak_alerts_enabled)
       · they have an unread session from a PRIOR cycle (any origin)
       · their current streak is > 0 (already-broken streaks have nothing to lose)
+
+    Task 20 requirement #4 ("never send a misleading 'streak ends in one
+    hour' alert after its useful window", with a bounded catch-up policy
+    SEPARATE from — and much tighter than — daily generation/delivery's):
+    the match below is a WINDOW (`[slot, slot + STREAK_ALERT_CATCHUP_WINDOW]`),
+    not the single exact tick it used to be, so a missed T−65 tick (a
+    restart, a slow tick) can still catch up shortly after — but never past
+    that short bound, since a stale "ends in one hour" alert sent at "ends
+    in ten minutes" would be actively misleading, worse than not sending it
+    at all. `Streak.last_alert_sent_date` is the idempotency guard a
+    WINDOWED match needs that an exact-tick match never did (otherwise the
+    same user would re-match, and re-send, on every tick inside the
+    window) — set eagerly, right before send, deliberately accepting "the
+    process crashes between the commit and the actual Expo call" as a rare,
+    low-stakes miss (no AI cost, no user-facing failure state) rather than
+    risk the alternative, a duplicate alert.
     """
-    from datetime import timedelta
+    from datetime import timedelta, datetime, time as dt_time
     from app.models.push_token import PushToken
     from app.models.streak import Streak
     from app.models.user import User
     from app.config import get_settings
     from app.services.entitlement_service import reconcile_free_lock_state
+    from app.services.delivery_lifecycle import STREAK_ALERT_CATCHUP_WINDOW
 
     settings = get_settings()
-    hour, slot = _slot(now + timedelta(minutes=65))
+    now_naive = now.replace(tzinfo=None) if now.tzinfo is not None else now
     today = now.date()
 
     messages = []
+    alerted_streak_ids = []
     with db_factory() as db:
         rows = (
             db.query(PushToken, User)
@@ -609,7 +644,27 @@ async def _notify_streak_alert_slot(db_factory, now) -> None:
                 tok.notification_local_hour, tok.notification_local_minute,
                 user.timezone, tok.notification_hour, tok.notification_minute, now,
             )
-            if (eff_hour, eff_minute) != (hour, slot):
+            # `eff_hour`/`eff_minute` is a UTC time-of-day with no date of
+            # its own — combining it onto a SINGLE fixed date (`today`,
+            # `now`'s own date) before subtracting 65 minutes is wrong
+            # whenever the T-65 alert slot actually falls on a DIFFERENT
+            # UTC calendar date than `now` — which happens for any delivery
+            # time in the first ~65 minutes after UTC midnight (an
+            # independent audit caught this empirically: it made the
+            # streak alert permanently unfireable, on any tick, for every
+            # delivery time between 00:00 and 00:40 UTC). Trying the
+            # adjacent day on both sides removes the ambiguity — only one
+            # of the three candidates can ever fall inside a ~20-minute
+            # window (candidates are ~24h apart), so this never produces a
+            # false match, only fixes the false NEGATIVE at day boundaries.
+            in_window = False
+            for day_offset in (0, -1, 1):
+                candidate = datetime.combine(today + timedelta(days=day_offset), dt_time(eff_hour, eff_minute))
+                slot_dt = candidate - timedelta(minutes=65)
+                if slot_dt <= now_naive <= slot_dt + STREAK_ALERT_CATCHUP_WINDOW:
+                    in_window = True
+                    break
+            if not in_window:
                 continue
             by_user.setdefault(user.id, []).append(tok.token)
             user_by_id[user.id] = user
@@ -621,6 +676,8 @@ async def _notify_streak_alert_slot(db_factory, now) -> None:
                 continue
             if streak.last_active_date and streak.last_active_date >= today:
                 continue  # already read today — nothing at risk
+            if streak.last_alert_sent_date == today:
+                continue  # already alerted once today — the window-match guard
             user = user_by_id[user_id]
             # Same reasoning as _notify_delivery_slot: this tick must not
             # alert about a streak-saving session on a source that's since
@@ -637,9 +694,14 @@ async def _notify_streak_alert_slot(db_factory, now) -> None:
             data = _notification_data(item_id, bite)
             for tok in toks:
                 messages.append({"to": tok, "title": title, "body": body, "sound": "default", "data": data})
+            streak.last_alert_sent_date = today
+            alerted_streak_ids.append(streak.id)
+        if alerted_streak_ids:
+            db.commit()
 
     if messages:
-        logger.info("Streak alert: %d dynamic push(es) (%02d:%02d UTC delivery)", len(messages), hour, slot)
+        logger.info("Streak alert: %d dynamic push(es) for %d user(s), window-matched",
+                     len(messages), len(alerted_streak_ids))
         await send_push_messages(messages, getattr(settings, "expo_access_token", ""))
 
 
@@ -655,6 +717,7 @@ async def _run_delivery_cycle(db_factory) -> None:
     import asyncio
     from datetime import datetime, timezone, timedelta
     from app.models.push_token import PushToken
+    from app.services import delivery_lifecycle
 
     now = datetime.now(timezone.utc)
 
@@ -678,6 +741,19 @@ async def _run_delivery_cycle(db_factory) -> None:
             logger.error("Pre-generation failed for user %s: %s", uid, e)
 
     await _notify_delivery_slot(db_factory, now)
+
+    # Task 20: durable reconciliation, additive to everything above — never
+    # replaces the on-time passes, only resumes/finishes whatever a
+    # restart, crash or long stall left incomplete (or fully missed). See
+    # app/services/delivery_lifecycle.py's module docstring for the full
+    # design. Runs every tick, same cadence as the rest of this function;
+    # failure here must not take down the rest of the scheduler's tick.
+    try:
+        await asyncio.to_thread(
+            delivery_lifecycle.reconcile_delivery_cycles, db_factory, now, _WORKER_ID,
+        )
+    except Exception as e:
+        logger.error("Delivery-cycle reconciliation failed: %s", e)
 
 
 async def _run_task2_maintenance_cycle(db_factory) -> None:
@@ -815,3 +891,15 @@ def start_scheduler(db_factory) -> None:
 def stop_scheduler() -> None:
     if scheduler.running:
         scheduler.shutdown(wait=False)
+
+
+def scheduler_initialized() -> bool:
+    """Task 20 requirement #11 ("the backend must not report ready if...
+    the scheduler cannot initialize safely") — read by
+    `app.database.get_readiness_status()` (a lazy import there, to avoid a
+    circular import: this module is well downstream of `app.database`).
+    `scheduler.running` is APScheduler's own state, not a separate flag we
+    could drift out of sync with — true only after a real `scheduler.start()`
+    call succeeded in `start_scheduler()` above, false after `stop_scheduler()`
+    or if startup crashed before reaching it."""
+    return scheduler.running
