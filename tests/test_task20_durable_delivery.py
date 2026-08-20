@@ -645,7 +645,13 @@ section("O — coverage gap closed: reconcile_delivery_cycles handles a genuinel
 gen_calls.clear()
 mkuser("userO")
 aware_now = datetime.datetime.now(datetime.timezone.utc)
-cid = create_cycle("userO", due_at=aware_now.replace(tzinfo=None))
+# cdate must be the UTC date `aware_now` actually falls on, NOT this file's
+# TODAY (built from local date.today() at the top of the file) — on a
+# non-UTC dev machine those can genuinely differ (confirmed directly: a
+# UTC+2 machine just after local midnight, while UTC was still the
+# previous day), which silently made reconcile_delivery_cycles' own
+# `cycle_date == now_naive.date()` filter never match this cycle at all.
+cid = create_cycle("userO", cdate=aware_now.date(), due_at=aware_now.replace(tzinfo=None))
 raised = None
 try:
     dl.reconcile_delivery_cycles(db_factory, aware_now, worker_id="aware-tick")
@@ -653,7 +659,10 @@ except TypeError as e:
     raised = e
 check("reconcile_delivery_cycles does not raise TypeError on a real aware `now` "
       "(the exact crash class `_naive()` exists to prevent)", raised is None, raised)
-snap = get_cycle_state("userO")
+# get_cycle_state's own default cdate=TODAY has the identical local-vs-UTC
+# pitfall as create_cycle's — must pass the same aware_now.date() used
+# above, not the file's local-date-based TODAY constant.
+snap = get_cycle_state("userO", cdate=aware_now.date())
 check("the cycle was actually processed (not silently skipped) under an aware `now`",
       snap is not None and snap["state"] in ("push_pending", "completed"), snap)
 

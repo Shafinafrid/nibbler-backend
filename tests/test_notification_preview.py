@@ -61,7 +61,16 @@ main.app.dependency_overrides[get_current_user] = \
     lambda: db.query(User).filter(User.id == AS["id"]).first()
 client = TestClient(main.app)
 
-TODAY = datetime.date.today()
+# UTC, not local date.today() — /notifications/send-test calls
+# preview_notification_for_user(db, current_user, datetime.utcnow()), so
+# this fixture's notion of "today" must match that, not the test-runner
+# machine's local timezone. A real, pre-existing bug: on a non-UTC dev
+# machine, local date.today() and UTC's current date genuinely differ for
+# part of every day (confirmed here directly on a UTC+2 machine at 00:32
+# local — UTC was still the previous day) — production is unaffected since
+# Railway runs UTC, but this made local test runs spuriously flip "fresh"
+# vs "forgotten"/"streak" framing depending only on wall-clock timing.
+TODAY = datetime.datetime.utcnow().date()
 YDAY = TODAY - datetime.timedelta(days=1)
 
 # ─────────────────────────────────────────────────────────────────────────
