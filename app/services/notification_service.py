@@ -692,7 +692,11 @@ async def _run_task2_maintenance_cycle(db_factory) -> None:
       3. Tombstoned `library_items` whose deletion cleanup previously
          failed (Task 2 closeout, Verified Blocker 6) — see
          entitlement_service.retry_item_deletions.
-      4. Pending/failed account erasures (Task 2 closeout, Verified
+      4. Stale/abandoned Free-tier upload reservations whose lease expired
+         with no owning user around to trigger the lazy per-account reap
+         (Task 15 remediation) — see
+         entitlement_service.reap_all_stale_reservations.
+      5. Pending/failed account erasures (Task 2 closeout, Verified
          Blocker 8) — see entitlement_service.retry_account_erasures.
     Runs every 5 minutes, same cadence as the notification cycle. Each
     queue is processed independently — one raising does not block the
@@ -723,6 +727,19 @@ async def _run_task2_maintenance_cycle(db_factory) -> None:
             if resolved or failed:
                 logger.info("[task2-maintenance] item-deletion retry: resolved=%d failed=%d", resolved, failed)
 
+    def _run_stale_reservation_reap():
+        with db_factory() as db:
+            # Task 15 remediation: an operational/UX parity fix, not an
+            # entitlement fix — see reap_all_stale_reservations' own
+            # docstring. A stuck 'pending' reservation was already excluded
+            # from the permanent successful_sources_total counter regardless
+            # of when it's reaped; this only makes a crashed-worker upload
+            # stop showing "processing" forever for a user who never
+            # uploads again to trigger the lazy per-account reap.
+            users_reaped, items_reaped = ent.reap_all_stale_reservations(db)
+            if users_reaped or items_reaped:
+                logger.info("[task2-maintenance] stale-reservation reap: users=%d items=%d", users_reaped, items_reaped)
+
     def _run_account_erasures():
         with db_factory() as db:
             # Deletion grace period (Aug 2026): promote any 'scheduled' erasure whose grace
@@ -750,6 +767,11 @@ async def _run_task2_maintenance_cycle(db_factory) -> None:
         await asyncio.to_thread(_run_item_deletions)
     except Exception as e:
         logger.error("[task2-maintenance] item-deletion retry pass failed: %s", e)
+
+    try:
+        await asyncio.to_thread(_run_stale_reservation_reap)
+    except Exception as e:
+        logger.error("[task2-maintenance] stale-reservation reap pass failed: %s", e)
 
     try:
         await asyncio.to_thread(_run_account_erasures)

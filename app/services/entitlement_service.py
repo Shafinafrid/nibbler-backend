@@ -261,7 +261,7 @@ def _free_limit_message() -> str:
 
 # ── Reservation primitive — acquire BEFORE any paid work ────────────────────
 
-def _reap_stale_reservations(db: Session, user: User) -> None:
+def _reap_stale_reservations(db: Session, user: User) -> int:
     """Reclaim this account's own abandoned 'pending' reservations — a
     lease nothing has renewed past its current deadline. Only ever called
     while the caller already holds `user`'s row lock (global lock order:
@@ -277,6 +277,11 @@ def _reap_stale_reservations(db: Session, user: User) -> None:
     token that no longer matches what the old worker is holding — that
     mismatch, not a cleared token, is what stops a stale worker from
     double-converting a reservation a newer attempt now owns.
+
+    Returns the number of reservations actually reaped (0 if none) — used
+    by `reap_all_stale_reservations`'s scheduled sweep (Task 15 remediation)
+    to report real work done, matching every other autonomous pass in this
+    module's own never-collapse-to-one-number contract.
     """
     now = datetime.utcnow()
     legacy_cutoff = now - timedelta(minutes=RESERVATION_TTL_MINUTES)
@@ -305,7 +310,7 @@ def _reap_stale_reservations(db: Session, user: User) -> None:
         .all()
     ]
     if not stale_ids:
-        return
+        return 0
 
     # This candidate list is only a HINT, never authoritative — it was read
     # with NO row lock. `renew_reservation_lease` touches only the item row
@@ -344,7 +349,7 @@ def _reap_stale_reservations(db: Session, user: User) -> None:
             continue
         stale.append(it)
     if not stale:
-        return
+        return 0
 
     for it in stale:
         it.entitlement_status = "released"
@@ -356,6 +361,79 @@ def _reap_stale_reservations(db: Session, user: User) -> None:
         synchronize_session="fetch",
     )
     logger.info("Reaped %d stale reservation(s) for user %s", len(stale), user.id)
+    return len(stale)
+
+
+def reap_all_stale_reservations(db: Session, batch_size: int = 25) -> tuple:
+    """Global scheduled sweep for stale 'pending' reservations (Task 15
+    remediation, Aug 2026) — parity with retry_item_deletions/
+    retry_account_erasures/retry_cleanup_tasks/retry_reconciliation_tasks,
+    all of which already run on the same 5-minute maintenance cycle
+    (notification_service._run_task2_maintenance_cycle).
+
+    Without this, `_reap_stale_reservations` above only ever runs LAZILY,
+    triggered by that SAME account's own next `reserve_free_capacity` call
+    — a user whose upload worker crashed or timed out, and who never
+    uploads again, would have that source sit showing "processing"
+    indefinitely, with no other code path that ever revisits it. This is
+    purely an operational/UX fix, not an entitlement fix: a stuck 'pending'
+    row was already correctly excluded from `successful_sources_total`
+    (the one PERMANENT counter — see `can_accept_new_upload`) regardless of
+    whether or when it gets reaped, so this sweep cannot change any
+    entitlement outcome, only how promptly a stuck row's slot and error
+    message become honest.
+
+    Global lock order: user row first, then item row(s) — same convention
+    as every other function in this module, enforced by delegating the
+    actual reap to `_reap_stale_reservations` itself once each candidate
+    user's row is locked. Each affected user is independent, wrapped in its
+    own try/except (one user's failure must never block another's), same
+    never-collapse-to-one-number `(users_reaped, items_reaped)` contract as
+    every other autonomous pass here."""
+    now = datetime.utcnow()
+    legacy_cutoff = now - timedelta(minutes=RESERVATION_TTL_MINUTES)
+    # HINT only, no lock — exactly the same caveat _reap_stale_reservations'
+    # own unlocked scan documents; every candidate is re-verified under the
+    # user's lock inside _reap_stale_reservations before anything is mutated.
+    candidate_user_ids = [
+        uid for (uid,) in db.query(LibraryItem.user_id)
+        .filter(LibraryItem.entitlement_status == "pending")
+        .filter(
+            (
+                (LibraryItem.reservation_lease_expires_at.isnot(None))
+                & (LibraryItem.reservation_lease_expires_at < now)
+            )
+            | (
+                (LibraryItem.reservation_lease_expires_at.is_(None))
+                & (LibraryItem.reserved_at.isnot(None))
+                & (LibraryItem.reserved_at < legacy_cutoff)
+            )
+        )
+        .distinct()
+        .limit(batch_size)
+        .all()
+    ]
+
+    users_reaped, items_reaped = 0, 0
+    for uid in candidate_user_ids:
+        user = (
+            db.query(User).filter(User.id == uid)
+            .populate_existing().with_for_update().first()
+        )
+        if not user:
+            continue  # orphaned rows (e.g. mid account-erasure) — nothing to lock against
+        try:
+            count = _reap_stale_reservations(db, user)
+            db.commit()
+        except Exception:
+            db.rollback()
+            logger.exception("autonomous stale-reservation reap failed for user %s", uid)
+            continue
+        if count:
+            users_reaped += 1
+            items_reaped += count
+
+    return users_reaped, items_reaped
 
 
 def reserve_free_capacity(db: Session, item: LibraryItem, user_id: str) -> bool:
