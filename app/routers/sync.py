@@ -29,7 +29,7 @@ from sqlalchemy.orm import Session
 from app.database import get_db
 from app.middleware.auth import get_current_user
 from app.models.user import User
-from app.models.library import LibraryItem
+from app.models.library import LibraryItem, DeletedLibraryItem
 from app.rate_limit import limiter
 from app.models.bite import DailyBite
 from app.models.streak import Streak
@@ -94,7 +94,17 @@ def _book_lock_status(db: Session, user: User, book_id) -> str:
         return "unattributed"
     item = db.query(LibraryItem).filter(LibraryItem.id == book_id).first()
     if item is None:
-        return "unattributed"
+        # Task 13 remediation: a book_id that WAS a real source of this
+        # user's, now hard-deleted, must stay rejected exactly like a
+        # still-tombstoned item — not fall into the 'unattributed'
+        # default-allow meant for ids this table never had an opinion
+        # about (see DeletedLibraryItem's docstring).
+        was_deleted = (
+            db.query(DeletedLibraryItem)
+            .filter(DeletedLibraryItem.id == book_id, DeletedLibraryItem.user_id == user.id)
+            .first()
+        )
+        return "locked" if was_deleted else "unattributed"
     if item.user_id != user.id:
         return "foreign"
     if item.deletion_state is not None:
@@ -120,6 +130,19 @@ def _resolve_book_lock_map(db: Session, user: User, book_ids: set) -> dict:
         .all()
     )
     by_id = {it.id: it for it in items}
+    # Task 13 remediation: batch the same hard-deleted-tombstone check
+    # _book_lock_status does — only for ids with no live LibraryItem row,
+    # since a live row's own deletion_state already covers the tombstoned-
+    # but-not-yet-hard-deleted case below.
+    missing_ids = book_ids - by_id.keys()
+    deleted_ids = set()
+    if missing_ids:
+        deleted_ids = {
+            row.id for row in db.query(DeletedLibraryItem.id).filter(
+                DeletedLibraryItem.user_id == user.id,
+                DeletedLibraryItem.id.in_(missing_ids),
+            ).all()
+        }
     out = {}
     for bid in book_ids:
         it = by_id.get(bid)
@@ -130,7 +153,7 @@ def _resolve_book_lock_map(db: Session, user: User, book_ids: set) -> dict:
         # binary unattributed/unlocked/locked split is sufficient for reads.
         # A tombstoned item is treated as 'locked' (see _book_lock_status).
         if it is None:
-            out[bid] = "unattributed"
+            out[bid] = "locked" if bid in deleted_ids else "unattributed"
         elif it.deletion_state is not None:
             out[bid] = "locked"
         else:

@@ -363,3 +363,31 @@ class AccountErasure(Base):
     deletion_started_at = Column(DateTime, nullable=True)
     deletion_completed_at = Column(DateTime, nullable=True)
     personal_data_redacted_at = Column(DateTime, nullable=True)
+
+
+class DeletedLibraryItem(Base):
+    """Permanent tombstone for a hard-deleted LibraryItem (Task 13
+    remediation, Aug 2026).
+
+    `delete_library_item()` hard-deletes the LibraryItem row once external
+    cleanup (S3/Pinecone/images) fully succeeds — see
+    `_finish_item_deletion_cleanup`. Once that row is gone,
+    `sync.py`'s `_book_lock_status` can no longer tell "this book_id never
+    existed" (the deliberate default-allow policy for legacy/demo ids the
+    table never had an opinion about) apart from "this book_id WAS a real
+    source and was deleted" (must stay rejected forever, same as a
+    still-tombstoned item). Without this record, a note/highlight/chat
+    write still sitting in a device's offline outbox at the moment
+    deletion finishes slips through the default-allow path the instant the
+    row is gone — and can even come back on a future `/sync/all` restore.
+
+    One row per (user_id, deleted item id), written in the SAME
+    transaction that hard-deletes the LibraryItem row, and never removed.
+    The id space is UUIDs (`id=str(uuid.uuid4())` at creation), so
+    collision with a future upload is not a practical concern — keeping
+    the record forever is simpler and cheaper than any expiry scheme."""
+    __tablename__ = "deleted_library_items"
+
+    id = Column(String, primary_key=True)   # the original LibraryItem.id
+    user_id = Column(String, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    deleted_at = Column(DateTime, server_default=func.now())

@@ -3,7 +3,7 @@ from sqlalchemy.orm import Session
 from app.database import get_db
 from app.middleware.auth import get_current_user
 from app.models.user import User
-from app.models.library import LibraryItem
+from app.models.library import LibraryItem, DeletedLibraryItem
 from app.models.bite import DailyBite, SavedBite
 from app.models.user_data import ChatMessage, Completion, Highlight, Note
 from app.rate_limit import limiter
@@ -1203,6 +1203,10 @@ def _finish_item_deletion_cleanup(db, item, user_id: str) -> bool:
         )
         return False
 
+    # Task 13 remediation: record the permanent tombstone BEFORE the row
+    # itself is gone, in the same transaction — see DeletedLibraryItem's
+    # docstring for why this can't just be "the row is simply absent".
+    db.add(DeletedLibraryItem(id=item_id, user_id=user_id))
     db.delete(item)
     db.commit()
     return True
