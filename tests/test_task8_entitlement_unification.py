@@ -485,6 +485,85 @@ check("premium_until reflects the later (comp) of the two",
 
 
 # ═══════════════════════════════════════════════════════════════════════
+section("K — Codex audit finding: reverse-order grant must not let a stale "
+        "entitlement_source outrank the EXPIRATION event's own store field")
+# ═══════════════════════════════════════════════════════════════════════
+
+# K1 — the exact reported sequence: PAID granted first, COMPLIMENTARY granted
+# afterward (entitlement_source is now "complimentary", stale relative to
+# which grant is about to expire), then the PAID subscription's own
+# EXPIRATION arrives (store=APP_STORE). A fallback that trusted
+# entitlement_source over the event's own store misread this as the comp
+# ending — wiping the still-valid comp and never expiring the lapsed paid
+# access. The event's own store must win.
+u_k1 = mkuser("wh_k1")
+webhook({"id": "evt-k1a", "type": "INITIAL_PURCHASE", "app_user_id": "wh_k1",
+         "store": "APP_STORE", "expiration_at_ms": days_ms(30), "event_timestamp_ms": 1000})
+webhook({"id": "evt-k1b", "type": "NON_RENEWING_PURCHASE", "app_user_id": "wh_k1",
+         "store": "PROMOTIONAL", "expiration_at_ms": days_ms(90), "event_timestamp_ms": 2000})
+u_k1 = refresh(u_k1)
+check("setup: entitlement_source is 'complimentary' (the later grant) ahead of the paid expiration",
+      u_k1.entitlement_source == "complimentary", u_k1.entitlement_source)
+comp_before_k1 = u_k1.complimentary_until
+webhook({"id": "evt-k1c", "type": "EXPIRATION", "app_user_id": "wh_k1", "store": "APP_STORE",
+         "expiration_at_ms": days_ms(30), "event_timestamp_ms": 3000})
+u_k1 = refresh(u_k1)
+check("the 90-day comp is NOT wiped by the paid subscription's own expiration, "
+      "byte-for-byte unchanged, despite entitlement_source having said 'complimentary'",
+      u_k1.complimentary_until == comp_before_k1, (u_k1.complimentary_until, comp_before_k1))
+check("the paid subscription's own expiration IS recorded on paid_premium_until",
+      u_k1.paid_premium_until is not None and u_k1.paid_premium_until < u_k1.complimentary_until,
+      (u_k1.paid_premium_until, u_k1.complimentary_until))
+check("premium_until correctly reflects the surviving comp (the paid grant genuinely lapsed)",
+      u_k1.premium_until == u_k1.complimentary_until, (u_k1.premium_until, u_k1.complimentary_until))
+check("access remains premium via the surviving comp, source correctly re-points to complimentary",
+      resolve_entitlement(u_k1)["access"] == "premium" and u_k1.entitlement_source == "complimentary",
+      (resolve_entitlement(u_k1)["access"], u_k1.entitlement_source))
+
+# K2 — mirror: COMP granted first, PAID granted afterward (entitlement_source
+# now "paid"), then the COMP's own EXPIRATION arrives (store=PROMOTIONAL).
+# The event's own store must still win even though it happens to already
+# agree it's not the currently-recorded source's expiration.
+u_k2 = mkuser("wh_k2")
+webhook({"id": "evt-k2a", "type": "NON_RENEWING_PURCHASE", "app_user_id": "wh_k2",
+         "store": "PROMOTIONAL", "expiration_at_ms": days_ms(5), "event_timestamp_ms": 1000})
+webhook({"id": "evt-k2b", "type": "INITIAL_PURCHASE", "app_user_id": "wh_k2",
+         "store": "APP_STORE", "expiration_at_ms": days_ms(60), "event_timestamp_ms": 2000})
+u_k2 = refresh(u_k2)
+check("setup: entitlement_source is 'paid' (the later grant) ahead of the comp's expiration",
+      u_k2.entitlement_source == "paid", u_k2.entitlement_source)
+paid_before_k2 = u_k2.paid_premium_until
+webhook({"id": "evt-k2c", "type": "EXPIRATION", "app_user_id": "wh_k2", "store": "PROMOTIONAL",
+         "expiration_at_ms": days_ms(5), "event_timestamp_ms": 3000})
+u_k2 = refresh(u_k2)
+check("the 60-day paid window is NOT wiped by the comp's own expiration, byte-for-byte unchanged",
+      u_k2.paid_premium_until == paid_before_k2, (u_k2.paid_premium_until, paid_before_k2))
+check("the comp's own expiration IS recorded on complimentary_until",
+      u_k2.complimentary_until is not None and u_k2.complimentary_until < u_k2.paid_premium_until)
+check("premium_until correctly reflects the surviving paid window",
+      u_k2.premium_until == u_k2.paid_premium_until, (u_k2.premium_until, u_k2.paid_premium_until))
+check("access remains premium via the surviving paid subscription, source correctly re-points to paid",
+      resolve_entitlement(u_k2)["access"] == "premium" and u_k2.entitlement_source == "paid",
+      (resolve_entitlement(u_k2)["access"], u_k2.entitlement_source))
+
+# K3 — store genuinely absent on the EXPIRATION payload falls back to the
+# defensive entitlement_source check (only reachable path for that fallback
+# now — proves it still exists for a malformed/incomplete RC payload).
+u_k3 = mkuser("wh_k3")
+webhook({"id": "evt-k3a", "type": "NON_RENEWING_PURCHASE", "app_user_id": "wh_k3",
+         "store": "PROMOTIONAL", "expiration_at_ms": days_ms(20), "event_timestamp_ms": 1000})
+u_k3 = refresh(u_k3)
+comp_before_k3 = u_k3.complimentary_until
+webhook({"id": "evt-k3b", "type": "EXPIRATION", "app_user_id": "wh_k3", "event_timestamp_ms": 2000})
+u_k3 = refresh(u_k3)
+check("store-absent EXPIRATION falls back to entitlement_source and still correctly "
+      "expires the comp (only active source)",
+      u_k3.complimentary_until != comp_before_k3, (u_k3.complimentary_until, comp_before_k3))
+check("access correctly drops once the comp (only source) is expired via the fallback",
+      resolve_entitlement(u_k3)["access"] != "premium")
+
+
+# ═══════════════════════════════════════════════════════════════════════
 print(f"\n{'='*60}")
 if failures:
     print(f"FAILED: {len(failures)} check(s) — {failures}")
