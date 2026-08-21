@@ -1112,10 +1112,18 @@ check("the real autonomous tick discovered and finished the previously-"
 
 after_erasure = db.query(AccountErasure).filter(AccountErasure.id == "erasure-sched-1").first()
 after_erase_user = db.query(User).filter(User.id == "sched_erase_u").first()
+# Audit fix: the erasure row now survives (state='resolved') until the
+# Sheet mirror write is ALSO confirmed — genuinely unconfigured in this
+# test env (no Sheet credentials), so it correctly stays present here.
+# The real proof the autonomous tick "finished" it is the User row being
+# gone and the erasure reaching a terminal, non-retrying state — not the
+# row's outright absence, which now depends on an unrelated mirror step.
 check("the real autonomous tick discovered and finished the previously-"
-      "failed account erasure — the erasure record and the User row are "
-      "both gone now", after_erasure is None and after_erase_user is None,
-      (after_erasure, after_erase_user))
+      "failed account erasure — the User row is gone and the erasure "
+      "record reached a terminal 'resolved' state (deletion itself done, "
+      "not stuck retrying)",
+      after_erase_user is None and after_erasure is not None and after_erasure.state == "resolved",
+      (after_erasure.state if after_erasure else None, after_erase_user))
 
 # Bounded shutdown of both the scheduler and the dedicated event-loop
 # thread — must prove neither survives, never just claim it.
@@ -1334,13 +1342,27 @@ with mock.patch("app.routers.auth.EmbeddingService") as MockEmbedH4b, \
 
 check("the retry (same durable identity, no re-derivation needed) "
       "completes successfully — complete=True", complete_2 is True)
-check("on full success, the erasure record itself is removed",
-      db.query(AccountErasure).filter(AccountErasure.id == "erasure-h4-1").first() is None)
+# Audit fix: the erasure row used to be deleted in the SAME commit as the
+# user, before the Sheet mirror write / confirmation email were even
+# attempted — a failure in either was then permanently unretryable. It now
+# survives in state='resolved' until BOTH are confirmed. Neither is mocked
+# in this fixture (no Sheet credentials, no Resend key — hermetic.py blanks
+# both), so both genuinely fail here, same as production would with no
+# automation configured — the row correctly stays present, in a terminal
+# 'resolved' state, not stuck retrying full deletion again.
+erasure_row_after = db.query(AccountErasure).filter(AccountErasure.id == "erasure-h4-1").first()
+check("on full success, the erasure record reaches 'resolved' (deletion truly done) "
+      "— it survives ONLY because the Sheet/email mirror steps are unconfigured here, "
+      "never because deletion itself is incomplete",
+      erasure_row_after is not None and erasure_row_after.state == "resolved",
+      erasure_row_after.state if erasure_row_after else None)
 check("on full success, the User row is finally removed too",
       db.query(User).filter(User.id == "erase_h4_u").first() is None)
-check("repeating the attempt a THIRD time (idempotent repeated deletion) "
-      "is a safe no-op — nothing left to do, no error, no double-delete",
-      db.query(AccountErasure).filter(AccountErasure.user_id == "erase_h4_u").first() is None)
+check("repeating the attempt a THIRD time (idempotent repeated deletion) is a safe no-op "
+      "— a 'resolved' row is excluded from retry_account_erasures' scan (state NOT IN "
+      "('pending','failed')), so nothing re-attempts deletion on an already-deleted user",
+      erasure_row_after is not None and erasure_row_after.state not in ("pending", "failed"),
+      erasure_row_after.state if erasure_row_after else None)
 
 
 db.close()

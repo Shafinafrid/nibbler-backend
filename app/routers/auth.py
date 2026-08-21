@@ -470,21 +470,6 @@ def _attempt_account_erasure_cleanup(db: Session, erasure: AccountErasure) -> bo
                         first_seen_user_id=user.id,
                     ))
 
-        # Completion email — best-effort, uses the captured snapshot email
-        # (independent of whether the Firebase record still exists).
-        email_sent = False
-        if snapshot.get("email"):
-            email_sent = _send_email_sync(
-                to=snapshot["email"],
-                subject="Your Nibbler account has been deleted",
-                html="<p>Your Nibbler account and all associated data have been "
-                     "permanently deleted, as requested. This cannot be undone.</p>",
-                text="Your Nibbler account and all associated data have been "
-                     "permanently deleted, as requested. This cannot be undone.",
-            )
-        progress["email_sent"] = email_sent
-        erasure.progress = progress
-
         # Audit finding: freeze the Sheet row VALUES and allocate row
         # NUMBERS now (reads current in-memory state; row-number
         # allocation is a Sheets API call, not a Postgres write, so it's
@@ -500,16 +485,56 @@ def _attempt_account_erasure_cleanup(db: Session, erasure: AccountErasure) -> bo
 
         if user:
             db.delete(user)  # CASCADE handles every FK'd child table
-        db.delete(erasure)
+        # Audit finding: the erasure row used to be deleted in this SAME
+        # commit, before the Sheet write / confirmation email were even
+        # attempted — if either failed afterward, there was no durable
+        # record left to retry it from. The actual GDPR-critical action
+        # (the user row and everything it cascades to) is genuinely gone
+        # the instant this commits; the row below is kept a while longer
+        # specifically so the Sheet mirror and the confirmation email —
+        # both best-effort, both external calls that can fail — have
+        # something durable to retry against. `retry_unsynced_erasure_
+        # mirrors` (entitlement_service.py) is what picks a row back up
+        # from here; it never re-runs deletion, only the two steps below.
         db.commit()
         logger.info("Erasure complete for user %s", user_id)
 
-        # Postgres is now authoritative and durable — the Sheet write is
-        # purely a best-effort mirror of an already-true fact.
-        try:
-            deletion_sheets_service.write_prepared_rows(prepared_sheet_write)
-        except Exception as e:
-            logger.warning("Deletion-sheet final write failed for %s: %s", user_id, e)
+        # Postgres is now authoritative and durable — the Sheet write and
+        # the confirmation email are best-effort mirrors of an already-true
+        # fact, attempted AFTER that fact is durable, never before.
+        sheet_ok = deletion_sheets_service.write_prepared_rows(prepared_sheet_write)
+
+        # Completion email — best-effort, uses the captured snapshot email
+        # (independent of whether the Firebase record still exists).
+        email_sent = False
+        if snapshot.get("email"):
+            try:
+                email_sent = _send_email_sync(
+                    to=snapshot["email"],
+                    subject="Your Nibbler account has been deleted",
+                    html="<p>Your Nibbler account and all associated data have been "
+                         "permanently deleted, as requested. This cannot be undone.</p>",
+                    text="Your Nibbler account and all associated data have been "
+                         "permanently deleted, as requested. This cannot be undone.",
+                )
+            except Exception as e:
+                logger.warning("Deletion confirmation email failed for %s: %s", user_id, e)
+        else:
+            email_sent = True  # nothing to send — not an outstanding obligation
+
+        erasure_row = db.query(AccountErasure).filter(AccountErasure.id == erasure.id).first()
+        if erasure_row:
+            progress = dict(erasure_row.progress or {})
+            progress["email_sent"] = email_sent
+            progress["sheet_synced"] = sheet_ok
+            erasure_row.progress = progress
+            if sheet_ok and email_sent:
+                # Both best-effort obligations are confirmed done — safe to
+                # remove the retry identity now (matches the ORIGINAL intent
+                # of the comment above this block, just gated on the right
+                # things finishing first).
+                db.delete(erasure_row)
+            db.commit()
 
         return True
 

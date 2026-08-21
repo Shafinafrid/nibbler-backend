@@ -121,7 +121,12 @@ def _get_or_create_tab(client: httpx.Client, headers: dict, sheet_id: str, tab_n
     last_col = _col_letter(len(header_row) - 1)
     r = client.put(
         f"{SHEETS}/spreadsheets/{sheet_id}/values/'{tab_name}'!A1:{last_col}1",
-        headers=headers, params={"valueInputOption": "USER_ENTERED"},
+        # RAW, not USER_ENTERED: every value written here originates from
+        # account data (email, device strings, etc.) — USER_ENTERED lets
+        # Sheets interpret a leading =/+/-/@ as a formula, the exact
+        # formula-injection vector this task's own requirement calls out.
+        # RAW stores the literal string/number with no interpretation.
+        headers=headers, params={"valueInputOption": "RAW"},
         json={"values": [header_row]},
     )
     r.raise_for_status()
@@ -159,7 +164,12 @@ def _write_row(client: httpx.Client, headers: dict, sheet_id: str, tab_name: str
     _ensure_grid_rows(client, headers, sheet_id, tab_name, row)
     r = client.put(
         f"{SHEETS}/spreadsheets/{sheet_id}/values/'{tab_name}'!A{row}:{last_col}{row}",
-        headers=headers, params={"valueInputOption": "USER_ENTERED"},
+        # RAW, not USER_ENTERED: every value written here originates from
+        # account data (email, device strings, etc.) — USER_ENTERED lets
+        # Sheets interpret a leading =/+/-/@ as a formula, the exact
+        # formula-injection vector this task's own requirement calls out.
+        # RAW stores the literal string/number with no interpretation.
+        headers=headers, params={"valueInputOption": "RAW"},
         json={"values": [values]},
     )
     r.raise_for_status()

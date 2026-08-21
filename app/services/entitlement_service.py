@@ -1915,3 +1915,100 @@ def retry_account_erasures(db: Session, batch_size: int = 25) -> tuple:
         failed += 1
 
     return resolved, failed
+
+
+def retry_unsynced_erasure_mirrors(db: Session, batch_size: int = 25) -> tuple:
+    """Audit finding fix: `_attempt_account_erasure_cleanup` (app/routers/
+    auth.py) used to delete the `AccountErasure` row in the SAME commit as
+    the actual user deletion, before ever attempting the Sheet mirror
+    write or confirmation email — a failure in either was then permanently
+    unretryable (the only durable record was already gone). The row is now
+    kept in `state == 'resolved'` until BOTH `progress['sheet_synced']` and
+    `progress['email_sent']` are true; this sweep is what finishes that
+    off autonomously, using the SAME claim-lease protocol as
+    `retry_account_erasures` above.
+
+    Deliberately narrower than that function: it NEVER calls
+    `_attempt_account_erasure_cleanup` (which would re-run the full S3/
+    Pinecone/RevenueCat/Firebase deletion attempt) — the user's data is
+    already, durably gone by the time a row reaches 'resolved'. Only the
+    two best-effort mirror steps are retried, rebuilding what they need
+    from `erasure.identity['snapshot']` — the same durable snapshot
+    dict the original attempt captured and persisted for exactly this
+    reason (see `_capture_erasure_snapshot`)."""
+    from datetime import datetime as _dt, timedelta as _td
+    from app.models.library import AccountErasure
+    from app.services import deletion_sheets_service
+    from app.routers.auth import _send_email_sync
+
+    runner_id = str(uuid.uuid4())
+    claim_ttl = _td(minutes=5)
+    now = _dt.utcnow()
+
+    candidate_ids = [
+        eid for (eid,) in db.query(AccountErasure.id)
+        .filter(
+            AccountErasure.state == "resolved",
+            (AccountErasure.claimed_until.is_(None)) | (AccountErasure.claimed_until < now),
+        )
+        .order_by(AccountErasure.updated_at.asc())
+        .limit(batch_size)
+        .all()
+    ]
+
+    resolved, failed = 0, 0
+    for erasure_id in candidate_ids:
+        erasure = (
+            db.query(AccountErasure).filter(AccountErasure.id == erasure_id)
+            .populate_existing().with_for_update().first()
+        )
+        if not erasure or erasure.state != "resolved":
+            continue  # already finished (deleted) or no longer eligible
+        if erasure.claimed_until is not None and erasure.claimed_until >= now:
+            continue  # a concurrent runner already holds this exact row
+        progress = dict(erasure.progress or {})
+        sheet_ok = bool(progress.get("sheet_synced"))
+        snapshot_email = (erasure.identity or {}).get("snapshot", {}).get("email")
+        email_ok = bool(progress.get("email_sent")) or not snapshot_email
+        erasure.claimed_by = runner_id
+        erasure.claimed_until = now + claim_ttl
+        db.commit()
+
+        try:
+            snapshot = (erasure.identity or {}).get("snapshot") or {}
+            if not sheet_ok:
+                prepared = deletion_sheets_service.prepare_success_write(erasure, snapshot)
+                sheet_ok = deletion_sheets_service.write_prepared_rows(prepared)
+            if not email_ok and snapshot_email:
+                email_ok = _send_email_sync(
+                    to=snapshot_email,
+                    subject="Your Nibbler account has been deleted",
+                    html="<p>Your Nibbler account and all associated data have been "
+                         "permanently deleted, as requested. This cannot be undone.</p>",
+                    text="Your Nibbler account and all associated data have been "
+                         "permanently deleted, as requested. This cannot be undone.",
+                )
+        except Exception:
+            logger.exception("erasure-mirror retry failed for %s", erasure_id)
+
+        fresh = (
+            db.query(AccountErasure).filter(AccountErasure.id == erasure_id)
+            .populate_existing().with_for_update().first()
+        )
+        if not fresh or fresh.claimed_by != runner_id:
+            continue  # reclaimed by a newer runner — don't touch its result
+        progress = dict(fresh.progress or {})
+        progress["sheet_synced"] = sheet_ok
+        progress["email_sent"] = email_ok
+        fresh.progress = progress
+        if sheet_ok and email_ok:
+            db.delete(fresh)
+            db.commit()
+            resolved += 1
+        else:
+            fresh.claimed_by = None
+            fresh.claimed_until = None
+            db.commit()
+            failed += 1
+
+    return resolved, failed

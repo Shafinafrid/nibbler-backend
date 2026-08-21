@@ -56,6 +56,7 @@ from app.models.library import LibraryItem, AccountErasure
 from app.middleware.auth import get_or_create_user
 from app.routers import auth as auth_router
 from app.services import deletion_sheets_service, mixpanel_service
+from app.services import entitlement_service as ent
 from app.config import get_settings
 
 create_tables()
@@ -269,7 +270,35 @@ check("full success (all artifact classes True, including RC+Mixpanel) returns T
 
 db.expire_all()
 check("the User row is genuinely gone", db.query(User).filter(User.id == "erase_g").first() is None)
-check("the AccountErasure row is genuinely gone", db.query(AccountErasure).filter(AccountErasure.id == "erasure-g1").first() is None)
+# Audit fix: the erasure row used to be deleted in the SAME commit as the
+# user, before the Sheet mirror write was even attempted — a failure there
+# was then permanently unretryable. It now survives (state='resolved')
+# until the Sheet write is ALSO confirmed — genuinely False here, since
+# this hermetic test env has no real Google credentials configured.
+erasure_g_after = db.query(AccountErasure).filter(AccountErasure.id == "erasure-g1").first()
+check("the AccountErasure row SURVIVES a genuine (hermetic, unconfigured) Sheet-write failure "
+      "— the user is already deleted, but the mirror obligation isn't confirmed yet",
+      erasure_g_after is not None, erasure_g_after)
+check("its state is 'resolved' (deletion done), not 'pending'/'failed' (which would wrongly "
+      "re-trigger a full re-deletion attempt via retry_account_erasures)",
+      erasure_g_after is not None and erasure_g_after.state == "resolved",
+      erasure_g_after.state if erasure_g_after else None)
+check("progress records the email as sent and the sheet as NOT yet synced",
+      erasure_g_after is not None and erasure_g_after.progress.get("email_sent") is True
+      and erasure_g_after.progress.get("sheet_synced") is False,
+      erasure_g_after.progress if erasure_g_after else None)
+
+# Now prove retry_unsynced_erasure_mirrors actually finishes it off, once
+# the Sheet write succeeds — never re-running deletion (the user is
+# already long gone; only the mirror is retried).
+with mock.patch("app.services.deletion_sheets_service.prepare_success_write", return_value={"x": 1}), \
+     mock.patch("app.services.deletion_sheets_service.write_prepared_rows", return_value=True):
+    mirror_resolved, mirror_failed = ent.retry_unsynced_erasure_mirrors(db)
+check("retry_unsynced_erasure_mirrors resolves the row once the Sheet write succeeds",
+      mirror_resolved == 1 and mirror_failed == 0, (mirror_resolved, mirror_failed))
+db.expire_all()
+check("the AccountErasure row is NOW genuinely gone, after the mirror retry succeeded",
+      db.query(AccountErasure).filter(AccountErasure.id == "erasure-g1").first() is None)
 
 guard_g = db.query(EmailAccountHistory).filter(EmailAccountHistory.email == "willdelete@example.com").first()
 check("EmailAccountHistory guard was created atomically with the deletion",
@@ -385,8 +414,18 @@ with mock.patch("app.routers.auth.EmbeddingService") as MockEmbedI1, \
 check("UserNotFoundError on retry (Firebase already gone) completes the erasure "
       "instead of stranding it forever", complete_i1 is True)
 db.expire_all()
-check("the erasure row is genuinely gone after the fix (not stuck retrying UserNotFoundError forever)",
-      db.query(AccountErasure).filter(AccountErasure.id == "erasure-i1").first() is None)
+# Audit fix (separate from the UserNotFoundError fix this section is
+# named for): the row now survives deletion-completion until the Sheet
+# mirror is ALSO confirmed — genuinely unconfirmed here too, same hermetic
+# reason as section G. The real proof "not stranded" needs is state, not
+# absence: 'resolved' (a terminal, done state) rather than stuck back in
+# 'pending'/'failed' where retry_account_erasures would loop on the SAME
+# already-fixed UserNotFoundError forever.
+erasure_i1_after = db.query(AccountErasure).filter(AccountErasure.id == "erasure-i1").first()
+check("the erasure row reaches 'resolved' after the fix (not stuck retrying "
+      "UserNotFoundError forever in 'pending'/'failed')",
+      erasure_i1_after is not None and erasure_i1_after.state == "resolved",
+      erasure_i1_after.state if erasure_i1_after else None)
 
 # I2 — founder decision (Aug 2026, superseding the earlier redact-on-completion
 # audit fix): email/uid are kept PERMANENTLY in both Sheet tabs for support

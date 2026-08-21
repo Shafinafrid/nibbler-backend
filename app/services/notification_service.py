@@ -848,6 +848,14 @@ async def _run_task2_maintenance_cycle(db_factory) -> None:
             resolved, failed = ent.retry_account_erasures(db)
             if resolved or failed:
                 logger.info("[task2-maintenance] account-erasure retry: resolved=%d failed=%d", resolved, failed)
+            # Audit finding fix (Aug 2026): a 'resolved' erasure row means
+            # the user's data is already, durably gone — only the Sheet
+            # mirror and/or confirmation email are still outstanding.
+            # Never re-runs deletion, only those two best-effort steps.
+            mirror_resolved, mirror_failed = ent.retry_unsynced_erasure_mirrors(db)
+            if mirror_resolved or mirror_failed:
+                logger.info("[task2-maintenance] erasure-mirror retry: resolved=%d failed=%d",
+                            mirror_resolved, mirror_failed)
 
     try:
         await asyncio.to_thread(_run_cleanup)
