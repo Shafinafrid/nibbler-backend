@@ -42,6 +42,21 @@ class User(Base):
     last_webhook_event_id = Column(String, nullable=True)
     last_webhook_event_at_ms = Column(BigInteger, nullable=True)  # ms epoch — too large for 32-bit INTEGER
 
+    # ── Per-source expiry (Task 8 fix, Aug 2026) ───────────────────────────
+    # A paid subscription and a complimentary grant can be active on the SAME
+    # account at once (the webhook's grant branch never touches is_premium
+    # for a real purchase — see routers/revenuecat.py's own docstring). Before
+    # this, both sources wrote the ONE shared premium_until, so an unrelated
+    # source's GRANT or EXPIRATION event silently clobbered the other's
+    # expiry — a promotional grant could erase a still-valid paid window and
+    # vice versa. Each source now owns its own column; premium_until below
+    # becomes a DERIVED summary (see recompute_premium_until), never written
+    # directly by a webhook/sync path again, so every pre-existing reader
+    # (effective_premium, resolve_entitlement, sync-premium's own logging)
+    # keeps working without modification.
+    paid_premium_until = Column(DateTime, nullable=True)
+    complimentary_until = Column(DateTime, nullable=True)
+
     # ── Identity + device context (July 2026) ────────────────────────────────
     # Everything here is either user-supplied or a technical attribute of their
     # own session. Deliberately NOT collected: precise location, contacts,
@@ -109,6 +124,31 @@ class User(Base):
     # True→False. Comparing against this snapshot is what makes that
     # transition detectable — see entitlement_service.reconcile_free_lock_state.
     free_lock_last_effective_premium = Column(Boolean, nullable=True)
+
+    def recompute_premium_until(self) -> None:
+        """Rebuilds the derived premium_until summary from the two
+        source-specific columns. Call this at the end of EVERY write path
+        that touches paid_premium_until/complimentary_until (webhook grant,
+        webhook expiration, sync-premium) — never set premium_until directly
+        again. Mirrors effective_premium's own "keep a past expiry instead
+        of nulling it" contract so a lapsed subscriber still correctly lands
+        on free rather than re-opening the signup trial."""
+        now = datetime.utcnow()
+        paid_active = bool(self.paid_premium_until and self.paid_premium_until > now)
+        comp_active = bool(self.complimentary_until and self.complimentary_until > now)
+        if paid_active and comp_active:
+            self.premium_until = max(self.paid_premium_until, self.complimentary_until)
+        elif paid_active:
+            self.premium_until = self.paid_premium_until
+        elif comp_active:
+            self.premium_until = self.complimentary_until
+        else:
+            # Neither currently active — report the most recent lapse so a
+            # past-but-set premium_until still correctly blocks the trial
+            # fallback below. A lifetime comp (complimentary_until=None,
+            # is_premium=True) has nothing to report here by design.
+            candidates = [d for d in (self.paid_premium_until, self.complimentary_until) if d]
+            self.premium_until = max(candidates) if candidates else None
 
     @property
     def effective_premium(self) -> bool:

@@ -644,6 +644,21 @@ def _run_migrations():
         # users — Task 3 fix (Aug 2026): sticky-until-read featured-nibble
         # pointer, see notification_service._feature_bite().
         "ALTER TABLE users ADD COLUMN IF NOT EXISTS last_featured_bite_id VARCHAR",
+        # users — Task 8 fix (Aug 2026): per-source expiry, see
+        # User.recompute_premium_until(). Backfill seeds each existing row's
+        # ALREADY-CORRECT current premium_until into whichever source
+        # entitlement_source names, so a deploy doesn't drop a live grant —
+        # after this, premium_until is derived and no write path sets it
+        # directly again. Safe to re-run: only fires while the new columns
+        # are still both NULL for that row.
+        "ALTER TABLE users ADD COLUMN IF NOT EXISTS paid_premium_until TIMESTAMP",
+        "ALTER TABLE users ADD COLUMN IF NOT EXISTS complimentary_until TIMESTAMP",
+        "UPDATE users SET paid_premium_until = premium_until "
+        "WHERE entitlement_source = 'paid' AND premium_until IS NOT NULL "
+        "AND paid_premium_until IS NULL AND complimentary_until IS NULL",
+        "UPDATE users SET complimentary_until = premium_until "
+        "WHERE entitlement_source = 'complimentary' AND premium_until IS NOT NULL "
+        "AND paid_premium_until IS NULL AND complimentary_until IS NULL",
         # Task 2's own schema (successful_sources_total, free_lock_state_token,
         # is_unlocked_selection, the reservation/provenance columns, and their
         # backfill) moved to TASK2_REQUIRED_MIGRATIONS below — kept on its own
@@ -716,6 +731,10 @@ REQUIRED_COLUMNS = [
     ("delivery_cycles", "user_id"), ("delivery_cycles", "cycle_date"),
     ("delivery_cycles", "state"), ("delivery_cycles", "claimed_by"),
     ("delivery_cycles", "claimed_until"), ("delivery_cycles", "due_at"),
+    # Task 8 fix — without these two columns the webhook/sync-premium write
+    # paths would silently fall back to corrupting the shared premium_until
+    # again, exactly the bug this migration exists to close.
+    ("users", "paid_premium_until"), ("users", "complimentary_until"),
 ]
 # Postgres only — a named UNIQUE constraint/index is how each of these
 # integrity guarantees is actually enforced by the database, not just

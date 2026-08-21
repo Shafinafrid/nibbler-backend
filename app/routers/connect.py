@@ -18,12 +18,14 @@ import math
 import os
 import uuid
 import logging
+import threading
 from datetime import datetime, timedelta
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 from typing import Optional, List
+from app.database import SessionLocal
 from pydantic import BaseModel, Field
 from app.database import get_db
 from app.middleware.auth import get_current_user
@@ -137,13 +139,17 @@ class _ChatTurnClaim:
     return it verbatim, no LLM call. `in_progress` → a still-live worker
     (this same request racing itself, another device, or a client bug)
     already owns this turn; the caller must not start a second generation.
-    `conflict` → this turn id is already bound to a DIFFERENT book — a
-    client bug or turn-id reuse, refused outright rather than guessed at."""
-    def __init__(self, worker_id=None, replay_reply=None, in_progress=False, conflict=False):
+    `conflict` → this turn id is already bound to a DIFFERENT book OR a
+    DIFFERENT question text (Task 16 audit fix) — a client bug or turn-id
+    reuse, refused outright rather than guessed at. `conflict_reason`
+    distinguishes the two ('book' | 'question') so the client's error
+    message doesn't claim the wrong one."""
+    def __init__(self, worker_id=None, replay_reply=None, in_progress=False, conflict=False, conflict_reason=None):
         self.worker_id = worker_id
         self.replay_reply = replay_reply
         self.in_progress = in_progress
         self.conflict = conflict
+        self.conflict_reason = conflict_reason
 
 
 def _claim_chat_turn(db: Session, turn_id: str, user_id: str, book_id: str, question: str) -> _ChatTurnClaim:
@@ -167,7 +173,19 @@ def _claim_chat_turn(db: Session, turn_id: str, user_id: str, book_id: str, ques
     )
 
     if turn is not None and turn.book_id != book_id:
-        return _ChatTurnClaim(conflict=True)
+        return _ChatTurnClaim(conflict=True, conflict_reason="book")
+
+    # Task 16 audit fix: turn_id alone is not a safe idempotency key — it is
+    # a client-generated value, and this table never verified the SAME id
+    # was actually still attached to the SAME question. Reusing an id with
+    # DIFFERENT text previously either silently replayed an unrelated
+    # completed answer (below) or overwrote the original question on a
+    # failed/stale-lease claim (further below), corrupting what a still-
+    # running worker would eventually attribute to that turn. Bind the id to
+    # its original question text, exactly like the pre-existing book_id
+    # check above — a text mismatch is refused as a conflict, never guessed at.
+    if turn is not None and turn.question is not None and turn.question != question:
+        return _ChatTurnClaim(conflict=True, conflict_reason="question")
 
     if turn is not None and turn.status == "completed":
         return _ChatTurnClaim(replay_reply=turn.reply)
@@ -176,20 +194,20 @@ def _claim_chat_turn(db: Session, turn_id: str, user_id: str, book_id: str, ques
         if turn.claimed_until and turn.claimed_until > now:
             return _ChatTurnClaim(in_progress=True)
         # Lease expired — the worker that claimed it died before finishing.
-        # Re-claim for THIS attempt (crash recovery).
+        # Re-claim for THIS attempt (crash recovery). question is already
+        # verified identical above — nothing to overwrite there.
         turn.claimed_by = worker_id
         turn.claimed_until = lease_until
-        turn.question = question
         db.commit()
         return _ChatTurnClaim(worker_id=worker_id)
 
     if turn is not None and turn.status == "failed":
         # Explicit retry of a definitively-failed turn — re-open it for
-        # exactly one more attempt, same claim as a fresh turn.
+        # exactly one more attempt, same claim as a fresh turn. question is
+        # already verified identical above.
         turn.status = "pending"
         turn.claimed_by = worker_id
         turn.claimed_until = lease_until
-        turn.question = question
         turn.error_code = None
         turn.error_message = None
         db.commit()
@@ -224,6 +242,83 @@ def _claim_chat_turn(db: Session, turn_id: str, user_id: str, book_id: str, ques
             return _ChatTurnClaim(replay_reply=turn.reply)
         return _ChatTurnClaim(in_progress=True)
     return _ChatTurnClaim(worker_id=worker_id)
+
+
+# ── Lease heartbeat around the LLM call (Task 16 audit fix) ────────────────
+# CHAT_TURN_LEASE_MINUTES was previously a FIXED lease with nothing renewing
+# it while the worker was blocked inside the single opaque llm.chat_with_
+# book() call. If generation legitimately ran longer than the lease (a slow
+# provider, or LLMService's own multi-provider fallback chain genuinely
+# working through 2-3 attempts), the lease could expire WHILE the first
+# worker was still alive and mid-call — a user retry then re-claimed the
+# turn and started a SECOND concurrent paid generation, with only the
+# ownership check in _complete_chat_turn/_fail_chat_turn (ChatTurn.
+# claimed_by != worker_id) stopping the loser from overwriting the winner's
+# result. That check prevents a corrupted final write but does nothing to
+# stop the wasted paid call itself. This mirrors _AttemptGuard's background-
+# renewal half (see routers/library.py) but is deliberately much smaller:
+# chat has no natural per-chunk checkpoint to call renew_now() from inside
+# a single blocking LLM call, so only the background-thread renewal side
+# applies here.
+_CHAT_HEARTBEAT_INTERVAL_SECONDS = 30.0
+
+
+class _ChatTurnHeartbeat:
+    """Background thread that extends a ChatTurn's claimed_until on a fixed
+    interval for as long as the worker is blocked inside the LLM call.
+    Renews only while THIS worker still owns the lease (authoritative
+    per-tick DB check, not a cached flag) — if ownership was already lost
+    (a bug elsewhere, or manual intervention), the thread stops renewing
+    and records the loss rather than fighting whoever now owns the row.
+    Runs through its own independent SessionLocal(), never the request's
+    own `db` (that connection is idle on this thread's stack, not safe to
+    share across threads)."""
+
+    def __init__(self, turn_id: str, user_id: str, worker_id: str,
+                 interval_seconds: float = None):
+        self.turn_id = turn_id
+        self.user_id = user_id
+        self.worker_id = worker_id
+        # Read the module-level constant at CALL time, not as a Python
+        # default-parameter value bound once at function-definition time —
+        # the latter can't be overridden by a test's mock.patch on the
+        # module attribute after this class is already defined.
+        self.interval_seconds = interval_seconds if interval_seconds is not None else _CHAT_HEARTBEAT_INTERVAL_SECONDS
+        self._stop = threading.Event()
+        self._thread = None
+        self.lost = False
+
+    def _run(self):
+        while not self._stop.wait(self.interval_seconds):
+            db = SessionLocal()
+            try:
+                turn = (
+                    db.query(ChatTurn)
+                    .filter(ChatTurn.turn_id == self.turn_id, ChatTurn.user_id == self.user_id)
+                    .with_for_update()
+                    .first()
+                )
+                if not turn or turn.claimed_by != self.worker_id:
+                    self.lost = True
+                    return
+                turn.claimed_until = datetime.utcnow() + timedelta(minutes=CHAT_TURN_LEASE_MINUTES)
+                db.commit()
+            except Exception:
+                logger.exception("Chat-turn heartbeat renewal failed for turn %s", self.turn_id)
+            finally:
+                db.close()
+
+    def start(self) -> None:
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=5.0)
+            if self._thread.is_alive():
+                logger.critical("CHAT_HEARTBEAT_JOIN_FAILED turn=%s worker=%s — thread did not "
+                                 "stop within timeout", self.turn_id, self.worker_id)
 
 
 def _complete_chat_turn(db: Session, turn_id: str, user_id: str, worker_id: str, reply: str) -> None:
@@ -467,9 +562,14 @@ def chat(
     turn_id = data.turn_id or str(uuid.uuid4())
     claim = _claim_chat_turn(db, turn_id, current_user.id, item.id, message)
     if claim.conflict:
+        conflict_message = (
+            "This question's id is already associated with a different book."
+            if claim.conflict_reason == "book" else
+            "This question's id is already associated with different question text — try again."
+        )
         raise HTTPException(status_code=409, detail={
             "code": "chat_turn_conflict",
-            "message": "This question's id is already associated with a different book.",
+            "message": conflict_message,
         })
     if claim.replay_reply is not None:
         # Idempotent replay: the exact same question, already answered —
@@ -498,6 +598,12 @@ def chat(
         raise HTTPException(status_code=422, detail={"code": "no_content", "message": no_content_msg})
 
     llm = LLMService()
+    # Task 16 audit fix: keep the lease alive for as long as this worker is
+    # genuinely still blocked inside the LLM call — see _ChatTurnHeartbeat's
+    # own docstring for why a fixed lease alone let a legitimately-slow
+    # generation get raced by a user retry.
+    heartbeat = _ChatTurnHeartbeat(turn_id, current_user.id, worker_id)
+    heartbeat.start()
     try:
         reply = llm.chat_with_book(
             book_title=item.title,
@@ -511,8 +617,10 @@ def chat(
         # model names, stack detail) — a fixed, safe message only.
         logger.exception("Connect chat generation failed for turn %s", turn_id)
         gen_failed_msg = "Something went wrong generating a reply — you can try again."
+        heartbeat.stop()
         _fail_chat_turn(db, turn_id, current_user.id, worker_id, "generation_failed", gen_failed_msg)
         raise HTTPException(status_code=502, detail={"code": "generation_failed", "message": gen_failed_msg})
+    heartbeat.stop()
 
     _complete_chat_turn(db, turn_id, current_user.id, worker_id, reply)
     background_tasks.add_task(mixpanel_service.track, "book_chat_message", current_user.id, {

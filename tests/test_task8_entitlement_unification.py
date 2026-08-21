@@ -382,6 +382,109 @@ check("the backfill never touches a row that already has a real entitlement_sour
 
 
 # ═══════════════════════════════════════════════════════════════════════
+section("J — audit fix: paid and complimentary expiries no longer share/clobber "
+        "the one premium_until column")
+# ═══════════════════════════════════════════════════════════════════════
+
+# NOTE: expiry checks below compare relative order (which stored value is
+# bigger/smaller/equal) rather than reconstructing an "expected" datetime via
+# NOW+timedelta independently — the webhook converts via ms-epoch UTC
+# (_ms_to_naive_utc), and re-deriving the same instant with naive
+# datetime.timestamp() on this machine (UTC+2) double-applies a local-tz
+# offset, which is a test-fixture bug, not a product one (the same class of
+# bug already documented above for TODAY/YDAY-style constants elsewhere).
+
+def days_ms(n):
+    return int((NOW + datetime.timedelta(days=n)).timestamp() * 1000)
+
+# J1 — a PAID grant must not erase an already-active COMP's expiry, and vice
+# versa: each source keeps its own column, premium_until is just their max.
+u_j1 = mkuser("wh_j1")
+webhook({"id": "evt-j1a", "type": "NON_RENEWING_PURCHASE", "app_user_id": "wh_j1",
+         "store": "PROMOTIONAL", "expiration_at_ms": days_ms(5), "event_timestamp_ms": 1000})
+u_j1 = refresh(u_j1)
+comp_after_grant1 = u_j1.complimentary_until
+webhook({"id": "evt-j1b", "type": "INITIAL_PURCHASE", "app_user_id": "wh_j1",
+         "store": "APP_STORE", "expiration_at_ms": days_ms(30), "event_timestamp_ms": 2000})
+u_j1 = refresh(u_j1)
+check("comp expiry survives a LATER, unrelated paid grant, byte-for-byte unchanged",
+      u_j1.complimentary_until == comp_after_grant1, (u_j1.complimentary_until, comp_after_grant1))
+check("paid expiry is independently recorded and is later than the comp's",
+      u_j1.paid_premium_until is not None and u_j1.paid_premium_until > u_j1.complimentary_until,
+      (u_j1.paid_premium_until, u_j1.complimentary_until))
+check("premium_until reflects the LATER of the two active expiries (the paid one)",
+      u_j1.premium_until == u_j1.paid_premium_until, (u_j1.premium_until, u_j1.paid_premium_until))
+
+# J2 — the CORE audit bug: a PAID subscription's EXPIRATION must not erase a
+# still-active, unrelated COMP's expiry (previously: unconditional premium_until
+# overwrite at the top of the EXPIRATION branch clobbered it regardless of source).
+u_j2 = mkuser("wh_j2")
+webhook({"id": "evt-j2a", "type": "NON_RENEWING_PURCHASE", "app_user_id": "wh_j2",
+         "store": "PROMOTIONAL", "expiration_at_ms": days_ms(60), "event_timestamp_ms": 1000})
+u_j2 = refresh(u_j2)
+comp_before_expiry = u_j2.complimentary_until
+webhook({"id": "evt-j2b", "type": "INITIAL_PURCHASE", "app_user_id": "wh_j2",
+         "store": "APP_STORE", "expiration_at_ms": days_ms(10), "event_timestamp_ms": 2000})
+webhook({"id": "evt-j2c", "type": "EXPIRATION", "app_user_id": "wh_j2", "store": "APP_STORE",
+         "expiration_at_ms": days_ms(10), "event_timestamp_ms": 3000})
+u_j2 = refresh(u_j2)
+check("the PAID subscription's own expiration is recorded on paid_premium_until "
+      "(earlier than the comp's, since it was the 10-day grant)",
+      u_j2.paid_premium_until is not None and u_j2.paid_premium_until < comp_before_expiry)
+check("the UNRELATED comp (60 days out) is completely untouched, byte-for-byte, by the paid expiration",
+      u_j2.complimentary_until == comp_before_expiry, (u_j2.complimentary_until, comp_before_expiry))
+check("premium_until correctly still reflects the still-active comp, "
+      "not the just-lapsed paid window — access must stay premium",
+      u_j2.premium_until == u_j2.complimentary_until, (u_j2.premium_until, u_j2.complimentary_until))
+check("access remains premium via the surviving comp", resolve_entitlement(u_j2)["access"] == "premium")
+
+# J3 — mirror: a COMP's EXPIRATION must not erase a still-active, unrelated PAID window.
+u_j3 = mkuser("wh_j3")
+webhook({"id": "evt-j3a", "type": "INITIAL_PURCHASE", "app_user_id": "wh_j3",
+         "store": "APP_STORE", "expiration_at_ms": days_ms(45), "event_timestamp_ms": 1000})
+u_j3 = refresh(u_j3)
+paid_before_expiry = u_j3.paid_premium_until
+webhook({"id": "evt-j3b", "type": "NON_RENEWING_PURCHASE", "app_user_id": "wh_j3",
+         "store": "PROMOTIONAL", "expiration_at_ms": days_ms(3), "event_timestamp_ms": 2000})
+webhook({"id": "evt-j3c", "type": "EXPIRATION", "app_user_id": "wh_j3", "store": "PROMOTIONAL",
+         "expiration_at_ms": days_ms(3), "event_timestamp_ms": 3000})
+u_j3 = refresh(u_j3)
+check("the still-active PAID window (45 days out) survives the comp's own expiration, "
+      "byte-for-byte unchanged",
+      u_j3.paid_premium_until == paid_before_expiry, (u_j3.paid_premium_until, paid_before_expiry))
+check("premium_until correctly reflects the surviving paid window",
+      u_j3.premium_until == u_j3.paid_premium_until, (u_j3.premium_until, u_j3.paid_premium_until))
+check("access remains premium via the surviving paid subscription",
+      resolve_entitlement(u_j3)["access"] == "premium" and resolve_entitlement(u_j3)["source"] == "paid")
+
+# J4 — sync-premium (third write path) also uses source-specific columns, not
+# a direct premium_until write, and recomputes correctly alongside a comp.
+u_j4 = mkuser("sync_j4")
+webhook({"id": "evt-j4a", "type": "NON_RENEWING_PURCHASE", "app_user_id": "sync_j4",
+         "store": "PROMOTIONAL", "expiration_at_ms": days_ms(90), "event_timestamp_ms": 1000})
+u_j4 = refresh(u_j4)
+comp_before_sync = u_j4.complimentary_until
+with mock.patch("app.routers.auth.requests") as MockRequests4, \
+     mock.patch("app.routers.auth.settings") as MockSettings4:
+    MockSettings4.revenuecat_secret_api_key = "sk_test"
+    MockRequests4.get.return_value.raise_for_status = lambda: None
+    MockRequests4.get.return_value.json.return_value = {
+        "subscriber": {"entitlements": {"Nibbler Pro": {
+            "expires_date": (NOW + datetime.timedelta(days=7)).isoformat() + "Z",
+            "product_identifier": "nibbler_pro_monthly",
+        }}}
+    }
+    auth_router.sync_premium(current_user=u_j4, db=db)
+u_j4 = refresh(u_j4)
+check("sync-premium's paid write doesn't clobber the pre-existing comp, byte-for-byte unchanged",
+      u_j4.complimentary_until == comp_before_sync, (u_j4.complimentary_until, comp_before_sync))
+check("sync-premium wrote its own paid_premium_until, earlier than the 90-day comp",
+      u_j4.paid_premium_until is not None and u_j4.paid_premium_until < u_j4.complimentary_until)
+check("premium_until reflects the later (comp) of the two",
+      u_j4.premium_until == u_j4.complimentary_until, (u_j4.premium_until, u_j4.complimentary_until))
+
+
+# ═══════════════════════════════════════════════════════════════════════
 print(f"\n{'='*60}")
 if failures:
     print(f"FAILED: {len(failures)} check(s) — {failures}")

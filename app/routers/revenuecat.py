@@ -172,17 +172,18 @@ def revenuecat_webhook(
                 # RC's "Lifetime" duration carries no expiration_at_ms at
                 # all — this IS the permanent-comp case, not a missing field.
                 user.is_premium = True
-                user.premium_until = None
+                user.complimentary_until = None
             else:
                 user.is_premium = False
-                user.premium_until = expires
+                user.complimentary_until = expires
         else:
             user.entitlement_source = "paid"
             user.has_held_paid_entitlement = True
-            user.premium_until = expires
+            user.paid_premium_until = expires
             # Never touch is_premium here — it stays reserved for comps;
-            # a real subscription's access lives entirely in premium_until.
+            # a real subscription's access lives entirely in paid_premium_until.
 
+        user.recompute_premium_until()
         user.premium_synced_at = datetime.utcnow()
         _stamp_processed(user, event)
         db.commit()
@@ -196,31 +197,45 @@ def revenuecat_webhook(
     # it: a set-but-past premium_until is how effective_premium recognises
     # a LAPSED subscriber, who must land on the free tier rather than back
     # in the signup trial.
-    user.premium_until = _ms_to_naive_utc(event.get("expiration_at_ms")) or datetime.utcnow()
-
-    # Audit finding (Aug 2026): an account CAN hold two independently-
+    #
+    # Audit finding (Aug 2026, fixed): an account CAN hold two independently-
     # sourced grants at once — e.g. a beta tester given a lifetime comp who
     # later, separately, becomes a real paying subscriber (the grant branch
     # above deliberately never touches is_premium for a real purchase, so
-    # both signals coexist on the same row). Unconditionally clearing
-    # is_premium/entitlement_source on EVERY expiration would silently
-    # revoke a still-valid comp whenever an unrelated real subscription
-    # lapses. Only clear the comp signal when THIS expiration is actually
-    # about the promotional grant — either the event itself says so, or (as
-    # a defensive fallback, in case store is ever absent on an EXPIRATION
-    # payload) the account's currently-recorded active source already is
-    # 'complimentary'.
+    # both signals coexist on the same row). The OLD code wrote the single
+    # shared premium_until UNCONDITIONALLY here, before the source check
+    # below even ran — so an unrelated source's expiration silently
+    # clobbered the other's still-valid expiry (or falsely resurrected a
+    # correctly-lapsed one via the `or datetime.utcnow()` fallback). Each
+    # source's expiry now lands ONLY in that source's own column; only
+    # clear/expire the signal when THIS expiration is actually about that
+    # grant — either the event itself says so, or (as a defensive fallback,
+    # in case store is ever absent on an EXPIRATION payload) the account's
+    # currently-recorded active source already names it.
+    expiry_ts = _ms_to_naive_utc(event.get("expiration_at_ms")) or datetime.utcnow()
     ends_the_comp = event.get("store") == PROMOTIONAL_STORE or user.entitlement_source == "complimentary"
     if ends_the_comp:
         user.is_premium = False  # clears a revoked LIFETIME promotional grant too
+        user.complimentary_until = expiry_ts
         user.entitlement_source = None
     elif user.entitlement_source == "paid":
         # The real subscription that just lapsed IS what entitlement_source
         # currently names — clear it, but leave is_premium untouched (it
         # was never this event's concern to begin with).
+        user.paid_premium_until = expiry_ts
         user.entitlement_source = None
-    # else: entitlement_source already reflects neither — nothing to clear.
+    else:
+        # entitlement_source already reflects neither known source (e.g. a
+        # stale/already-cleared row) — best-effort record against whichever
+        # column the event's own store says, so the expiry isn't dropped
+        # silently. Falls back to paid, matching this branch's pre-existing
+        # "not promotional" assumption.
+        if event.get("store") == PROMOTIONAL_STORE:
+            user.complimentary_until = expiry_ts
+        else:
+            user.paid_premium_until = expiry_ts
 
+    user.recompute_premium_until()
     user.premium_synced_at = datetime.utcnow()
     _stamp_processed(user, event)
     db.commit()

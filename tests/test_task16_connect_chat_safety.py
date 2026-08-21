@@ -377,6 +377,154 @@ check("no ChatTurn row was ever created for the refused request",
       refresh_turn("turn_k1", "t16_k") is None)
 
 
+# ═══════════════════════════════════════════════════════════════════════
+section("L — audit fix: a turn id reused with DIFFERENT question text is a "
+        "conflict, never a replay or a silent overwrite")
+# ═══════════════════════════════════════════════════════════════════════
+u_l = mkuser("t16_l")
+mkitem("t16_item_l", "t16_l")
+as_user("t16_l")
+
+with mock.patch("app.routers.connect.LLMService") as MockLLMl1, \
+     mock.patch("app.routers.connect.EmbeddingService") as MockEmbedl1:
+    MockEmbedl1.return_value.search_item.return_value = ["excerpt"]
+    MockLLMl1.return_value.chat_with_book.return_value = "Answer to the FIRST question."
+    r1 = c.post("/connect/chat", json=chat_payload("t16_item_l", "What is chapter 1 about?", turn_id="turn_l1"))
+check("setup: first question completes normally", r1.status_code == 200, f"{r1.status_code} {r1.text[:150]}")
+
+# Same turn id, DIFFERENT text — must be refused as a conflict, never
+# silently replay the first answer (which would be wrong for this question)
+# nor overwrite the stored question (which would corrupt a still-in-flight
+# duplicate's eventual completion).
+with mock.patch("app.routers.connect.LLMService") as MockLLMl2, \
+     mock.patch("app.routers.connect.EmbeddingService") as MockEmbedl2:
+    MockLLMl2.return_value.chat_with_book.return_value = "THIS MUST NEVER BE RETURNED"
+    r2 = c.post("/connect/chat", json=chat_payload("t16_item_l", "What is chapter 2 about?", turn_id="turn_l1"))
+check("reusing a turn id against DIFFERENT question text is refused (409 chat_turn_conflict), "
+      "not replayed as the first question's answer",
+      r2.status_code == 409 and r2.json().get("detail", {}).get("code") == "chat_turn_conflict",
+      f"{r2.status_code} {r2.text[:150]}")
+check("the conflict message correctly names the QUESTION mismatch, not the book",
+      "question" in r2.json().get("detail", {}).get("message", "").lower())
+check("no LLM call was made for the conflicting request", MockLLMl2.return_value.chat_with_book.call_count == 0)
+check("the original turn's stored question/reply are untouched by the conflicting attempt",
+      refresh_turn("turn_l1", "t16_l").question == "What is chapter 1 about?"
+      and refresh_turn("turn_l1", "t16_l").reply == "Answer to the FIRST question.")
+
+# The mirror case: the SAME text reused for the SAME turn id is still a
+# normal, honest replay — the fix must not have made retries stricter than
+# they were before for the actually-legitimate case.
+with mock.patch("app.routers.connect.LLMService") as MockLLMl3, \
+     mock.patch("app.routers.connect.EmbeddingService") as MockEmbedl3:
+    MockLLMl3.return_value.chat_with_book.return_value = "SHOULD NEVER BE CALLED"
+    r3 = c.post("/connect/chat", json=chat_payload("t16_item_l", "What is chapter 1 about?", turn_id="turn_l1"))
+check("the SAME turn id with the SAME text is still a normal cache replay (unaffected by the fix)",
+      r3.status_code == 200 and r3.json().get("reply") == "Answer to the FIRST question.",
+      f"{r3.status_code} {r3.text[:150]}")
+check("...with zero LLM calls, exactly like before this fix", MockLLMl3.return_value.chat_with_book.call_count == 0)
+
+# A failed turn retried with different text is ALSO a conflict, not a
+# silent re-open with the new (wrong) question overwriting the old one.
+with mock.patch("app.routers.connect.LLMService") as MockLLMl4, \
+     mock.patch("app.routers.connect.EmbeddingService") as MockEmbedl4:
+    MockEmbedl4.return_value.search_item.return_value = ["excerpt"]
+    MockLLMl4.return_value.chat_with_book.side_effect = RuntimeError("boom")
+    c.post("/connect/chat", json=chat_payload("t16_item_l", "A question that will fail", turn_id="turn_l2"))
+check("setup: turn_l2 is durably 'failed'", refresh_turn("turn_l2", "t16_l").status == "failed")
+with mock.patch("app.routers.connect.LLMService") as MockLLMl5, \
+     mock.patch("app.routers.connect.EmbeddingService") as MockEmbedl5:
+    r5 = c.post("/connect/chat", json=chat_payload("t16_item_l", "A DIFFERENT question entirely", turn_id="turn_l2"))
+check("retrying a FAILED turn with different text is ALSO refused as a conflict, not silently re-opened",
+      r5.status_code == 409 and r5.json().get("detail", {}).get("code") == "chat_turn_conflict",
+      f"{r5.status_code} {r5.text[:150]}")
+check("the original (failed) question text is untouched",
+      refresh_turn("turn_l2", "t16_l").question == "A question that will fail")
+
+
+# ═══════════════════════════════════════════════════════════════════════
+section("M — audit fix: the lease is renewed by a background heartbeat while "
+        "the worker is genuinely still blocked inside the LLM call")
+# ═══════════════════════════════════════════════════════════════════════
+u_m = mkuser("t16_m")
+mkitem("t16_item_m", "t16_m")
+as_user("t16_m")
+
+import time as _time
+from app.rate_limit import limiter as _limiter
+
+# This file makes 20+ real /connect/chat calls across every section above,
+# all sharing ONE rate-limit bucket (the test harness's dependency override
+# bypasses the real auth middleware that would key requests per-user, so
+# every call here falls back to the shared test-client IP) — section M's
+# extra calls would otherwise trip the real 20/hour production limit
+# entirely as a test-harness artifact, unrelated to the heartbeat fix being
+# proven here. Disabled for exactly these two requests, restored after.
+_limiter.enabled = False
+
+with mock.patch("app.routers.connect._CHAT_HEARTBEAT_INTERVAL_SECONDS", 0.05), \
+     mock.patch("app.routers.connect.LLMService") as MockLLMm, \
+     mock.patch("app.routers.connect.EmbeddingService") as MockEmbedm:
+    MockEmbedm.return_value.search_item.return_value = ["excerpt"]
+
+    captured = {"claimed_until_during_call": None}
+
+    def slow_chat(*a, **kw):
+        # Simulate a genuinely long-running generation — long enough for
+        # several heartbeat ticks (interval patched to 50ms above) to have
+        # fired before this returns. Read the row's OWN lease mid-call
+        # through an independent session (matching the heartbeat's own
+        # pattern), proving it was actually extended DURING the call, not
+        # just left at its original claim-time value.
+        _time.sleep(0.3)
+        from app.database import SessionLocal as _SL
+        _db2 = _SL()
+        try:
+            row = _db2.query(ChatTurn).filter(ChatTurn.turn_id == "turn_m1", ChatTurn.user_id == "t16_m").first()
+            captured["claimed_until_during_call"] = row.claimed_until
+        finally:
+            _db2.close()
+        return "Answer after a long generation."
+
+    MockLLMm.return_value.chat_with_book.side_effect = slow_chat
+    before_call = _dt.datetime.utcnow()
+    r = c.post("/connect/chat", json=chat_payload("t16_item_m", "a slow question", turn_id="turn_m1"))
+
+check("the slow request still completes successfully", r.status_code == 200, f"{r.status_code} {r.text[:150]}")
+check("the lease seen MID-CALL was extended well past the original 3-minute claim-time window relative to "
+      "when the call started — proof the heartbeat actually ran and renewed it, not just a static claim",
+      captured["claimed_until_during_call"] is not None
+      and captured["claimed_until_during_call"] > before_call + _dt.timedelta(minutes=2, seconds=55),
+      captured["claimed_until_during_call"])
+check("after completion the turn is 'completed' — the heartbeat stopped cleanly and did not "
+      "interfere with the final write", refresh_turn("turn_m1", "t16_m").status == "completed")
+
+# The heartbeat must also stop (not leak/keep renewing) after a FAILED
+# generation — otherwise a dead-lease scenario could never self-heal.
+with mock.patch("app.routers.connect._CHAT_HEARTBEAT_INTERVAL_SECONDS", 0.05), \
+     mock.patch("app.routers.connect.LLMService") as MockLLMm2, \
+     mock.patch("app.routers.connect.EmbeddingService") as MockEmbedm2:
+    MockEmbedm2.return_value.search_item.return_value = ["excerpt"]
+
+    def slow_fail(*a, **kw):
+        _time.sleep(0.2)
+        raise RuntimeError("boom after a slow start")
+    MockLLMm2.return_value.chat_with_book.side_effect = slow_fail
+    r2 = c.post("/connect/chat", json=chat_payload("t16_item_m", "a slow failing question", turn_id="turn_m2"))
+
+check("a slow-then-failed generation still reports the safe generic failure",
+      r2.status_code == 502 and r2.json().get("detail", {}).get("code") == "generation_failed",
+      f"{r2.status_code} {r2.text[:150]}")
+check("the turn is durably 'failed' — the heartbeat's stop() ran before _fail_chat_turn, "
+      "no leaked renewal thread fighting the failure write",
+      refresh_turn("turn_m2", "t16_m").status == "failed")
+# Give any leaked thread a moment to prove it does NOT keep renewing —
+# if stop() genuinely joined it, this sleep should see no further change.
+_time.sleep(0.2)
+check("no leaked heartbeat thread renewed the lease again after the turn was already marked failed",
+      refresh_turn("turn_m2", "t16_m").status == "failed")
+_limiter.enabled = True
+
+
 print("\n" + "=" * 62)
 if failures:
     print(f"RESULT: {len(failures)} FAILURE(S): {failures}")

@@ -100,10 +100,16 @@ def sync_premium(
         # premium_until, and the webhook remains authoritative for the
         # is_premium/lifetime distinction, which it can actually observe.
         is_promotional = str(entitlement.get("product_identifier") or "").startswith("rc_promo_")
-        current_user.premium_until = expires
-        current_user.entitlement_source = "complimentary" if is_promotional else "paid"
-        if not is_promotional:
+        # Task 8 fix: source-specific column, matching the webhook's own
+        # split — writing the shared premium_until directly here had the
+        # exact same cross-source clobber bug as the webhook did.
+        if is_promotional:
+            current_user.complimentary_until = expires
+        else:
+            current_user.paid_premium_until = expires
             current_user.has_held_paid_entitlement = True
+        current_user.entitlement_source = "complimentary" if is_promotional else "paid"
+        current_user.recompute_premium_until()
         current_user.premium_synced_at = datetime.utcnow()
     # No entitlement in the payload → leave premium_until untouched. RevenueCat
     # keeps expired entitlements in the subscriber object, so "missing" means
