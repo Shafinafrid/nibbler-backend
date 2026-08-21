@@ -43,6 +43,19 @@ settings = get_settings()
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 SHEETS = "https://sheets.googleapis.com/v4"
 
+
+def _fmt_dt(dt: Optional[datetime.datetime]) -> str:
+    """Audit fix: raw .isoformat() (e.g. '2026-08-21T23:07:10.760322') is
+    hard to read at a glance in the Sheet and needed manual reformatting
+    every time. All timestamp columns now write this same human format —
+    'M/D/YYYY H:MM:SS' (no leading zeros, matches how Shafin reads the
+    sheet day-to-day), microseconds dropped as pure noise for an ops log.
+    Written via RAW valueInputOption (see _write_row), so this is a plain
+    string — Sheets will not silently reinterpret/reformat it."""
+    if not dt:
+        return ""
+    return f"{dt.month}/{dt.day}/{dt.year} {dt.hour}:{dt.minute:02d}:{dt.second:02d}"
+
 DELETION_LOG_COLUMNS = [
     "Deletion Request ID", "Requested At", "User Email", "Firebase UID",
     "Plan", "Status", "Deletion Started At", "Deletion Completed At",
@@ -186,13 +199,13 @@ def deletion_log_row_values(erasure, snapshot: dict) -> list:
     progress = erasure.progress or {}
     return [
         erasure.id,
-        (erasure.requested_at.isoformat() if erasure.requested_at else ""),
+        _fmt_dt(erasure.requested_at),
         snapshot.get("email", ""),
         snapshot.get("firebase_uid", ""),
         snapshot.get("plan", ""),
         erasure.state,
-        (erasure.deletion_started_at.isoformat() if erasure.deletion_started_at else ""),
-        (erasure.deletion_completed_at.isoformat() if erasure.deletion_completed_at else ""),
+        _fmt_dt(erasure.deletion_started_at),
+        _fmt_dt(erasure.deletion_completed_at),
         # Audit finding: this must mean what its header says — the user row
         # is ACTUALLY gone — not a partial AND of unrelated classes that
         # could be True while Firebase/RevenueCat/Mixpanel/vectors are
@@ -209,7 +222,7 @@ def deletion_log_row_values(erasure, snapshot: dict) -> list:
         erasure.retry_count or 0,
         ", ".join(k for k, v in progress.items() if not v) if progress else "",
         "yes" if (erasure.state == "failed" and (erasure.retry_count or 0) >= 5) else "",
-        (erasure.personal_data_redacted_at.isoformat() if erasure.personal_data_redacted_at else ""),
+        _fmt_dt(erasure.personal_data_redacted_at),
     ]
 
 
@@ -230,7 +243,7 @@ def snapshot_row_values(erasure, snapshot: dict) -> list:
     # support lookups — see deletion_log_row_values' docstring above.
     return [
         erasure.id,
-        (erasure.requested_at.isoformat() if erasure.requested_at else ""),
+        _fmt_dt(erasure.requested_at),
         snapshot.get("email", ""),
         snapshot.get("firebase_uid", ""),
         snapshot.get("created_at_iso", ""),
@@ -406,7 +419,7 @@ def connection_test(write_marker: bool = False) -> tuple:
             if not write_marker:
                 return True, detail
             row = _next_empty_row(client, headers, sheet_id, settings.account_deletion_sheet_tab)
-            marker = ["CONNECTION-TEST", datetime.datetime.utcnow().isoformat(), "", "", "", "test", *([""] * 14)]
+            marker = ["CONNECTION-TEST", _fmt_dt(datetime.datetime.utcnow()), "", "", "", "test", *([""] * 14)]
             _write_row(client, headers, sheet_id, settings.account_deletion_sheet_tab,
                        row, _DELETION_LOG_LAST_COL, marker)
             return True, f"{detail} wrote row {row}"
