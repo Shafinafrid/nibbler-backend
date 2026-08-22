@@ -32,15 +32,34 @@ from app.middleware.auth import get_current_user
 from app.models.user import User
 from app.models.library import LibraryItem
 from app.models.bite import DailyBite
-from app.models.user_data import ChatTurn
+from app.models.user_data import ChatTurn, ChatContextChunk
 from app.rate_limit import limiter
-from app.services.llm import LLMService
+from app.services.llm import LLMService, CONNECT_MAX_TOKENS, CONNECT_BROAD_MAX_TOKENS
 from app.services.embedding_service import EmbeddingService, EmbeddingError
 from app.services import mixpanel_service
 from app.services.entitlement_service import is_source_unlocked
+from app.services.connect_retrieval import (
+    expand_query, is_broad_coverage_question, salient_terms,
+)
 
 router = APIRouter(prefix="/connect", tags=["connect"])
 logger = logging.getLogger(__name__)
+
+# ── Retrieval tuning for POST /connect/chat (Aug 2026 retrieval-memory fix) ─
+# Default top_k for a normal turn's own fresh vector search — unchanged from
+# before this fix; what changed is that this is no longer the ONLY thing the
+# model sees (see _gather_chat_excerpts below).
+CHAT_DEFAULT_TOP_K = 8
+# Broad/"everything about X" turns search harder: more neighbours per query,
+# across multiple query variants (see connect_retrieval.is_broad_coverage_question).
+CHAT_BROAD_TOP_K = 24
+# Ceiling on how many chunks (this turn's + everything accumulated so far in
+# the conversation) get sent to the model. Keeps a long-running chat from
+# silently growing past what the LLM's token budget can hold — CONNECT_MAX_TOKENS
+# governs the reply, this governs the input. Bounded generously above the
+# default top_k (8) since the whole point of this fix is carrying PRIOR turns'
+# chunks forward, not just this turn's.
+CHAT_MAX_CONTEXT_CHUNKS = 40
 
 # ── Chat-turn idempotency (Task 16, Aug 2026) ───────────────────────────────
 # 3 minutes is a deliberately generous upper bound on a single chat
@@ -397,6 +416,123 @@ def _get_item(item_id: str, user: User, db: Session) -> LibraryItem:
     return item
 
 
+class _ChatExcerpts:
+    """Result of `_gather_chat_excerpts` — `excerpts` for the model, and
+    `broad` (whether this turn was treated as broad-coverage) so the caller
+    can pick the matching reply token budget WITHOUT recomputing
+    is_broad_coverage_question itself (which would risk drifting from the
+    decision this function actually made, e.g. if a future change here adds
+    another condition for `broad` that a duplicate check elsewhere misses)."""
+    def __init__(self, excerpts: List[str], broad: bool):
+        self.excerpts = excerpts
+        self.broad = broad
+
+
+def _gather_chat_excerpts(
+    db: Session,
+    embeddings: EmbeddingService,
+    user: User,
+    item: LibraryItem,
+    message: str,
+    history: List[dict],
+) -> _ChatExcerpts:
+    """The retrieval-memory fix (Aug 2026): what the model sees for THIS
+    turn is the union of (a) a fresh search for this turn, run against an
+    EXPANDED query so a vague follow-up doesn't search for nothing, (b) a
+    keyword pass so an exact topic phrase can't be missed by embedding
+    drift alone, and (c) every chunk this (user, book) conversation has
+    EVER surfaced before — persisted in `chat_context_chunks`. (a)+(b) are
+    also persisted for next time. This is what stops the model from
+    denying content it correctly cited one turn earlier: once a chunk has
+    been shown, it stays in context for the rest of the conversation.
+    """
+    query = expand_query(message, history)
+    # Broad on the RAW message ("tell me everything about X") or on the
+    # EXPANDED query (a vague "is that all?" substituted with a prior
+    # question that was itself broad) — either means this turn should
+    # search wider. A vague message alone is never broad by itself (see
+    # is_broad_coverage_question's own docstring) so this can't double-count
+    # vagueness as breadth.
+    broad = is_broad_coverage_question(message) or is_broad_coverage_question(query)
+    top_k = CHAT_BROAD_TOP_K if broad else CHAT_DEFAULT_TOP_K
+
+    # Vector search: the expanded query, plus — on a broad-coverage turn —
+    # the raw message too (it can surface neighbours the expanded query's
+    # narrower phrasing misses, e.g. "is that all" alone sometimes still
+    # matches summary/overview chunks the substituted prior question doesn't).
+    queries = [query] if query == message or not broad else [query, message]
+    fresh: "dict[int, str]" = {}
+    for q in queries:
+        try:
+            results = embeddings.search_item_fresh(
+                query=q, user_id=user.id, item_id=item.id, top_k=top_k,
+            )
+        except EmbeddingError:
+            results = []  # Voyage hiccup on this query — the other query/keyword pass may still help
+        for r in results:
+            idx = r.get("chunk_index")
+            text = r.get("text")
+            if idx is not None and text:
+                fresh[idx] = text
+
+    # Keyword fallback net — only worth the re-chunk cost on a genuinely
+    # named topic; a purely stylistic/vague message has no salient terms
+    # (connect_retrieval.salient_terms returns []) and this is a no-op.
+    if item.content:
+        for idx in embeddings.keyword_search_item(salient_terms(query), item.content):
+            if idx not in fresh:
+                # Keyword hits don't carry text from this pass (re-chunking
+                # only, no Pinecone round trip) — fetched below alongside
+                # persisted memory so there's exactly one fetch path.
+                fresh[idx] = None
+
+    # Persisted conversation memory — every chunk this (user, book) chat has
+    # ever surfaced, independent of what THIS turn's search returned.
+    persisted_rows = (
+        db.query(ChatContextChunk.chunk_index)
+        .filter(ChatContextChunk.user_id == user.id, ChatContextChunk.book_id == item.id)
+        .all()
+    )
+    persisted_indexes = {row[0] for row in persisted_rows}
+
+    # New indexes this turn contributed (vector + keyword) — persist them so
+    # future turns inherit them too, even if this turn's context budget below
+    # ends up dropping some for THIS reply.
+    new_indexes = set(fresh.keys()) - persisted_indexes
+    for idx in new_indexes:
+        db.add(ChatContextChunk(user_id=user.id, book_id=item.id, chunk_index=idx))
+    if new_indexes:
+        try:
+            db.commit()
+        except IntegrityError:
+            # Two near-simultaneous turns surfacing the same new chunk for
+            # the first time — harmless, the unique constraint is exactly
+            # what should win this race; just don't fail the chat over it.
+            db.rollback()
+
+    # Resolve text for any index still missing it (keyword hits, and any
+    # persisted index not already in `fresh` from this turn's own search).
+    need_text = [idx for idx, text in fresh.items() if text is None]
+    need_text += [idx for idx in persisted_indexes if idx not in fresh]
+    if need_text:
+        fetched = embeddings.fetch_chunks_by_index(item.id, user.id, need_text)
+        for idx, text in fetched.items():
+            fresh[idx] = text
+
+    all_chunks = {idx: text for idx, text in fresh.items() if text}
+
+    # Budget: this turn's own fresh hits always win a slot (they're what the
+    # CURRENT question needs); older accumulated chunks fill the remainder,
+    # most-recently-surfaced first, so a very long conversation degrades by
+    # dropping its OLDEST context rather than its newest.
+    fresh_this_turn = [idx for idx in all_chunks if idx not in persisted_indexes or idx in new_indexes]
+    remainder = [idx for idx in all_chunks if idx not in fresh_this_turn]
+    ordered = fresh_this_turn + remainder
+    kept = ordered[:CHAT_MAX_CONTEXT_CHUNKS]
+    kept_sorted = sorted(kept)  # book order reads more coherently than relevance order
+    return _ChatExcerpts(excerpts=[all_chunks[idx] for idx in kept_sorted], broad=broad)
+
+
 @router.post("/insights", response_model=InsightsResponse)
 @limiter.limit("30/hour")
 def get_insights(
@@ -584,20 +720,17 @@ def chat(
     worker_id = claim.worker_id
 
     embeddings = EmbeddingService()
-    try:
-        excerpts = embeddings.search_item(
-            query=message, user_id=current_user.id, item_id=item.id, top_k=8,
-        )
-    except EmbeddingError:
-        excerpts = []  # Voyage hiccup — fall through to the raw-text fallback
+    gathered = _gather_chat_excerpts(db, embeddings, current_user, item, message, data.history)
+    excerpts = gathered.excerpts
     if not excerpts and item.content:
-        excerpts = [item.content[:8000]]
+        excerpts = [item.content[:8000]]  # Voyage/Pinecone hiccup — raw-text fallback, as before
     if not excerpts:
         no_content_msg = "No indexed content found for this book."
         _fail_chat_turn(db, turn_id, current_user.id, worker_id, "no_content", no_content_msg)
         raise HTTPException(status_code=422, detail={"code": "no_content", "message": no_content_msg})
 
     llm = LLMService()
+    reply_token_budget = CONNECT_BROAD_MAX_TOKENS if gathered.broad else CONNECT_MAX_TOKENS
     # Task 16 audit fix: keep the lease alive for as long as this worker is
     # genuinely still blocked inside the LLM call — see _ChatTurnHeartbeat's
     # own docstring for why a fixed lease alone let a legitimately-slow
@@ -611,6 +744,7 @@ def chat(
             excerpts=excerpts,
             history=data.history,
             message=message,
+            max_visible_tokens=reply_token_budget,
         )
     except Exception:
         # Never leak the raw exception to the client (provider internals,

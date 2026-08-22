@@ -393,6 +393,75 @@ class EmbeddingService:
             print(f"[EmbeddingService] fetch_chunks error: {e}")
             return []
 
+    # Re-chunking a whole book on a live request is cheap but not free —
+    # this ceiling bounds it on a very large book, same rationale as MAX_EXCLUDE
+    # above but for a different cost (CPU re-chunking, not a filter payload size).
+    MAX_KEYWORD_SCAN_CHUNKS = 400
+
+    def keyword_search_item(self, terms: List[str], item_content: str) -> List[int]:
+        """Chunk-index list of chunks whose text contains at least one of
+        `terms`, verbatim (case-insensitive). Connect chat's lexical fallback
+        net (connect_retrieval.salient_terms picks `terms`), so a named topic
+        phrase can't be missed purely because of embedding drift.
+
+        Re-chunks `item_content` with the exact same deterministic
+        `_chunk_text` used by `index_text` at ingestion (same tokenizer, same
+        size/overlap), so the indexes returned line up with the `chunk_index`
+        already stamped on every Pinecone vector — no character-offset math
+        needed. Deliberately a method on THIS class (not a free function) so
+        it shares `index_text`'s tokenizer dependency and mocking boundary —
+        every existing test already patches `EmbeddingService` wholesale
+        rather than reaching into `_chunk_text` directly, and calling
+        tiktoken from outside this class bypasses that boundary (caught
+        live: it tried a real network fetch for its BPE vocab file under a
+        test harness that blocks outbound connections).
+
+        `MAX_KEYWORD_SCAN_CHUNKS` bounds re-chunking cost on a very large
+        book on a live request path — cheap relative to the LLM call this
+        feeds into, so this is a safety ceiling, not a normal limit.
+        """
+        if not terms or not item_content:
+            return []
+        chunks = _chunk_text(item_content)[:self.MAX_KEYWORD_SCAN_CHUNKS]
+        hits: List[int] = []
+        for idx, chunk in enumerate(chunks):
+            lowered = chunk.lower()
+            if any(term in lowered for term in terms):
+                hits.append(idx)
+        return hits
+
+    def fetch_chunks_by_index(
+        self,
+        item_id: str,
+        user_id: str,
+        chunk_indexes: List[int],
+    ) -> "dict[int, str]":
+        """Fetch an ARBITRARY, possibly non-contiguous set of chunks by
+        index — unlike `fetch_chunks` above (sequential range, for Story
+        mode), this is what Connect chat's accumulated per-conversation
+        chunk memory needs: the indexes it has to re-fetch are whichever
+        chunks were ever surfaced across a conversation, scattered wherever
+        in the book they happened to be. Returns {chunk_index: text}, only
+        for indexes that actually still resolve (a chunk can vanish if the
+        book was re-processed since it was first surfaced)."""
+        if not self.pinecone_available or not chunk_indexes:
+            return {}
+        ids = [f"{item_id}_{i}" for i in chunk_indexes]
+        try:
+            res = self.index.fetch(ids=ids, namespace=user_id)
+            vectors = getattr(res, "vectors", None) or {}
+            out = {}
+            for idx, vid in zip(chunk_indexes, ids):
+                v = vectors.get(vid)
+                if v is not None and getattr(v, "metadata", None):
+                    text = v.metadata.get("text", "")
+                    if text:
+                        out[idx] = text
+            return out
+        except Exception as e:
+            print(f"[EmbeddingService] fetch_chunks_by_index error: {e}")
+            return {}
+
     def delete_item_vectors(self, item_id: str, user_id: str = None, attempt_token: str = None) -> bool:
         """Delete vectors for a given library item. True when it succeeded.
 

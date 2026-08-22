@@ -126,7 +126,7 @@ as_user("t16_a")
 
 with mock.patch("app.routers.connect.LLMService") as MockLLM, \
      mock.patch("app.routers.connect.EmbeddingService") as MockEmbed:
-    MockEmbed.return_value.search_item.return_value = ["an excerpt from the book"]
+    MockEmbed.return_value.search_item_fresh.return_value = [{"text": "an excerpt from the book", "chunk_index": 0}]
     MockLLM.return_value.chat_with_book.return_value = "Here's what the book says."
     r = c.post("/connect/chat", json=chat_payload("t16_item_a", "What is this book about?", turn_id="turn_a1"))
 
@@ -144,7 +144,7 @@ section("B — retrying the SAME turn id after success is a pure cache replay (z
 # ═══════════════════════════════════════════════════════════════════════
 with mock.patch("app.routers.connect.LLMService") as MockLLM2, \
      mock.patch("app.routers.connect.EmbeddingService") as MockEmbed2:
-    MockEmbed2.return_value.search_item.return_value = ["should never be reached"]
+    MockEmbed2.return_value.search_item_fresh.return_value = [{"text": "should never be reached", "chunk_index": 0}]
     MockLLM2.return_value.chat_with_book.return_value = "THIS WOULD BE A SECOND BILLED CALL"
     r = c.post("/connect/chat", json=chat_payload("t16_item_a", "What is this book about?", turn_id="turn_a1"))
 
@@ -153,7 +153,7 @@ check("the retry returns the ORIGINAL cached reply, not a new one",
       r.json().get("reply") == "Here's what the book says.", r.json())
 check("THE LLM WAS NEVER CALLED FOR THE RETRY — the exact money-safety property this task exists for",
       MockLLM2.return_value.chat_with_book.call_count == 0)
-check("embeddings were never even searched for the replay", MockEmbed2.return_value.search_item.call_count == 0)
+check("embeddings were never even searched for the replay", MockEmbed2.return_value.search_item_fresh.call_count == 0)
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -191,7 +191,7 @@ as_user("t16_d")
 
 with mock.patch("app.routers.connect.LLMService") as MockLLM4, \
      mock.patch("app.routers.connect.EmbeddingService") as MockEmbed4:
-    MockEmbed4.return_value.search_item.return_value = ["excerpt"]
+    MockEmbed4.return_value.search_item_fresh.return_value = [{"text": "excerpt", "chunk_index": 0}]
     MockLLM4.return_value.chat_with_book.side_effect = RuntimeError("provider exploded")
     r1 = c.post("/connect/chat", json=chat_payload("t16_item_d", "will this work?", turn_id="turn_d1"))
 
@@ -204,7 +204,7 @@ check("the turn is durably marked 'failed' after the definitive failure",
 
 with mock.patch("app.routers.connect.LLMService") as MockLLM5, \
      mock.patch("app.routers.connect.EmbeddingService") as MockEmbed5:
-    MockEmbed5.return_value.search_item.return_value = ["excerpt"]
+    MockEmbed5.return_value.search_item_fresh.return_value = [{"text": "excerpt", "chunk_index": 0}]
     MockLLM5.return_value.chat_with_book.return_value = "Yes, it works now."
     r2 = c.post("/connect/chat", json=chat_payload("t16_item_d", "will this work?", turn_id="turn_d1"))
 
@@ -233,7 +233,7 @@ db.commit()
 
 with mock.patch("app.routers.connect.LLMService") as MockLLM6, \
      mock.patch("app.routers.connect.EmbeddingService") as MockEmbed6:
-    MockEmbed6.return_value.search_item.return_value = ["excerpt"]
+    MockEmbed6.return_value.search_item_fresh.return_value = [{"text": "excerpt", "chunk_index": 0}]
     MockLLM6.return_value.chat_with_book.return_value = "Yes, still here."
     r = c.post("/connect/chat", json=chat_payload("t16_item_e", "are you still there?", turn_id="turn_e1"))
 
@@ -255,14 +255,14 @@ mkitem("t16_item_f2", "t16_f2")
 as_user("t16_f1")
 with mock.patch("app.routers.connect.LLMService") as MockLLMf1, \
      mock.patch("app.routers.connect.EmbeddingService") as MockEmbedf1:
-    MockEmbedf1.return_value.search_item.return_value = ["excerpt"]
+    MockEmbedf1.return_value.search_item_fresh.return_value = [{"text": "excerpt", "chunk_index": 0}]
     MockLLMf1.return_value.chat_with_book.return_value = "Answer for user F1, private."
     c.post("/connect/chat", json=chat_payload("t16_item_f1", "q", turn_id="shared_turn_id"))
 
 as_user("t16_f2")
 with mock.patch("app.routers.connect.LLMService") as MockLLMf2, \
      mock.patch("app.routers.connect.EmbeddingService") as MockEmbedf2:
-    MockEmbedf2.return_value.search_item.return_value = ["excerpt"]
+    MockEmbedf2.return_value.search_item_fresh.return_value = [{"text": "excerpt", "chunk_index": 0}]
     MockLLMf2.return_value.chat_with_book.return_value = "Answer for user F2, unrelated."
     r_f2 = c.post("/connect/chat", json=chat_payload("t16_item_f2", "q", turn_id="shared_turn_id"))
 
@@ -285,7 +285,7 @@ as_user("t16_g")
 
 with mock.patch("app.routers.connect.LLMService") as MockLLMg, \
      mock.patch("app.routers.connect.EmbeddingService") as MockEmbedg:
-    MockEmbedg.return_value.search_item.return_value = ["excerpt"]
+    MockEmbedg.return_value.search_item_fresh.return_value = [{"text": "excerpt", "chunk_index": 0}]
     MockLLMg.return_value.chat_with_book.return_value = "Works without a turn id too."
     r = c.post("/connect/chat", json=chat_payload("t16_item_g", "hello", turn_id=None))
 
@@ -304,7 +304,7 @@ as_user("t16_h")
 
 with mock.patch("app.routers.connect.LLMService") as MockLLMh, \
      mock.patch("app.routers.connect.EmbeddingService") as MockEmbedh:
-    MockEmbedh.return_value.search_item.return_value = ["excerpt"]
+    MockEmbedh.return_value.search_item_fresh.return_value = [{"text": "excerpt", "chunk_index": 0}]
     MockLLMh.return_value.chat_with_book.return_value = "book 1 answer"
     c.post("/connect/chat", json=chat_payload("t16_item_h1", "q", turn_id="turn_h1"))
 
@@ -328,7 +328,7 @@ as_user("t16_i")
 
 with mock.patch("app.routers.connect.LLMService") as MockLLMi, \
      mock.patch("app.routers.connect.EmbeddingService") as MockEmbedi:
-    MockEmbedi.return_value.search_item.return_value = ["excerpt"]
+    MockEmbedi.return_value.search_item_fresh.return_value = [{"text": "excerpt", "chunk_index": 0}]
     MockLLMi.return_value.chat_with_book.side_effect = RuntimeError(
         "SENSITIVE_PROVIDER_INTERNAL_DETAIL sk-secret-key-1234")
     r = c.post("/connect/chat", json=chat_payload("t16_item_i", "q", turn_id="turn_i1"))
@@ -350,7 +350,7 @@ as_user("t16_j")
 
 with mock.patch("app.routers.connect.LLMService") as MockLLMj, \
      mock.patch("app.routers.connect.EmbeddingService") as MockEmbedj:
-    MockEmbedj.return_value.search_item.return_value = []   # nothing indexed
+    MockEmbedj.return_value.search_item_fresh.return_value = []   # nothing indexed
     r = c.post("/connect/chat", json=chat_payload("t16_item_j", "q", turn_id="turn_j1"))
 
 check("a no-content book is refused (422 no_content)",
@@ -387,7 +387,7 @@ as_user("t16_l")
 
 with mock.patch("app.routers.connect.LLMService") as MockLLMl1, \
      mock.patch("app.routers.connect.EmbeddingService") as MockEmbedl1:
-    MockEmbedl1.return_value.search_item.return_value = ["excerpt"]
+    MockEmbedl1.return_value.search_item_fresh.return_value = [{"text": "excerpt", "chunk_index": 0}]
     MockLLMl1.return_value.chat_with_book.return_value = "Answer to the FIRST question."
     r1 = c.post("/connect/chat", json=chat_payload("t16_item_l", "What is chapter 1 about?", turn_id="turn_l1"))
 check("setup: first question completes normally", r1.status_code == 200, f"{r1.status_code} {r1.text[:150]}")
@@ -427,7 +427,7 @@ check("...with zero LLM calls, exactly like before this fix", MockLLMl3.return_v
 # silent re-open with the new (wrong) question overwriting the old one.
 with mock.patch("app.routers.connect.LLMService") as MockLLMl4, \
      mock.patch("app.routers.connect.EmbeddingService") as MockEmbedl4:
-    MockEmbedl4.return_value.search_item.return_value = ["excerpt"]
+    MockEmbedl4.return_value.search_item_fresh.return_value = [{"text": "excerpt", "chunk_index": 0}]
     MockLLMl4.return_value.chat_with_book.side_effect = RuntimeError("boom")
     c.post("/connect/chat", json=chat_payload("t16_item_l", "A question that will fail", turn_id="turn_l2"))
 check("setup: turn_l2 is durably 'failed'", refresh_turn("turn_l2", "t16_l").status == "failed")
@@ -464,7 +464,7 @@ _limiter.enabled = False
 with mock.patch("app.routers.connect._CHAT_HEARTBEAT_INTERVAL_SECONDS", 0.05), \
      mock.patch("app.routers.connect.LLMService") as MockLLMm, \
      mock.patch("app.routers.connect.EmbeddingService") as MockEmbedm:
-    MockEmbedm.return_value.search_item.return_value = ["excerpt"]
+    MockEmbedm.return_value.search_item_fresh.return_value = [{"text": "excerpt", "chunk_index": 0}]
 
     captured = {"claimed_until_during_call": None}
 
@@ -503,7 +503,7 @@ check("after completion the turn is 'completed' — the heartbeat stopped cleanl
 with mock.patch("app.routers.connect._CHAT_HEARTBEAT_INTERVAL_SECONDS", 0.05), \
      mock.patch("app.routers.connect.LLMService") as MockLLMm2, \
      mock.patch("app.routers.connect.EmbeddingService") as MockEmbedm2:
-    MockEmbedm2.return_value.search_item.return_value = ["excerpt"]
+    MockEmbedm2.return_value.search_item_fresh.return_value = [{"text": "excerpt", "chunk_index": 0}]
 
     def slow_fail(*a, **kw):
         _time.sleep(0.2)

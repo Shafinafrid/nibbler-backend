@@ -74,6 +74,13 @@ __all__ = [
 # and onboarding replies stay exactly as long as they are today.
 ASPIRATION_MAX_TOKENS = 400
 CONNECT_MAX_TOKENS = 600
+# A genuinely broad "everything about X" question needs more than the normal
+# ~150-word reply the system prompt asks for by default — see connect.py's
+# is_broad_coverage_question / _gather_chat_excerpts, which also widens
+# retrieval for these turns. Kept as a distinct constant (not just "always
+# use the bigger budget") so an ordinary short question still gets a short,
+# concise reply rather than the model padding it out to fill more tokens.
+CONNECT_BROAD_MAX_TOKENS = 1400
 STORY_BASE_TOKENS = 300
 STORY_TOKENS_PER_CARD = 40
 WISDOM_BASE_TOKENS = 1500
@@ -217,19 +224,24 @@ class LLMService:
         excerpts: list,
         history: list,
         message: str,
+        max_visible_tokens: int = CONNECT_MAX_TOKENS,
     ) -> str:
         """Grounded chat: Nibbler answers only from this book's excerpts.
 
         Plain text, no schema. The grounding promise lives in the system prompt
         and the fact that the excerpts are the only source material supplied —
         that contract is identical for all three providers.
+
+        `max_visible_tokens` defaults to CONNECT_MAX_TOKENS; connect.py passes
+        CONNECT_BROAD_MAX_TOKENS for a detected "everything about X" question,
+        which also gets more excerpts — a longer answer needs room to use them.
         """
         request = LLMRequest(
             operation=OP_CONNECT,
             system=BOOK_CHAT_SYSTEM,
             context=build_connect_context(book_title, author, excerpts),
             messages=normalize_chat_history(history, message),
-            max_visible_tokens=CONNECT_MAX_TOKENS,
+            max_visible_tokens=max_visible_tokens,
         )
 
         def finalize(result: LLMResult) -> None:
