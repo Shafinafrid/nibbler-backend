@@ -122,7 +122,7 @@ The 5-min on-time passes above (`_prepare_user_nibbles`/`_notify_delivery_slot`/
 - Rate limits (slowapi, in-memory): chat 20/hr, session 30/day, uploads 10-20/hr, interpret-aspiration 10/hr/IP.
 
 ## Canonical product decisions (July 2026 — override older docs)
-- Pricing: **$9.99/mo, $69.99/yr** (correct on all surfaces as of 2026-07-12).
+- Pricing: **$9.99/mo, $99.99/yr** (raised from $69.99, correct on all surfaces as of 2026-08-22).
 - Library model: uploads are **uncapped**; premium users select **up to 5 "active" sources** (`library_items.is_active` + `PATCH /library/{id}/active`, cap enforced server-side).
 - Free tier: 3 uploads, 1 bite/day, 7-day history.
 
