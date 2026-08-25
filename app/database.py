@@ -624,6 +624,15 @@ def _run_migrations():
         # chat / completions — read paths are always scoped to one user+book
         "CREATE INDEX IF NOT EXISTS ix_chat_messages_user_book ON chat_messages (user_id, book_id)",
         "CREATE INDEX IF NOT EXISTS ix_completions_user_book ON completions (user_id, book_id)",
+        # chat_context_chunks — every /connect/chat call reads the full
+        # accumulated set for (user_id, book_id) before retrieval; the
+        # UniqueConstraint on the model already gives Postgres an index
+        # covering (user_id, book_id, chunk_index), but that composite index
+        # is only efficient when queries also filter chunk_index — the read
+        # path here never does, so a plain (user_id, book_id) index is what
+        # actually serves it.
+        "CREATE INDEX IF NOT EXISTS ix_chat_context_chunks_user_book "
+        "ON chat_context_chunks (user_id, book_id)",
         # daily_bites / saved_bites — these were applied to PRODUCTION BY HAND on
         # 2026-07-16 and never declared anywhere in code, so a fresh database
         # (local dev, a restore, a second environment) silently didn't get them —
@@ -714,7 +723,7 @@ def _run_migrations():
 REQUIRED_TABLES = [
     "users", "library_items", "daily_bites", "chat_turns",
     "deleted_library_items", "account_erasures", "cleanup_tasks",
-    "delivery_cycles",
+    "delivery_cycles", "chat_context_chunks",
 ]
 REQUIRED_COLUMNS = [
     ("chat_turns", "turn_id"), ("chat_turns", "status"),
@@ -735,6 +744,7 @@ REQUIRED_COLUMNS = [
     # paths would silently fall back to corrupting the shared premium_until
     # again, exactly the bug this migration exists to close.
     ("users", "paid_premium_until"), ("users", "complimentary_until"),
+    ("chat_context_chunks", "book_id"), ("chat_context_chunks", "chunk_index"),
 ]
 # Postgres only — a named UNIQUE constraint/index is how each of these
 # integrity guarantees is actually enforced by the database, not just
@@ -750,6 +760,7 @@ REQUIRED_PG_CONSTRAINTS = [
     ("saved_bites", "uq_saved_bites_user_bite"),
     ("cleanup_tasks", "uq_cleanup_task_identity_v2"),
     ("delivery_cycles", "uq_delivery_cycle_user_date"),
+    ("chat_context_chunks", "uq_chat_context_chunk"),
 ]
 
 

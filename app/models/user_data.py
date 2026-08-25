@@ -180,6 +180,41 @@ class ChatTurn(Base):
     updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now())
 
 
+class ChatContextChunk(Base):
+    """The set of book chunks already surfaced to the model in one Connect
+    conversation — keyed like ChatMessage, `(user_id, book_id)`, so it
+    naturally spans the whole ongoing chat with that book and resets only
+    when the app starts a fresh conversation with a new book_id.
+
+    Why this exists (Aug 2026): POST /connect/chat used to run retrieval
+    fresh on every turn from ONLY that turn's message text — a follow-up
+    like "is that all?" embeds nothing like the original question, so it
+    pulled a DIFFERENT top-8 and the model would flatly deny content it had
+    correctly cited one turn earlier. Persisting every chunk_index this
+    conversation has ever surfaced, and UNIONing it into every subsequent
+    turn's context (see connect.py), makes what the model can see stable
+    across a conversation instead of re-rolled per message.
+
+    Row-per-chunk, not a JSON blob on ChatMessage/ChatTurn — same reasoning
+    as this module's own note above about upsert-only writes: a chunk is
+    only ever ADDED to a conversation's context, never replaced, so a
+    blob-replace write path isn't needed and a plain INSERT ... ON CONFLICT
+    DO NOTHING per chunk is enough. `chunk_index` is the value Pinecone
+    already stamps on every vector at ingestion (embedding_service.py) —
+    reusing it here means no new identity scheme for "which chunk is this."
+    """
+    __tablename__ = "chat_context_chunks"
+    __table_args__ = (
+        UniqueConstraint("user_id", "book_id", "chunk_index", name="uq_chat_context_chunk"),
+    )
+
+    id = Column(String, primary_key=True, default=_uuid)
+    user_id = Column(String, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    book_id = Column(String, nullable=False, index=True)
+    chunk_index = Column(Integer, nullable=False)
+    first_surfaced_at = Column(DateTime, server_default=func.now())
+
+
 class Completion(Base):
     """One finished reading session. Append-only log; the per-book aggregate
     (how many times, when last) is derived from it."""
