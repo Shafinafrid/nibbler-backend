@@ -32,6 +32,8 @@ OP_ASPIRATION = "aspiration_interpretation"
 OP_WISDOM = "wisdom_session"
 OP_STORY = "story_metadata"
 OP_CONNECT = "connect_chat"
+OP_PERSONALIZATION_QUESTION = "personalization_question"
+OP_PERSONALIZATION_INTERPRET = "personalization_interpret"
 
 
 class Usage:

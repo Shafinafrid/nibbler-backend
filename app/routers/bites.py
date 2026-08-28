@@ -11,11 +11,13 @@ from app.rate_limit import limiter
 from app.models.user import User
 from app.models.bite import DailyBite, SavedBite
 from app.models.library import LibraryItem
+from app.models.personalization import PersonalizationQuestion
 from app.schemas.bite import (
     BiteResponse, SavedBiteResponse, BiteHistoryResponse,
     SessionHistoryItem, SessionHistoryResponse,
 )
 from app.services import mixpanel_service
+from app.services.llm import LLMService
 from app.services.session_service import generate_session_for_item, SessionGenerationError, CARD_TARGETS
 from app.services.entitlement_service import is_source_unlocked
 
@@ -117,6 +119,13 @@ def _cap_message(cap: int, resets_at: datetime) -> str:
 
 
 class SessionProfile(BaseModel):
+    # The LOCAL growth-profile id (ProfileRepository.js) this session is for
+    # — Aug 2026, additive. Threaded through to PersonalizationQuestion.
+    # profile_id so an answer's deltas can be attributed to the profile that
+    # was active at GENERATION time even if the user later switches profiles
+    # before answering. Optional so an older app build (which omits it)
+    # keeps working exactly as before.
+    id: Optional[str] = None
     name: Optional[str] = None
     lifeArea: Optional[str] = None
     aspirationLabel: Optional[str] = None
@@ -361,6 +370,94 @@ def mark_bite_read(
         bite.read_at = datetime.utcnow()
         db.commit()
     return {"ok": True, "read_at": bite.read_at}
+
+
+# ── Dynamic growth-profile personalization (Aug 2026) ───────────────────────
+
+class PersonalizeAnswerRequest(BaseModel):
+    # Mutually exclusive: a listed option's id, OR free text for the
+    # always-present "something else" affordance the app renders client-side
+    # (never LLM-authored — see schemas.py's personalization_option_schema
+    # docstring).
+    option_id: Optional[str] = None
+    free_text: Optional[str] = None
+
+
+class PersonalizeAnswerResponse(BaseModel):
+    tags: List[str]
+    interpreted_summary: Optional[str] = None
+
+
+@router.post("/{bite_id}/personalize-answer", response_model=PersonalizeAnswerResponse)
+@limiter.limit("30/hour")
+def submit_personalize_answer(
+    request: Request,
+    bite_id: str,
+    data: PersonalizeAnswerRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Record the user's answer to a session's personalization card and
+    return the resolved tags for the app to apply locally via
+    ProfileRepository.recordEvent (see profileEvents.js's
+    'personalization_answered' case) — this endpoint never touches
+    Profile.growth_state itself, so there is exactly one write path for the
+    growth profile (the app's own existing debounced PUT /profile/growth
+    push), never a race between two direct writers.
+
+    Idempotent by construction: the PersonalizationQuestion row was created
+    at GENERATION time (session_service._roll_personalization), not here, so
+    a second submit against an already-'answered' row (a retry, or a second
+    device racing the first) returns the SAME resolved tags rather than
+    re-applying or re-interpreting anything.
+    """
+    row = db.query(PersonalizationQuestion).filter(
+        PersonalizationQuestion.daily_bite_id == bite_id,
+        PersonalizationQuestion.user_id == current_user.id,
+    ).first()
+    if not row:
+        raise HTTPException(status_code=404, detail="No personalization question on this session.")
+
+    if row.status == "answered":
+        # Idempotent replay — not an error. Mirrors update_growth_state's own
+        # "a redundant write is a no-op, not a 409" convention.
+        return PersonalizeAnswerResponse(
+            tags=row.applied_tags or [], interpreted_summary=row.interpreted_summary,
+        )
+
+    bite = db.query(DailyBite).filter(DailyBite.id == bite_id, DailyBite.user_id == current_user.id).first()
+    if bite and _bite_source_locked(db, current_user, bite):
+        raise HTTPException(
+            status_code=403,
+            detail={"code": "source_locked", "message": "This source is Premium-only right now."},
+        )
+
+    free_text = (data.free_text or "").strip()
+    interpreted_summary = None
+
+    if data.option_id:
+        options = row.options or []
+        matched = next((o for o in options if o.get("id") == data.option_id or o.get("text") == data.option_id), None)
+        tags = [matched["tag"]] if matched and matched.get("tag") else []
+        row.answer_option_id = data.option_id
+    elif free_text:
+        llm = LLMService()
+        interpreted = llm.interpret_personalization_answer(
+            question=row.question, options=row.options or [], free_text=free_text,
+        )
+        tags = interpreted.get("tags") or []
+        interpreted_summary = interpreted.get("summary")
+        row.answer_free_text = free_text
+    else:
+        raise HTTPException(status_code=422, detail="Provide either option_id or free_text.")
+
+    row.applied_tags = tags
+    row.interpreted_summary = interpreted_summary
+    row.status = "answered"
+    row.answered_at = datetime.utcnow()
+    db.commit()
+
+    return PersonalizeAnswerResponse(tags=tags, interpreted_summary=interpreted_summary)
 
 
 def _bite_to_response(bite: DailyBite, saved_ids: set) -> BiteResponse:

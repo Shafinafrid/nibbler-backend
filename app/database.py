@@ -35,6 +35,7 @@ def create_tables():
     # much later as a 500 on the first /sync call instead of loudly at boot.
     from app.models import (  # noqa
         user, profile, library, bite, streak, push_token, user_data, bug_report, delivery,
+        personalization,
     )
     Base.metadata.create_all(bind=engine)
     _run_migrations()
@@ -723,7 +724,7 @@ def _run_migrations():
 REQUIRED_TABLES = [
     "users", "library_items", "daily_bites", "chat_turns",
     "deleted_library_items", "account_erasures", "cleanup_tasks",
-    "delivery_cycles", "chat_context_chunks",
+    "delivery_cycles", "chat_context_chunks", "personalization_questions",
 ]
 REQUIRED_COLUMNS = [
     ("chat_turns", "turn_id"), ("chat_turns", "status"),
@@ -745,6 +746,11 @@ REQUIRED_COLUMNS = [
     # again, exactly the bug this migration exists to close.
     ("users", "paid_premium_until"), ("users", "complimentary_until"),
     ("chat_context_chunks", "book_id"), ("chat_context_chunks", "chunk_index"),
+    # Personalization questions (Aug 2026) — the answer endpoint's
+    # idempotent-replay guarantee (app/routers/bites.py) depends on this
+    # row existing with these columns; see app/models/personalization.py.
+    ("personalization_questions", "daily_bite_id"), ("personalization_questions", "status"),
+    ("personalization_questions", "user_id"),
 ]
 # Postgres only — a named UNIQUE constraint/index is how each of these
 # integrity guarantees is actually enforced by the database, not just
@@ -761,6 +767,7 @@ REQUIRED_PG_CONSTRAINTS = [
     ("cleanup_tasks", "uq_cleanup_task_identity_v2"),
     ("delivery_cycles", "uq_delivery_cycle_user_date"),
     ("chat_context_chunks", "uq_chat_context_chunk"),
+    ("personalization_questions", "uq_personalization_daily_bite"),
 ]
 
 
