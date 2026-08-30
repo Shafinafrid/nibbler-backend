@@ -27,7 +27,7 @@ from typing import Any, Dict, List, Optional
 
 from .errors import ErrorCategory, ProviderError
 from .jsonschema_lite import schema_errors
-from .schemas import CARD_KINDS
+from .schemas import CARD_KINDS, PERSONALIZATION_TAGS
 
 # Card kinds that may fill the middle of a deck. Hook and summary are pinned to
 # the ends, and the interaction card is requested explicitly, so everything
@@ -125,6 +125,55 @@ def _validate_options(provider: str, options: Any, where: str) -> None:
         _fail(provider, "%s: %d correct options, expected exactly 1" % (where, correct))
 
 
+def _validate_personalize_options(provider: str, options: Any, where: str) -> None:
+    """2-4 personalization options, each with non-empty text and a tag from
+    the fixed PERSONALIZATION_TAGS vocabulary. Unlike quiz options, there is
+    no "exactly one correct" rule — these are preference choices, not a
+    right/wrong quiz — and the tag is what a deterministic, code-owned
+    mapping (PERSONALIZATION_TAG_DELTAS, in profile-delta application code)
+    turns into an actual growth-profile shift, never a number the model
+    invents itself. See schemas.py's personalization_option_schema docstring
+    for why a closed enum matters here."""
+    if not isinstance(options, list) or not (2 <= len(options) <= 4):
+        _fail(provider, "%s: expected 2-4 personalize options, got %s" % (
+            where, len(options) if isinstance(options, list) else type(options).__name__))
+    for opt in options:
+        if not isinstance(opt, dict) or not str(opt.get("text") or "").strip():
+            _fail(provider, "%s: personalize option missing text" % where)
+        if opt.get("tag") not in PERSONALIZATION_TAGS:
+            _fail(provider, "%s: personalize option has unsupported tag %r" % (where, opt.get("tag")))
+
+
+def validate_personalization(
+    question: Dict[str, Any],
+    *,
+    provider: str,
+    source_chunks: Optional[List[str]] = None,
+) -> Dict[str, Any]:
+    """Semantic check for the standalone personalization-question call
+    (generate_personalization_question), BEFORE its result is spliced into
+    the deck-generation prompt (see session_service._roll_personalization).
+    Grounding is checked here, not just left to validate_wisdom's later
+    pass, because this is the call that actually derived the question from
+    the book's excerpts — validate_wisdom's own check on the same
+    `highlight` field afterward is defense in depth against the deck model
+    disobeying the instruction to reproduce it verbatim, not a substitute
+    for checking it at the source."""
+    if not str(question.get("question") or "").strip():
+        _fail(provider, "personalization question is empty")
+    if not str(question.get("eyebrow") or "").strip():
+        _fail(provider, "personalization question missing eyebrow")
+    _validate_personalize_options(provider, question.get("options"), "personalization question")
+
+    quote = str(question.get("highlight") or "").strip()
+    if source_chunks and len(quote) >= MIN_GROUNDED_QUOTE_CHARS:
+        haystack = _normalize_for_grounding("\n".join(source_chunks))
+        if _normalize_for_grounding(quote) not in haystack:
+            _fail(provider, "personalization highlight quote does not appear in the source")
+
+    return question
+
+
 def validate_wisdom(
     session: Dict[str, Any],
     *,
@@ -133,6 +182,7 @@ def validate_wisdom(
     quiz_target: int,
     interaction_kind: str,
     source_chunks: Optional[List[str]] = None,
+    has_personalization: bool = False,
 ) -> Dict[str, Any]:
     """Full semantic check of a Wisdom deck. Returns the session unchanged.
 
@@ -146,6 +196,15 @@ def validate_wisdom(
     out whether it did. A pull-quote is rendered to the user as the book's own
     words, so an invented one is the product's core promise breaking silently —
     and a prompt instruction is not a guarantee.
+
+    `has_personalization` (Aug 2026): true when session_service rolled a
+    dynamic growth-profile question into this deck's card_target. When true,
+    the tail shape gains one more pinned position — [..., interaction_card,
+    "personalize", "summary"] instead of [..., interaction_card, "summary"] —
+    since the personalize card's own question/options were pre-generated and
+    validated separately (see validate_personalization) and are handed to
+    THIS call already spliced into `cards` by the prompt; this function only
+    confirms the deck-generation model actually placed it where asked.
     """
     for key in ("title", "headline", "preview"):
         if not str(session.get(key) or "").strip():
@@ -169,6 +228,8 @@ def validate_wisdom(
             _fail(provider, "card %d has no title" % i)
         if kind == "quiz":
             _validate_options(provider, card.get("options"), "card %d" % i)
+        elif kind == "personalize":
+            _validate_personalize_options(provider, card.get("personalizeOptions"), "card %d" % i)
         elif not str(card.get("body") or "").strip():
             _fail(provider, "card %d (%s) has no body" % (i, kind))
 
@@ -176,11 +237,23 @@ def validate_wisdom(
         _fail(provider, "first card is %r, expected hook" % cards[0].get("kind"))
     if cards[-1].get("kind") != "summary":
         _fail(provider, "last card is %r, expected summary" % cards[-1].get("kind"))
-    if len(cards) >= 3:
-        got = cards[-2].get("kind")
+
+    # tail_offset: how far from the end the interaction card sits. Normally
+    # it's -2 (right before summary); with a personalize card also pinned
+    # to -2, the interaction card is pushed one further back to -3.
+    if has_personalization:
+        if len(cards) < 2 or cards[-2].get("kind") != "personalize":
+            _fail(provider, "expected personalize card at position -2")
+        tail_offset = 3
+    else:
+        tail_offset = 2
+
+    if len(cards) >= tail_offset + 1:
+        interaction_index = -tail_offset
+        got = cards[interaction_index].get("kind")
         if got != interaction_kind:
             _fail(provider, "interaction card is %r, expected %r" % (got, interaction_kind))
-        for i, card in enumerate(cards[1:-2], start=1):
+        for i, card in enumerate(cards[1:interaction_index], start=1):
             if card.get("kind") not in _MIDDLE_KINDS:
                 _fail(provider, "card %d is %r, expected insight" % (i, card.get("kind")))
 

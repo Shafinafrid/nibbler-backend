@@ -9,10 +9,11 @@ from app.models.user_data import (
     Note, Highlight, ChatMessage, ChatTurn, Completion, UserSettings, UserState,
 )
 from app.models.delivery import DeliveryCycle
+from app.models.personalization import PersonalizationQuestion
 
 __all__ = [
     "User", "Profile", "LibraryItem", "DailyBite", "SavedBite", "Streak",
     "PushToken", "BugReport",
     "Note", "Highlight", "ChatMessage", "ChatTurn", "Completion", "UserSettings", "UserState",
-    "DeliveryCycle",
+    "DeliveryCycle", "PersonalizationQuestion",
 ]

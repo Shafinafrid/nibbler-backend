@@ -35,23 +35,34 @@ from .prompts import (
     ASPIRATION_FALLBACK,
     ASPIRATION_SYSTEM,
     BOOK_CHAT_SYSTEM,
+    PERSONALIZATION_INTERPRET_SYSTEM,
+    PERSONALIZATION_SYSTEM,
     SESSION_SYSTEM,
     STORY_SYSTEM,
     build_connect_context,
+    build_personalization_interpret_user_message,
+    build_personalization_user_message,
     build_story_user_message,
     build_wisdom_user_message,
     normalize_chat_history,
     quiz_target_for,
 )
 from .router import LLMConfigError, LLMRouter, validate_llm_settings
-from .schemas import aspiration_schema, story_schema, wisdom_schema
-from .usage import OP_ASPIRATION, OP_CONNECT, OP_STORY, OP_WISDOM, configure_llm_telemetry_logging
+from .schemas import (
+    aspiration_schema, personalization_interpret_schema, personalization_schema,
+    story_schema, wisdom_schema,
+)
+from .usage import (
+    OP_ASPIRATION, OP_CONNECT, OP_PERSONALIZATION_INTERPRET, OP_PERSONALIZATION_QUESTION,
+    OP_STORY, OP_WISDOM, configure_llm_telemetry_logging,
+)
 from .validation import (
     coerce_card_list,
     enforce_schema,
     shuffle_quiz_options,
     validate_aspiration,
     validate_chat_reply,
+    validate_personalization,
     validate_story,
     validate_wisdom,
 )
@@ -87,6 +98,11 @@ WISDOM_BASE_TOKENS = 1500
 WISDOM_TOKENS_PER_CARD = 450          # ~90-160 words of body, plus its JSON
 WISDOM_TOKENS_PER_QUIZ = 120
 WISDOM_MAX_TOKENS_CEILING = 8000
+# Same budget class as ASPIRATION_MAX_TOKENS — both are small, closed-vocabulary
+# structured outputs (a handful of short strings + 2-4 tagged options), not a
+# full card deck.
+PERSONALIZATION_MAX_TOKENS = 400
+PERSONALIZATION_INTERPRET_MAX_TOKENS = 250
 
 
 def wisdom_max_tokens(card_target: int, quiz_target: int) -> int:
@@ -164,6 +180,7 @@ class LLMService:
         card_target: int,
         read_length: int,
         image_options: Optional[str] = None,
+        personalization: Optional[dict] = None,
     ) -> dict:
         """A personalized card deck built only from the user's own excerpts.
 
@@ -172,6 +189,13 @@ class LLMService:
         none. It only changes the prompt and the schema: the ids that come back
         are suggestions, and session_service re-validates every one of them
         against the stored rows before anything reaches a card.
+
+        `personalization` (Aug 2026) is the already-generated, already
+        grounding-validated result of `generate_personalization_question`, or
+        None on an ordinary session. When supplied, the caller (session_service)
+        has ALREADY added 1 to `card_target` to make room for it — this method
+        does not adjust card_target itself, only threads the pinned-card
+        instruction and the ordering rule through to the prompt and validator.
 
         Raises `ProviderError` when no provider produces a valid deck — the
         caller (session_service) turns that into its existing generation
@@ -184,7 +208,7 @@ class LLMService:
         user_message = build_wisdom_user_message(
             book_title=book_title, author=author, profile=profile,
             context_chunks=context_chunks, card_target=card_target,
-            read_length=read_length,
+            read_length=read_length, personalization=personalization,
         )
         if with_images:
             user_message += "\n\n" + image_options
@@ -206,6 +230,7 @@ class LLMService:
                 # The excerpts go in so pull-quotes can be checked against the
                 # book rather than trusted because the prompt asked nicely.
                 source_chunks=context_chunks,
+                has_personalization=bool(personalization),
             )
 
         result = self.router.run(request, finalize)
@@ -214,6 +239,91 @@ class LLMService:
         # BEFORE persisting, so stored decks keep the shape the app expects.
         session["cards"] = coerce_card_list(session.get("cards"))
         return shuffle_quiz_options(session)
+
+    # ── Dynamic growth-profile personalization ──────────────────────────────
+
+    def generate_personalization_question(
+        self,
+        book_title: str,
+        author: Optional[str],
+        profile: dict,
+        context_chunks: List[str],
+    ) -> Optional[dict]:
+        """A grounded preference question drawn from this book's own excerpts.
+
+        Called BEFORE generate_wisdom_session — see session_service's
+        two-call design — so the question's grounding is validated once,
+        against the same excerpts, independently of the deck's own
+        generation. Returns None (never raises) on total provider failure:
+        a personalization card is a bonus, occasional feature, never worth
+        failing — or even delaying — the session itself over.
+        """
+        schema = personalization_schema()
+        user_message = build_personalization_user_message(
+            book_title=book_title, author=author, profile=profile,
+            context_chunks=context_chunks,
+        )
+        request = LLMRequest(
+            operation=OP_PERSONALIZATION_QUESTION,
+            system=PERSONALIZATION_SYSTEM,
+            messages=[{"role": "user", "content": user_message}],
+            max_visible_tokens=PERSONALIZATION_MAX_TOKENS,
+            json_schema=schema,
+            schema_name="personalization_question",
+        )
+
+        def finalize(result: LLMResult) -> None:
+            enforce_schema(result.data or {}, schema, result.provider)
+            validate_personalization(
+                result.data or {}, provider=result.provider,
+                source_chunks=context_chunks,
+            )
+
+        try:
+            result = self.router.run(request, finalize)
+        except ProviderError as e:
+            logger.warning("generate_personalization_question failed (%s/%s) — skipping this session's card",
+                            e.provider, e.category)
+            return None
+        return result.data or None
+
+    def interpret_personalization_answer(
+        self,
+        question: str,
+        options: List[dict],
+        free_text: str,
+    ) -> dict:
+        """Free-text "something else" answer → tags from the same fixed
+        vocabulary the listed options use.
+
+        Never raises — mirrors interpret_aspiration's own contract. A failed
+        interpretation still records the user's own words (the caller
+        persists `free_text` regardless) and simply contributes no profile
+        deltas, which is a safe no-op, never a blocked response.
+        """
+        schema = personalization_interpret_schema()
+        user_message = build_personalization_interpret_user_message(
+            question=question, options=options, free_text=free_text,
+        )
+        request = LLMRequest(
+            operation=OP_PERSONALIZATION_INTERPRET,
+            system=PERSONALIZATION_INTERPRET_SYSTEM,
+            messages=[{"role": "user", "content": user_message}],
+            max_visible_tokens=PERSONALIZATION_INTERPRET_MAX_TOKENS,
+            json_schema=schema,
+            schema_name="personalization_interpretation",
+        )
+
+        def finalize(result: LLMResult) -> None:
+            enforce_schema(result.data or {}, schema, result.provider)
+
+        try:
+            result = self.router.run(request, finalize)
+        except ProviderError as e:
+            logger.warning("interpret_personalization_answer failed (%s/%s) — recording free text with no tags",
+                            e.provider, e.category)
+            return {"tags": [], "summary": free_text[:100]}
+        return result.data or {"tags": [], "summary": free_text[:100]}
 
     # ── Connect chat ─────────────────────────────────────────────────────
 

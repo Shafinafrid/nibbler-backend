@@ -13,7 +13,10 @@ same logical instructions. The split between a stable system block and a
 dynamic user message is deliberate: the stable half is what providers cache.
 """
 
+import json
 from typing import Any, Dict, List, Optional
+
+from .schemas import PERSONALIZATION_TAGS
 
 SESSION_SYSTEM = """You are Nibbler's session engine. You build a daily "nibble session" — a tap-through
 card deck — from excerpts of a book/article the user uploaded, personalized to their growth profile.
@@ -173,6 +176,56 @@ ASPIRATION_FALLBACK = {
 }
 
 
+PERSONALIZATION_SYSTEM = """You are Nibbler's personalization engine. Occasionally, at the end of a nibble
+session, the user is asked ONE grounded preference question drawn from the specific book they're reading —
+not a quiz, not a comprehension check, but a real question about how THEY approach the book's subject.
+
+Example: a user building a "Financial enrichment" growth profile from The Intelligent Investor might be
+asked "Do you actually enjoy spending your weekends digging through spreadsheets to find hidden stock
+gems, or would you rather just set up an automatic investment plan and go enjoy your life?" — a genuine
+trade-off the book itself raises, phrased warmly and specifically, never generic ("what's your learning
+style?" is not acceptable).
+
+Respond ONLY with valid JSON, no markdown fences, matching exactly:
+{
+  "question": "the question, second person, warm, specific to this book's actual content (max 40 words)",
+  "eyebrow": "short label above the question, e.g. 'ONE QUICK QUESTION' or 'GETTING TO KNOW YOU'",
+  "options": [
+    {"text": "one concrete way of being/answering (max 14 words)", "tag": "one tag from the allowed list"},
+    ... 2 to 4 options total ...
+  ],
+  "highlight": "an EXACT pull-quote from the excerpts that inspired this question, or null if none fits"
+}
+
+Rules:
+- The question MUST be grounded in a real tension, theme, or trade-off actually present in the excerpts
+  below — never invent one from the book's general reputation or your own outside knowledge of it.
+- Options must be genuinely different answers a reader could give, not a "correct vs incorrect" pair —
+  this is about preference, not comprehension.
+- Each option's "tag" MUST be exactly one value from the allowed list you are given — never a value
+  outside it, never more than one tag per option.
+- If you use "highlight", reproduce it EXACTLY as it appears in the excerpts — same words, same
+  punctuation. If nothing excerpted is quotable as a clean pull-quote, use null rather than paraphrase.
+- Keep it warm and specific to the user's growth profile and this book — never a generic "how do you
+  like to learn?" question that could apply to any book."""
+
+PERSONALIZATION_INTERPRET_SYSTEM = """You are Nibbler's personalization interpreter. A user was asked a
+preference question at the end of a nibble session, declined every listed option, and wrote their own
+answer instead. Read their free text and map it onto the SAME fixed tag vocabulary the listed options use.
+
+Respond ONLY with valid JSON, no markdown fences, matching exactly:
+{
+  "tags": [ ... 0 to 3 tags from the allowed list that best capture what they said ... ],
+  "summary": "a short, warm, second-person confirmation of what you understood (max 20 words)"
+}
+
+Rules:
+- Only use tags from the allowed list you are given. An answer that doesn't clearly map to any of them
+  should return an empty tags array — never guess or force a fit.
+- "summary" restates their own answer back warmly, e.g. "Got it — you'd rather understand the reasoning
+  behind a decision than just follow a rule." Never invent detail they didn't say."""
+
+
 BOOK_CHAT_SYSTEM = """You are Nibbler, a warm, curious cat companion inside a learning app. The user is
 chatting with ONE book from their own library. You are that book's voice and guide.
 
@@ -213,8 +266,19 @@ def build_wisdom_user_message(
     context_chunks: List[str],
     card_target: int,
     read_length: int,
+    personalization: Optional[Dict[str, Any]] = None,
 ) -> str:
-    """The dynamic half of a Wisdom request: source, profile, targets, excerpts."""
+    """The dynamic half of a Wisdom request: source, profile, targets, excerpts.
+
+    `personalization` (Aug 2026), when supplied, is the ALREADY-generated and
+    grounding-validated result of generate_personalization_question — the
+    deck model is instructed to reproduce it VERBATIM as a pinned card
+    rather than asked to invent its own question. This is deliberate: the
+    question's grounding was checked once, against the same excerpts, by a
+    separate call (validate_personalization); asking the deck model to
+    re-derive or re-word it would reopen exactly the drift/hallucination
+    risk that separate validation pass closed. See session_service's
+    two-call design."""
     quiz_target = quiz_target_for(read_length)
     interaction = {
         "analytical": "a QUIZ card (kind quiz, eyebrow QUICK CHECK)",
@@ -237,6 +301,32 @@ def build_wisdom_user_message(
         "depends": 'they said "depends on the topic" when facing new things',
     }.get(profile.get("confidenceStyle") or "steps", "")
 
+    tail_note = (
+        "Deck structure: hook first, summary last, one interaction card second-to-last, "
+        "all remaining cards are insights."
+    )
+    personalize_block = ""
+    if personalization:
+        pinned_card = {
+            "kind": "personalize",
+            "eyebrow": personalization.get("eyebrow") or "",
+            "title": personalization.get("question") or "",
+            "body": None,
+            "highlight": personalization.get("highlight"),
+            "options": None,
+            "explanation": None,
+            "personalizeOptions": personalization.get("options") or [],
+        }
+        tail_note = (
+            "Deck structure: hook first, summary last, a PERSONALIZE card is the SECOND-TO-LAST card "
+            "(immediately before summary), the interaction card moves one further back to THIRD-from-"
+            "last, all remaining cards are insights."
+        )
+        personalize_block = (
+            "\n\nPINNED PERSONALIZE CARD (reproduce EXACTLY at the position described above — do not "
+            "reword, do not invent a different question):\n" + json.dumps(pinned_card)
+        )
+
     return f"""SOURCE: "{book_title}"{f' by {author}' if author else ''}
 
 GROWTH PROFILE:
@@ -246,12 +336,62 @@ GROWTH PROFILE:
 
 CARD_TARGET: {card_target} cards total ({read_length}-minute read).
 QUIZ_TARGET: {quiz_target} quiz questions.
-Interaction card (second-to-last): {interaction}.
+Interaction card: {interaction}.
+{tail_note}{personalize_block}
 
 SOURCE EXCERPTS (build the session ONLY from these):
 {chr(10).join(f'--- excerpt {i+1} ---{chr(10)}{c}' for i, c in enumerate(context_chunks))}
 
 Build today's session JSON now."""
+
+
+def build_personalization_user_message(
+    *,
+    book_title: str,
+    author: Optional[str],
+    profile: Dict[str, Any],
+    context_chunks: List[str],
+) -> str:
+    """The dynamic half of the standalone personalization-question request."""
+    goal_bits = []
+    if profile.get("aspirationUnderstanding"):
+        goal_bits.append(f'their goal: they want {profile["aspirationUnderstanding"]}')
+    elif profile.get("aspirationLabel"):
+        goal_bits.append(f'their chosen goal: "{profile["aspirationLabel"]}"')
+    if profile.get("lifeArea"):
+        goal_bits.append(f'life area: {profile["lifeArea"]}')
+
+    return f"""SOURCE: "{book_title}"{f' by {author}' if author else ''}
+
+GROWTH PROFILE:
+- {'; '.join(goal_bits) if goal_bits else 'general personal growth'}
+- Interests: {', '.join(profile.get('interests') or [])}
+
+ALLOWED TAGS (each option's "tag" must be exactly one of these): {', '.join(PERSONALIZATION_TAGS)}
+
+SOURCE EXCERPTS (ground the question ONLY in these):
+{chr(10).join(f'--- excerpt {i+1} ---{chr(10)}{c}' for i, c in enumerate(context_chunks))}
+
+Write today's personalization question JSON now."""
+
+
+def build_personalization_interpret_user_message(
+    *,
+    question: str,
+    options: List[Dict[str, Any]],
+    free_text: str,
+) -> str:
+    """The dynamic half of the free-text interpretation request."""
+    options_desc = "; ".join(f'"{o.get("text")}" (tag: {o.get("tag")})' for o in options)
+    return f"""QUESTION ASKED: {question}
+
+LISTED OPTIONS (for context — the user chose NONE of these): {options_desc}
+
+ALLOWED TAGS (each entry in "tags" must be exactly one of these): {', '.join(PERSONALIZATION_TAGS)}
+
+USER'S OWN ANSWER: {free_text}
+
+Return the interpretation JSON now."""
 
 
 def build_story_user_message(

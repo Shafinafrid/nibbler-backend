@@ -11,6 +11,7 @@ suggested status_code) instead of FastAPI HTTPException, so the scheduler can
 use it without a request context.
 """
 
+import random
 import re
 import uuid
 import logging
@@ -22,6 +23,7 @@ from sqlalchemy.exc import IntegrityError
 
 from app.models.bite import DailyBite
 from app.models.library import LibraryItem
+from app.models.personalization import PersonalizationQuestion
 from app.models.user import User
 from app.services.llm import LLMService
 from app.services.embedding_service import EmbeddingService
@@ -34,6 +36,48 @@ logger = logging.getLogger(__name__)
 CARD_TARGETS = {5: 5, 10: 8, 15: 12}
 WISDOM_TOP_K = {5: 6, 10: 10, 15: 14}
 STORY_WORDS = {5: 1100, 10: 2200, 15: 3300}
+
+# ── Dynamic growth-profile personalization (Aug 2026) ───────────────────────
+# Chance any single ELIGIBLE wisdom session also asks a grounded
+# personalization question. Deliberately unseeded/probabilistic per session
+# (not a fixed-N counter, not adaptive to profile confidence) — the founder's
+# own framing was "every once in a while", and replay safety comes from the
+# surrounding DailyBite per-day cache (this function is only ever reached
+# once per (user, item, day) — see generate_session_for_item's docstring),
+# not from the roll itself being deterministic.
+PERSONALIZATION_PROBABILITY = 0.20
+# Below this, the retrieved excerpts are too thin to ground a genuine
+# preference question in the book's actual content, not just its topic.
+PERSONALIZATION_MIN_CHUNK_CHARS = 400
+PERSONALIZATION_MIN_CHUNKS = 3
+
+
+def _roll_personalization(db: Session, user: User, item: LibraryItem, chunks: List[str]) -> bool:
+    """Whether THIS wisdom session should also carry a personalization card.
+
+    Called once per (user, item, day) from inside generate_session_for_item
+    — the SAME function both the on-demand HTTP path and the scheduler's
+    pre-generation path share, so scheduler-delivered nibbles get this
+    feature too, not just on-demand taps. Must be called BEFORE card_target
+    is finalized (the extra card has to be baked into the exact card count
+    the schema enforces, not appended after generation)."""
+    if len(chunks) < PERSONALIZATION_MIN_CHUNKS:
+        return False
+    if sum(len(c) for c in chunks) < PERSONALIZATION_MIN_CHUNK_CHARS:
+        return False
+    # Not the user's first session with this book — a specific, book-grounded
+    # question reads better once the user has actually started the book, and
+    # chunk_ids' progressive-coverage exclusion means session 2+ retrieves a
+    # more book-specific slice than session 1's cold-start query.
+    prior_exists = (
+        db.query(DailyBite.id)
+        .filter(DailyBite.user_id == user.id, DailyBite.library_item_id == item.id)
+        .first()
+        is not None
+    )
+    if not prior_exists:
+        return False
+    return random.random() < PERSONALIZATION_PROBABILITY
 
 
 class SessionGenerationError(Exception):
@@ -280,15 +324,59 @@ def generate_session_for_item(
         # expected outcome — a text-only deck is a correct deck.
         wisdom_candidates = image_select.safe_shortlist(item.images, " ".join(chunks))
 
+        # Dynamic growth-profile personalization (Aug 2026): decided BEFORE
+        # card_target is finalized, and generated in its own call BEFORE the
+        # deck call, so its grounding is validated once against these same
+        # excerpts (see llm.generate_personalization_question) rather than
+        # trusted to the deck model re-deriving it faithfully. `chunk_ids`
+        # here excludes the raw-text fallback (chunk_ids == [] in that case),
+        # which is correct — a personalization question should only ever be
+        # grounded in real retrieved passages, never the 8000-char fallback.
+        personalization_question = None
+        if chunk_ids and _roll_personalization(db, user, item, chunks):
+            personalization_question = llm.generate_personalization_question(
+                book_title=item.title, author=item.author,
+                profile=profile, context_chunks=chunks,
+            )
+            if personalization_question:
+                card_target += 1
+                # Stamp a stable, purely positional id onto each option HERE
+                # — "optN" by array index, never something the model invents
+                # (personalization_option_schema has no id field at all).
+                # This is the id the PersonalizationQuestion row below is
+                # persisted with; the SAME optN-by-position scheme is
+                # re-applied to the deck's returned personalize card further
+                # down (search "Re-stamp the personalize card"), so the two
+                # always agree without depending on the deck model echoing
+                # our request text byte-for-byte.
+                for i, opt in enumerate(personalization_question.get("options") or []):
+                    opt["id"] = f"opt{i}"
+
         try:
             result = llm.generate_wisdom_session(
                 book_title=item.title, author=item.author,
                 profile=profile, context_chunks=chunks,
                 card_target=card_target, read_length=read_length,
                 image_options=image_select.safe_prompt(wisdom_candidates),
+                personalization=personalization_question,
             )
         except Exception as e:
             raise SessionGenerationError(f"Session generation failed: {e}", 502)
+
+        # Re-stamp the personalize card's option ids by POSITION rather than
+        # trusting the deck model to have echoed our pinned JSON's "id"
+        # fields byte-for-byte — matching a strict-schema model's own output
+        # to our request text is not guaranteed character-for-character, and
+        # the answer endpoint's option_id -> tag lookup only needs the id to
+        # be self-consistent with what session_service itself persisted onto
+        # the PersonalizationQuestion row above (same source list, same
+        # order — personalizeOptions is never shuffled, unlike quiz options).
+        if personalization_question:
+            for card in result.get("cards") or []:
+                if isinstance(card, dict) and card.get("kind") == "personalize":
+                    for i, opt in enumerate(card.get("personalizeOptions") or []):
+                        if isinstance(opt, dict):
+                            opt["id"] = f"opt{i}"
 
         # Ownership, book and shortlist membership are all re-checked here from
         # the stored rows — the id came back from a model, so nothing about it
@@ -327,6 +415,22 @@ def generate_session_for_item(
         origin=origin,
     )
     db.add(bite)
+    # Same transaction as the DailyBite insert — if the personalization card
+    # made it into `result["cards"]` above, its question row must exist
+    # atomically with the deck that references it, or a crash between the
+    # two would leave a deck the answer endpoint can never find a row for.
+    # `daily_bite_id` is unique (PersonalizationQuestion.__table_args__), so
+    # this can never create two rows for one bite.
+    if mode != "story" and personalization_question:
+        db.add(PersonalizationQuestion(
+            user_id=user.id,
+            daily_bite_id=bite.id,
+            library_item_id=item.id,
+            profile_id=(profile or {}).get("id"),
+            question=personalization_question.get("question") or "",
+            options=personalization_question.get("options") or [],
+            source_chunk_ids=chunk_ids,
+        ))
     # A session was actually generated for this source — real "use", the
     # authoritative signal the deterministic downgrade fallback ranks on
     # (see entitlement_service._fallback_candidates), distinct from a bare
@@ -335,7 +439,12 @@ def generate_session_for_item(
     try:
         db.commit()
     except IntegrityError:
-        # Unique index on (user, item, date): a concurrent request won — return it.
+        # Unique index on (user, item, date): a concurrent request won — return
+        # it. Our own personalization_question (if any) is simply discarded
+        # here along with `bite` — it belongs to the losing attempt, not the
+        # bite we're about to return, and creating a row against a
+        # daily_bite_id we don't own would be a correctness bug, not a
+        # harmless duplicate (that FK belongs to whichever attempt actually won).
         db.rollback()
         winner = db.query(DailyBite).filter(
             DailyBite.user_id == user.id,
