@@ -80,6 +80,44 @@ def _roll_personalization(db: Session, user: User, item: LibraryItem, chunks: Li
     return random.random() < PERSONALIZATION_PROBABILITY
 
 
+def _insert_personalization_card(result: dict, question: dict) -> None:
+    """Splice the already-validated personalization card into a generated
+    deck, in place, immediately before the summary card.
+
+    Server-side insertion is deliberate — see the long note at the call
+    site. The card object placed here carries the SAME option list (ids
+    included) that gets persisted on the PersonalizationQuestion row, so
+    "opt0" on screen and "opt0" in the database are the same option by
+    construction rather than by trusting a model to preserve order.
+
+    Never raises: personalization is an occasional bonus card, and a
+    malformed deck shape must degrade to an ordinary (still perfectly
+    valid) session rather than cost the user their nibble.
+    """
+    cards = result.get("cards")
+    if not isinstance(cards, list) or not cards:
+        return
+    card = {
+        "kind": "personalize",
+        "eyebrow": question.get("eyebrow") or "ONE QUICK QUESTION",
+        "title": question.get("question") or "",
+        "body": None,
+        "highlight": question.get("highlight"),
+        "options": None,
+        "explanation": None,
+        "personalizeOptions": question.get("options") or [],
+    }
+    if not card["title"] or not card["personalizeOptions"]:
+        return
+    # Before the summary when there is one (the normal case — validate_wisdom
+    # guarantees it); otherwise append, so an unexpected deck shape still
+    # yields a coherent deck rather than a card in a nonsensical position.
+    if cards[-1].get("kind") == "summary":
+        cards.insert(len(cards) - 1, card)
+    else:
+        cards.append(card)
+
+
 class SessionGenerationError(Exception):
     """A session couldn't be generated (bad input, retrieval empty, provider failure)."""
 
@@ -339,44 +377,46 @@ def generate_session_for_item(
                 profile=profile, context_chunks=chunks,
             )
             if personalization_question:
-                card_target += 1
-                # Stamp a stable, purely positional id onto each option HERE
-                # — "optN" by array index, never something the model invents
+                # Stamp a stable, purely positional id onto each option.
+                # "optN" by array index — never something a model invents
                 # (personalization_option_schema has no id field at all).
-                # This is the id the PersonalizationQuestion row below is
-                # persisted with; the SAME optN-by-position scheme is
-                # re-applied to the deck's returned personalize card further
-                # down (search "Re-stamp the personalize card"), so the two
-                # always agree without depending on the deck model echoing
-                # our request text byte-for-byte.
+                # This exact list, ids included, is BOTH persisted on the
+                # PersonalizationQuestion row below AND spliced verbatim into
+                # the deck after generation, so the id the user taps and the
+                # id the answer endpoint resolves are the same object.
                 for i, opt in enumerate(personalization_question.get("options") or []):
                     opt["id"] = f"opt{i}"
 
         try:
+            # NOTE (audit fix, Aug 2026): the deck is generated at its NORMAL
+            # card count and is told nothing about personalization. The card
+            # is inserted server-side, below.
+            #
+            # The original implementation asked the deck model to reproduce a
+            # pre-generated personalize card verbatim at a pinned position,
+            # then re-stamped optN ids onto whatever came back BY POSITION.
+            # That silently assumed the model preserves option ORDER, and
+            # nothing enforced it — validate_wisdom checked option
+            # count/text/tag validity but never equality with the original —
+            # so a model that reordered the options produced a card where
+            # "opt0" on screen meant a different answer than "opt0" in the
+            # persisted row. The user's tap then applied the wrong profile
+            # tag: silent, plausible, and invisible from the outside.
+            #
+            # Splicing server-side removes the failure mode rather than
+            # trying to detect it: the card the user sees IS the object that
+            # was grounding-validated and persisted, not a model's copy.
             result = llm.generate_wisdom_session(
                 book_title=item.title, author=item.author,
                 profile=profile, context_chunks=chunks,
                 card_target=card_target, read_length=read_length,
                 image_options=image_select.safe_prompt(wisdom_candidates),
-                personalization=personalization_question,
             )
         except Exception as e:
             raise SessionGenerationError(f"Session generation failed: {e}", 502)
 
-        # Re-stamp the personalize card's option ids by POSITION rather than
-        # trusting the deck model to have echoed our pinned JSON's "id"
-        # fields byte-for-byte — matching a strict-schema model's own output
-        # to our request text is not guaranteed character-for-character, and
-        # the answer endpoint's option_id -> tag lookup only needs the id to
-        # be self-consistent with what session_service itself persisted onto
-        # the PersonalizationQuestion row above (same source list, same
-        # order — personalizeOptions is never shuffled, unlike quiz options).
         if personalization_question:
-            for card in result.get("cards") or []:
-                if isinstance(card, dict) and card.get("kind") == "personalize":
-                    for i, opt in enumerate(card.get("personalizeOptions") or []):
-                        if isinstance(opt, dict):
-                            opt["id"] = f"opt{i}"
+            _insert_personalization_card(result, personalization_question)
 
         # Ownership, book and shortlist membership are all re-checked here from
         # the stored rows — the id came back from a model, so nothing about it

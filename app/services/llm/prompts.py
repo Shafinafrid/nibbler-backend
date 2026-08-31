@@ -13,7 +13,6 @@ same logical instructions. The split between a stable system block and a
 dynamic user message is deliberate: the stable half is what providers cache.
 """
 
-import json
 from typing import Any, Dict, List, Optional
 
 from .schemas import PERSONALIZATION_TAGS
@@ -266,19 +265,15 @@ def build_wisdom_user_message(
     context_chunks: List[str],
     card_target: int,
     read_length: int,
-    personalization: Optional[Dict[str, Any]] = None,
 ) -> str:
     """The dynamic half of a Wisdom request: source, profile, targets, excerpts.
 
-    `personalization` (Aug 2026), when supplied, is the ALREADY-generated and
-    grounding-validated result of generate_personalization_question — the
-    deck model is instructed to reproduce it VERBATIM as a pinned card
-    rather than asked to invent its own question. This is deliberate: the
-    question's grounding was checked once, against the same excerpts, by a
-    separate call (validate_personalization); asking the deck model to
-    re-derive or re-word it would reopen exactly the drift/hallucination
-    risk that separate validation pass closed. See session_service's
-    two-call design."""
+    Deliberately knows nothing about personalization: that card is inserted
+    server-side by session_service after generation (audit fix, Aug 2026).
+    An earlier version pinned it into this prompt for the model to
+    reproduce, which both contradicted SESSION_SYSTEM's own card-ordering
+    rule and let the option order silently diverge from what was persisted.
+    """
     quiz_target = quiz_target_for(read_length)
     interaction = {
         "analytical": "a QUIZ card (kind quiz, eyebrow QUICK CHECK)",
@@ -305,27 +300,6 @@ def build_wisdom_user_message(
         "Deck structure: hook first, summary last, one interaction card second-to-last, "
         "all remaining cards are insights."
     )
-    personalize_block = ""
-    if personalization:
-        pinned_card = {
-            "kind": "personalize",
-            "eyebrow": personalization.get("eyebrow") or "",
-            "title": personalization.get("question") or "",
-            "body": None,
-            "highlight": personalization.get("highlight"),
-            "options": None,
-            "explanation": None,
-            "personalizeOptions": personalization.get("options") or [],
-        }
-        tail_note = (
-            "Deck structure: hook first, summary last, a PERSONALIZE card is the SECOND-TO-LAST card "
-            "(immediately before summary), the interaction card moves one further back to THIRD-from-"
-            "last, all remaining cards are insights."
-        )
-        personalize_block = (
-            "\n\nPINNED PERSONALIZE CARD (reproduce EXACTLY at the position described above — do not "
-            "reword, do not invent a different question):\n" + json.dumps(pinned_card)
-        )
 
     return f"""SOURCE: "{book_title}"{f' by {author}' if author else ''}
 
@@ -337,7 +311,7 @@ GROWTH PROFILE:
 CARD_TARGET: {card_target} cards total ({read_length}-minute read).
 QUIZ_TARGET: {quiz_target} quiz questions.
 Interaction card: {interaction}.
-{tail_note}{personalize_block}
+{tail_note}
 
 SOURCE EXCERPTS (build the session ONLY from these):
 {chr(10).join(f'--- excerpt {i+1} ---{chr(10)}{c}' for i, c in enumerate(context_chunks))}

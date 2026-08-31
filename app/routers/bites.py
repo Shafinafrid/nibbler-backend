@@ -4,7 +4,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy import or_
 from datetime import date, datetime, timedelta, timezone
 from typing import Optional, List
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from app.database import get_db
 from app.middleware.auth import get_current_user
 from app.rate_limit import limiter
@@ -59,7 +59,10 @@ def _bite_source_locked(db: Session, user: User, bite: DailyBite) -> bool:
         return False
     return not is_source_unlocked(user, item)
 from app.config import get_settings
+import logging
 import uuid
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/bites", tags=["bites"])
 settings = get_settings()
@@ -374,18 +377,39 @@ def mark_bite_read(
 
 # ── Dynamic growth-profile personalization (Aug 2026) ───────────────────────
 
+# Free text is a person typing one sentence about how they like to learn.
+# Bounded because it reaches an LLM: this endpoint has no premium gate, so
+# the cap is what stops one account turning a preference box into a cheap
+# prompt channel. Matches ChatRequest.message's own max_length idiom.
+PERSONALIZE_FREE_TEXT_MAX = 2000
+
+# How long one interpretation attempt may hold the row before another
+# request may take it over. Generous enough that a genuinely slow provider
+# chain (LLMService can try three providers) is never raced by a retry;
+# short enough that a dead worker self-heals inside one user retry.
+PERSONALIZE_CLAIM_MINUTES = 3
+
+
 class PersonalizeAnswerRequest(BaseModel):
     # Mutually exclusive: a listed option's id, OR free text for the
     # always-present "something else" affordance the app renders client-side
     # (never LLM-authored — see schemas.py's personalization_option_schema
-    # docstring).
+    # docstring). Enforced in the handler, not just documented here.
     option_id: Optional[str] = None
-    free_text: Optional[str] = None
+    free_text: Optional[str] = Field(default=None, max_length=PERSONALIZE_FREE_TEXT_MAX)
 
 
 class PersonalizeAnswerResponse(BaseModel):
     tags: List[str]
     interpreted_summary: Optional[str] = None
+    # The growth profile this answer belongs to — the one that was active
+    # when the QUESTION was generated, not whatever is active now. Without
+    # it the app applied every answer to its current activeProfileId, so a
+    # finance book's question could sharpen a career profile (audit finding
+    # #2). None for rows written before this field existed, and for
+    # scheduler-generated sessions from before _build_profile_dict carried
+    # the id — the app falls back to its old behavior in that case.
+    profile_id: Optional[str] = None
 
 
 @router.post("/{bite_id}/personalize-answer", response_model=PersonalizeAnswerResponse)
@@ -405,55 +429,138 @@ def submit_personalize_answer(
     growth profile (the app's own existing debounced PUT /profile/growth
     push), never a race between two direct writers.
 
-    Idempotent by construction: the PersonalizationQuestion row was created
-    at GENERATION time (session_service._roll_personalization), not here, so
-    a second submit against an already-'answered' row (a retry, or a second
-    device racing the first) returns the SAME resolved tags rather than
-    re-applying or re-interpreting anything.
+    Idempotent, and safe against two concurrent submits. The
+    PersonalizationQuestion row is created at GENERATION time
+    (session_service._roll_personalization), and this handler CLAIMS it
+    under a row lock before doing any slow work, so:
+
+      · a submit against an already-'answered' row returns the stored
+        answer verbatim — a retry or a second device never re-interprets,
+        never re-charges an LLM call, and never changes the recorded answer;
+      · two simultaneous submits (the real case: tapping a listed option
+        while a free-text interpretation is still in flight) cannot both
+        win — the loser is told the answer is already being resolved and
+        re-reads the winner's result, instead of silently overwriting it.
+
+    Audit fix (Aug 2026): this previously read `status`, ran the LLM call,
+    then wrote — with no lock and no conditional update. Both requests saw
+    'pending', and whichever committed LAST silently overwrote the other's
+    answer, while the app could apply BOTH sets of tags to the profile.
     """
+    free_text = (data.free_text or "").strip()
+
+    # Exactly one answer field. Previously "option_id wins if present" was
+    # implicit in the if/elif, so a client bug sending both got a silent,
+    # arbitrary resolution of an ambiguous request.
+    if bool(data.option_id) == bool(free_text):
+        raise HTTPException(
+            status_code=422,
+            detail="Provide exactly one of option_id or free_text.",
+        )
+
+    # Claim under a row lock. SELECT ... FOR UPDATE is the same primitive
+    # _claim_chat_turn (connect.py) uses for the identical problem.
+    now = datetime.utcnow()
     row = db.query(PersonalizationQuestion).filter(
         PersonalizationQuestion.daily_bite_id == bite_id,
         PersonalizationQuestion.user_id == current_user.id,
-    ).first()
+    ).with_for_update().first()
     if not row:
         raise HTTPException(status_code=404, detail="No personalization question on this session.")
 
     if row.status == "answered":
-        # Idempotent replay — not an error. Mirrors update_growth_state's own
-        # "a redundant write is a no-op, not a 409" convention.
+        db.commit()   # release the lock; nothing to change
         return PersonalizeAnswerResponse(
             tags=row.applied_tags or [], interpreted_summary=row.interpreted_summary,
+            profile_id=row.profile_id,
         )
+
+    if row.status == "processing" and row.claimed_until and row.claimed_until > now:
+        db.commit()
+        raise HTTPException(status_code=409, detail={
+            "code": "personalize_processing",
+            "message": "Still recording your last answer — hang tight.",
+        })
 
     bite = db.query(DailyBite).filter(DailyBite.id == bite_id, DailyBite.user_id == current_user.id).first()
     if bite and _bite_source_locked(db, current_user, bite):
+        db.commit()
         raise HTTPException(
             status_code=403,
             detail={"code": "source_locked", "message": "This source is Premium-only right now."},
         )
 
-    free_text = (data.free_text or "").strip()
+    # Resolve the option BEFORE claiming, so an unknown id is rejected
+    # without burning the row (see below) — a stale client sending "otp0"
+    # used to permanently mark the question answered with zero tags, with
+    # no way for the user to correct it.
+    matched = None
+    if data.option_id:
+        matched = next(
+            (o for o in (row.options or []) if o.get("id") == data.option_id),
+            None,
+        )
+        if not matched:
+            db.commit()
+            raise HTTPException(status_code=422, detail={
+                "code": "unknown_option",
+                "message": "That answer option isn't part of this question.",
+            })
+
+    # Take the claim and RELEASE the lock before the slow call, exactly as
+    # _claim_chat_turn does — an uncancellable LLM request must never be
+    # made while holding a row lock.
+    row.status = "processing"
+    row.claimed_until = now + timedelta(minutes=PERSONALIZE_CLAIM_MINUTES)
+    db.commit()
+
     interpreted_summary = None
+    try:
+        if matched:
+            tags = [matched["tag"]] if matched.get("tag") else []
+        else:
+            llm = LLMService()
+            interpreted = llm.interpret_personalization_answer(
+                question=row.question, options=row.options or [], free_text=free_text,
+            )
+            tags = interpreted.get("tags") or []
+            interpreted_summary = interpreted.get("summary")
+    except Exception:
+        # Release the claim so the user can actually retry, rather than
+        # leaving the row wedged in 'processing' until the lease expires.
+        logger.exception("Personalization interpretation failed for bite %s", bite_id)
+        row.status = "pending"
+        row.claimed_until = None
+        db.commit()
+        raise HTTPException(status_code=502, detail={
+            "code": "interpretation_failed",
+            "message": "Couldn't process that answer — you can try again.",
+        })
+
+    # Duplicate/conflicting tags would each apply their delta in sequence
+    # app-side, tripling a "fixed" increment. Order-preserving dedupe.
+    tags = list(dict.fromkeys(t for t in tags if t))
+
+    # Finalize under the lock, and only if this request still owns the claim.
+    row = db.query(PersonalizationQuestion).filter(
+        PersonalizationQuestion.daily_bite_id == bite_id,
+        PersonalizationQuestion.user_id == current_user.id,
+    ).with_for_update().first()
+    if row and row.status == "answered":
+        db.commit()
+        return PersonalizeAnswerResponse(
+            tags=row.applied_tags or [], interpreted_summary=row.interpreted_summary,
+            profile_id=row.profile_id,
+        )
 
     if data.option_id:
-        options = row.options or []
-        matched = next((o for o in options if o.get("id") == data.option_id or o.get("text") == data.option_id), None)
-        tags = [matched["tag"]] if matched and matched.get("tag") else []
         row.answer_option_id = data.option_id
-    elif free_text:
-        llm = LLMService()
-        interpreted = llm.interpret_personalization_answer(
-            question=row.question, options=row.options or [], free_text=free_text,
-        )
-        tags = interpreted.get("tags") or []
-        interpreted_summary = interpreted.get("summary")
-        row.answer_free_text = free_text
     else:
-        raise HTTPException(status_code=422, detail="Provide either option_id or free_text.")
-
+        row.answer_free_text = free_text
     row.applied_tags = tags
     row.interpreted_summary = interpreted_summary
     row.status = "answered"
+    row.claimed_until = None
     row.answered_at = datetime.utcnow()
     db.commit()
 

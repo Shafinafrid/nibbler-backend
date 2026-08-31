@@ -62,7 +62,13 @@ class PersonalizationQuestion(Base):
     # Chunk indexes the question was grounded in — provenance only, mirrors
     # DailyBite.chunk_ids; never a query-time filter.
     source_chunk_ids = Column(JSON, nullable=True)
-    status = Column(String, nullable=False, default="pending", index=True)  # pending | answered
+    # pending | processing | answered. 'processing' means a request has
+    # CLAIMED this row and is resolving the answer (possibly inside a slow
+    # LLM call) — see the personalize-answer endpoint. A claim that outlives
+    # `claimed_until` is treated as a dead worker's and may be taken over,
+    # matching ChatTurn's lease idiom rather than inventing a new one.
+    status = Column(String, nullable=False, default="pending", index=True)
+    claimed_until = Column(DateTime, nullable=True)
     answer_option_id = Column(String, nullable=True)
     answer_free_text = Column(Text, nullable=True)
     # The resolved tag(s) actually applied — from the fixed option, or from

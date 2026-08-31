@@ -523,6 +523,11 @@ def _run_migrations():
         "ALTER TABLE library_items ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT now()",
         # library_items — active nibble sources (July 2026)
         "ALTER TABLE library_items ADD COLUMN IF NOT EXISTS is_active BOOLEAN DEFAULT TRUE",
+        # personalization_questions.claimed_until (audit fix, Aug 2026) — the
+        # answer endpoint's claim lease. The table itself was created by
+        # create_all on first deploy, but this column was added afterwards,
+        # so an existing production table needs the ALTER.
+        "ALTER TABLE personalization_questions ADD COLUMN IF NOT EXISTS claimed_until TIMESTAMP",
         # Did the ORIGINAL file reach S3? `processed` never meant that.
         "ALTER TABLE library_items ADD COLUMN IF NOT EXISTS archive_status VARCHAR",
         # daily_bites — per-book card-deck sessions (July 2026)
@@ -746,11 +751,27 @@ REQUIRED_COLUMNS = [
     # again, exactly the bug this migration exists to close.
     ("users", "paid_premium_until"), ("users", "complimentary_until"),
     ("chat_context_chunks", "book_id"), ("chat_context_chunks", "chunk_index"),
-    # Personalization questions (Aug 2026) — the answer endpoint's
-    # idempotent-replay guarantee (app/routers/bites.py) depends on this
-    # row existing with these columns; see app/models/personalization.py.
-    ("personalization_questions", "daily_bite_id"), ("personalization_questions", "status"),
+    # Personalization questions (Aug 2026). EVERY column the runtime paths
+    # actually read or write is listed — audit fix: registering only three
+    # of them meant a partially-restored table missing e.g. `options` still
+    # reported /ready healthy, then 500'd on the first answer submission
+    # (false-green readiness, exactly what this registry exists to prevent).
+    ("personalization_questions", "id"),
     ("personalization_questions", "user_id"),
+    ("personalization_questions", "daily_bite_id"),
+    ("personalization_questions", "library_item_id"),
+    ("personalization_questions", "profile_id"),
+    ("personalization_questions", "question"),
+    ("personalization_questions", "options"),
+    ("personalization_questions", "source_chunk_ids"),
+    ("personalization_questions", "status"),
+    ("personalization_questions", "claimed_until"),
+    ("personalization_questions", "answer_option_id"),
+    ("personalization_questions", "answer_free_text"),
+    ("personalization_questions", "applied_tags"),
+    ("personalization_questions", "interpreted_summary"),
+    ("personalization_questions", "answered_at"),
+    ("personalization_questions", "created_at"),
 ]
 # Postgres only — a named UNIQUE constraint/index is how each of these
 # integrity guarantees is actually enforced by the database, not just
