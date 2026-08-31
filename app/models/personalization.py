@@ -68,6 +68,13 @@ class PersonalizationQuestion(Base):
     # `claimed_until` is treated as a dead worker's and may be taken over,
     # matching ChatTurn's lease idiom rather than inventing a new one.
     status = Column(String, nullable=False, default="pending", index=True)
+    # WHO holds the claim, not just until when. Without this pair being
+    # checked together, finalize can only ask "has anyone answered yet",
+    # which cannot tell a fresh row apart from one a NEWER worker is
+    # currently mid-flight on — so a superseded slow worker would overwrite
+    # the newer worker's answer and clear its lease. Same reason ChatTurn
+    # carries claimed_by (app/models/user_data.py).
+    claimed_by = Column(String, nullable=True)
     claimed_until = Column(DateTime, nullable=True)
     answer_option_id = Column(String, nullable=True)
     answer_free_text = Column(Text, nullable=True)

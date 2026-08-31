@@ -60,6 +60,7 @@ def _bite_source_locked(db: Session, user: User, bite: DailyBite) -> bool:
     return not is_source_unlocked(user, item)
 from app.config import get_settings
 import logging
+import os
 import uuid
 
 logger = logging.getLogger(__name__)
@@ -390,6 +391,55 @@ PERSONALIZE_FREE_TEXT_MAX = 2000
 PERSONALIZE_CLAIM_MINUTES = 3
 
 
+# Tag pairs that cannot both be true of one answer. The model picks from a
+# closed vocabulary but nothing stopped it returning BOTH halves of an
+# opposing pair (re-audit finding #9), which the app would then apply in
+# sequence — a +0.05 and a -0.05 that quietly cancel, or a contentMode set
+# twice with the last one silently winning. Neither is a defensible reading
+# of one answer, so the conflict is dropped rather than guessed at.
+_OPPOSING_TAGS = [
+    ("increase_confidence", "decrease_confidence"),
+    ("prefers_automation", "prefers_manual_control"),
+    ("prefers_analytical_depth", "prefers_simplicity"),
+    ("shift_practical", "shift_reflective"),
+    ("shift_practical", "shift_analytical"),
+    ("shift_reflective", "shift_analytical"),
+]
+
+
+def _normalize_tags(tags) -> List[str]:
+    """Order-preserving dedupe, then drop both halves of any opposing pair.
+
+    Dropping BOTH (rather than keeping the first) is deliberate: if a model
+    says a user both wants more confidence and less, it has not expressed a
+    preference — applying either half would be inventing one.
+    """
+    clean = list(dict.fromkeys(t for t in (tags or []) if t))
+    conflicted = set()
+    for a, b in _OPPOSING_TAGS:
+        if a in clean and b in clean:
+            conflicted.add(a)
+            conflicted.add(b)
+    if conflicted:
+        logger.warning("personalization: dropping contradictory tags %s", sorted(conflicted))
+    return [t for t in clean if t not in conflicted]
+
+
+def _release_claim_if_owner(db: Session, bite_id: str, user_id: str, worker_id: str) -> None:
+    """Return a claimed row to 'pending' — but only if `worker_id` still owns
+    it. A superseded worker releasing unconditionally would reset the claim
+    of the worker that legitimately took over (re-audit finding #2)."""
+    row = db.query(PersonalizationQuestion).filter(
+        PersonalizationQuestion.daily_bite_id == bite_id,
+        PersonalizationQuestion.user_id == user_id,
+    ).with_for_update().first()
+    if row and row.status == "processing" and row.claimed_by == worker_id:
+        row.status = "pending"
+        row.claimed_by = None
+        row.claimed_until = None
+    db.commit()
+
+
 class PersonalizeAnswerRequest(BaseModel):
     # Mutually exclusive: a listed option's id, OR free text for the
     # always-present "something else" affordance the app renders client-side
@@ -509,8 +559,12 @@ def submit_personalize_answer(
 
     # Take the claim and RELEASE the lock before the slow call, exactly as
     # _claim_chat_turn does — an uncancellable LLM request must never be
-    # made while holding a row lock.
+    # made while holding a row lock. `worker_id` is what makes the claim
+    # OWNED: without it, finalize can only ask "has anyone answered", not
+    # "am I still the one allowed to answer" (re-audit finding #2).
+    worker_id = f"{os.getpid()}-{uuid.uuid4().hex[:8]}"
     row.status = "processing"
+    row.claimed_by = worker_id
     row.claimed_until = now + timedelta(minutes=PERSONALIZE_CLAIM_MINUTES)
     db.commit()
 
@@ -526,32 +580,52 @@ def submit_personalize_answer(
             tags = interpreted.get("tags") or []
             interpreted_summary = interpreted.get("summary")
     except Exception:
-        # Release the claim so the user can actually retry, rather than
-        # leaving the row wedged in 'processing' until the lease expires.
+        # Release the claim so the user can actually retry — but ONLY if this
+        # worker still owns it. A slow worker that has already been superseded
+        # must not reset a NEWER worker's live claim on its way out (re-audit
+        # finding #2): that would let a third request in while the second is
+        # still working.
         logger.exception("Personalization interpretation failed for bite %s", bite_id)
-        row.status = "pending"
-        row.claimed_until = None
-        db.commit()
+        _release_claim_if_owner(db, bite_id, current_user.id, worker_id)
         raise HTTPException(status_code=502, detail={
             "code": "interpretation_failed",
             "message": "Couldn't process that answer — you can try again.",
         })
 
-    # Duplicate/conflicting tags would each apply their delta in sequence
-    # app-side, tripling a "fixed" increment. Order-preserving dedupe.
-    tags = list(dict.fromkeys(t for t in tags if t))
+    tags = _normalize_tags(tags)
 
-    # Finalize under the lock, and only if this request still owns the claim.
+    # Finalize under the lock, and only if this request STILL OWNS the claim.
+    #
+    # Re-audit finding #2: the first fix checked only `status == "answered"`,
+    # which cannot distinguish "nobody has answered yet" from "my lease
+    # expired and another worker is mid-flight". A worker whose LLM call ran
+    # past the lease would overwrite the newer worker's answer and clear its
+    # lease, discarding a paid result. `claimed_by` is what makes ownership
+    # decidable — the same reason ChatTurn carries it (connect.py).
     row = db.query(PersonalizationQuestion).filter(
         PersonalizationQuestion.daily_bite_id == bite_id,
         PersonalizationQuestion.user_id == current_user.id,
     ).with_for_update().first()
-    if row and row.status == "answered":
+    if not row:
+        db.commit()
+        raise HTTPException(status_code=404, detail="No personalization question on this session.")
+
+    if row.status == "answered":
+        # Someone else finished first — theirs is canonical, return it.
         db.commit()
         return PersonalizeAnswerResponse(
             tags=row.applied_tags or [], interpreted_summary=row.interpreted_summary,
             profile_id=row.profile_id,
         )
+
+    if row.claimed_by != worker_id:
+        # Superseded mid-flight. Drop this result rather than overwriting the
+        # worker that legitimately took over.
+        db.commit()
+        raise HTTPException(status_code=409, detail={
+            "code": "personalize_processing",
+            "message": "Still recording your last answer — hang tight.",
+        })
 
     if data.option_id:
         row.answer_option_id = data.option_id
@@ -560,11 +634,18 @@ def submit_personalize_answer(
     row.applied_tags = tags
     row.interpreted_summary = interpreted_summary
     row.status = "answered"
+    row.claimed_by = None
     row.claimed_until = None
     row.answered_at = datetime.utcnow()
     db.commit()
 
-    return PersonalizeAnswerResponse(tags=tags, interpreted_summary=interpreted_summary)
+    return PersonalizeAnswerResponse(
+        tags=tags, interpreted_summary=interpreted_summary,
+        # Re-audit finding #1: this ordinary first-success path returned NO
+        # profile_id, so even the free-text path (the one that does consume
+        # the response) got undefined and fell back to the active profile.
+        profile_id=row.profile_id,
+    )
 
 
 def _bite_to_response(bite: DailyBite, saved_ids: set) -> BiteResponse:

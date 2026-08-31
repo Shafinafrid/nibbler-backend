@@ -80,7 +80,7 @@ def _roll_personalization(db: Session, user: User, item: LibraryItem, chunks: Li
     return random.random() < PERSONALIZATION_PROBABILITY
 
 
-def _insert_personalization_card(result: dict, question: dict) -> None:
+def _insert_personalization_card(result: dict, question: dict, profile_id=None) -> None:
     """Splice the already-validated personalization card into a generated
     deck, in place, immediately before the summary card.
 
@@ -89,6 +89,14 @@ def _insert_personalization_card(result: dict, question: dict) -> None:
     included) that gets persisted on the PersonalizationQuestion row, so
     "opt0" on screen and "opt0" in the database are the same option by
     construction rather than by trusting a model to preserve order.
+
+    `profile_id` is the growth profile this session was generated FOR, and
+    it must ride on the card (re-audit finding #1). The first fix persisted
+    it on the database row but never put it on the card, so the app read
+    `card.profileId === undefined` and silently fell back to whatever
+    profile happened to be active at answer time — the exact bug the fix
+    was supposed to close, still fully reachable on the common
+    multiple-choice path.
 
     Never raises: personalization is an occasional bonus card, and a
     malformed deck shape must degrade to an ordinary (still perfectly
@@ -106,6 +114,7 @@ def _insert_personalization_card(result: dict, question: dict) -> None:
         "options": None,
         "explanation": None,
         "personalizeOptions": question.get("options") or [],
+        "profileId": profile_id,
     }
     if not card["title"] or not card["personalizeOptions"]:
         return
@@ -416,7 +425,10 @@ def generate_session_for_item(
             raise SessionGenerationError(f"Session generation failed: {e}", 502)
 
         if personalization_question:
-            _insert_personalization_card(result, personalization_question)
+            _insert_personalization_card(
+                result, personalization_question,
+                profile_id=(profile or {}).get("id"),
+            )
 
         # Ownership, book and shortlist membership are all re-checked here from
         # the stored rows — the id came back from a model, so nothing about it

@@ -174,8 +174,13 @@ def validate_personalization(
 
     quote = str(question.get("highlight") or "").strip()
     if source_chunks and quote:
-        haystack = _normalize_for_grounding("\n".join(source_chunks))
-        if _normalize_for_grounding(quote) not in haystack:
+        # Checked against each chunk INDIVIDUALLY, never a concatenation
+        # (re-audit finding #13). Joining chunks first creates text that
+        # exists in no source passage: a "quote" spanning the seam between
+        # two unrelated excerpts would match the joined haystack and be
+        # presented to the user as one continuous sentence from the book.
+        needle = _normalize_for_grounding(quote)
+        if not any(needle in _normalize_for_grounding(c) for c in source_chunks):
             _fail(provider, "personalization highlight quote does not appear in the source")
 
     return question

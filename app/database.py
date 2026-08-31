@@ -528,6 +528,7 @@ def _run_migrations():
         # create_all on first deploy, but this column was added afterwards,
         # so an existing production table needs the ALTER.
         "ALTER TABLE personalization_questions ADD COLUMN IF NOT EXISTS claimed_until TIMESTAMP",
+        "ALTER TABLE personalization_questions ADD COLUMN IF NOT EXISTS claimed_by VARCHAR",
         # Did the ORIGINAL file reach S3? `processed` never meant that.
         "ALTER TABLE library_items ADD COLUMN IF NOT EXISTS archive_status VARCHAR",
         # daily_bites — per-book card-deck sessions (July 2026)
@@ -766,6 +767,7 @@ REQUIRED_COLUMNS = [
     ("personalization_questions", "source_chunk_ids"),
     ("personalization_questions", "status"),
     ("personalization_questions", "claimed_until"),
+    ("personalization_questions", "claimed_by"),
     ("personalization_questions", "answer_option_id"),
     ("personalization_questions", "answer_free_text"),
     ("personalization_questions", "applied_tags"),
@@ -789,6 +791,18 @@ REQUIRED_PG_CONSTRAINTS = [
     ("delivery_cycles", "uq_delivery_cycle_user_date"),
     ("chat_context_chunks", "uq_chat_context_chunk"),
     ("personalization_questions", "uq_personalization_daily_bite"),
+]
+
+# (table, constraint/index name, expected columns) — the subset of the above
+# whose COLUMN SHAPE is also verified, not just its existence by name. Each
+# of these is a uniqueness guarantee a write path relies on for idempotency
+# or dedupe, and a same-named non-unique index (or one on different columns)
+# would enforce nothing while passing a name-only check (re-audit #10).
+REQUIRED_PG_CONSTRAINT_SHAPES = [
+    ("personalization_questions", "uq_personalization_daily_bite", ["daily_bite_id"]),
+    ("chat_turns", "uq_chat_turn_user_turn", ["user_id", "turn_id"]),
+    ("daily_bites", "uq_daily_bites_user_item_date", ["user_id", "library_item_id", "date"]),
+    ("delivery_cycles", "uq_delivery_cycle_user_date", ["user_id", "cycle_date"]),
 ]
 
 
@@ -852,6 +866,58 @@ def verify_required_schema() -> "tuple[bool, list[str]]":
             for t, name in REQUIRED_PG_CONSTRAINTS:
                 if (t, name) not in existing_named:
                     missing.append(f"constraint:{t}.{name}")
+
+            # Re-audit finding #10: existence-by-name is not the guarantee
+            # these entries stand for. Every one of them is a UNIQUENESS
+            # guarantee some write path depends on (idempotency keys, dedupe
+            # constraints) — and a plain non-unique index, or a unique
+            # constraint on the WRONG columns, satisfies the name check while
+            # enforcing nothing. Verify the actual shape where the expected
+            # columns are known.
+            for t, name, cols in REQUIRED_PG_CONSTRAINT_SHAPES:
+                if (t, name) not in existing_named:
+                    continue    # already reported missing above
+                actual = [
+                    row[0] for row in conn.execute(
+                        text(
+                            "SELECT a.attname "
+                            "FROM pg_constraint c "
+                            "JOIN pg_class rel ON rel.oid = c.conrelid "
+                            "JOIN pg_namespace n ON n.oid = rel.relnamespace "
+                            "JOIN unnest(c.conkey) WITH ORDINALITY AS k(attnum, ord) ON TRUE "
+                            "JOIN pg_attribute a ON a.attrelid = rel.oid AND a.attnum = k.attnum "
+                            "WHERE n.nspname = 'public' AND rel.relname = :t "
+                            "AND c.conname = :name AND c.contype IN ('u', 'p') "
+                            "ORDER BY k.ord"
+                        ),
+                        {"t": t, "name": name},
+                    )
+                ]
+                if not actual:
+                    # Not a unique/primary constraint at all — check whether a
+                    # UNIQUE INDEX of that name covers the same columns, since
+                    # this codebase creates some guarantees that way.
+                    actual = [
+                        row[0] for row in conn.execute(
+                            text(
+                                "SELECT a.attname FROM pg_index i "
+                                "JOIN pg_class idx ON idx.oid = i.indexrelid "
+                                "JOIN pg_class rel ON rel.oid = i.indrelid "
+                                "JOIN pg_namespace n ON n.oid = rel.relnamespace "
+                                "JOIN unnest(i.indkey) WITH ORDINALITY AS k(attnum, ord) ON TRUE "
+                                "JOIN pg_attribute a ON a.attrelid = rel.oid AND a.attnum = k.attnum "
+                                "WHERE n.nspname = 'public' AND rel.relname = :t "
+                                "AND idx.relname = :name AND i.indisunique "
+                                "ORDER BY k.ord"
+                            ),
+                            {"t": t, "name": name},
+                        )
+                    ]
+                if sorted(actual) != sorted(cols):
+                    missing.append(
+                        f"constraint-shape:{t}.{name} covers {sorted(actual) or 'nothing unique'}, "
+                        f"expected {sorted(cols)}"
+                    )
         else:
             # SQLite (local/test): tables + columns come straight from the
             # ORM via Base.metadata.create_all() — checked the same way, for
