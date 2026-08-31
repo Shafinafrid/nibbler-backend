@@ -803,7 +803,19 @@ REQUIRED_PG_CONSTRAINT_SHAPES = [
     ("chat_turns", "uq_chat_turn_user_turn", ["user_id", "turn_id"]),
     ("daily_bites", "uq_daily_bites_user_item_date", ["user_id", "library_item_id", "date"]),
     ("delivery_cycles", "uq_delivery_cycle_user_date", ["user_id", "cycle_date"]),
+    # Round-4: the remaining three guarantees now have shape checks too —
+    # previously only four of seven did, so the rest were name-only.
+    ("saved_bites", "uq_saved_bites_user_bite", ["user_id", "bite_id"]),
+    ("cleanup_tasks", "uq_cleanup_task_identity_v2",
+     ["item_id", "attempt_token", "artifact_kind", "artifact_key"]),
+    ("chat_context_chunks", "uq_chat_context_chunk", ["user_id", "book_id", "chunk_index"]),
 ]
+
+# Indexes that are legitimately PARTIAL by design — exempt from the
+# "must cover all rows" rule, still required to be valid and ready.
+# uq_daily_bites_user_item_date is `WHERE library_item_id IS NOT NULL`
+# (legacy pre-session bites carry no item and must not collide).
+_PARTIAL_INDEX_EXEMPTIONS = {"uq_daily_bites_user_item_date"}
 
 
 def verify_required_schema() -> "tuple[bool, list[str]]":
@@ -897,22 +909,51 @@ def verify_required_schema() -> "tuple[bool, list[str]]":
                     # Not a unique/primary constraint at all — check whether a
                     # UNIQUE INDEX of that name covers the same columns, since
                     # this codebase creates some guarantees that way.
-                    actual = [
-                        row[0] for row in conn.execute(
-                            text(
-                                "SELECT a.attname FROM pg_index i "
-                                "JOIN pg_class idx ON idx.oid = i.indexrelid "
-                                "JOIN pg_class rel ON rel.oid = i.indrelid "
-                                "JOIN pg_namespace n ON n.oid = rel.relnamespace "
-                                "JOIN unnest(i.indkey) WITH ORDINALITY AS k(attnum, ord) ON TRUE "
-                                "JOIN pg_attribute a ON a.attrelid = rel.oid AND a.attnum = k.attnum "
-                                "WHERE n.nspname = 'public' AND rel.relname = :t "
-                                "AND idx.relname = :name AND i.indisunique "
-                                "ORDER BY k.ord"
-                            ),
-                            {"t": t, "name": name},
-                        )
-                    ]
+                    #
+                    # Round-4: an index only ENFORCES anything when it is
+                    # valid, ready and total. A CREATE INDEX CONCURRENTLY that
+                    # failed leaves an INVALID index that still appears in the
+                    # catalog; a not-ready index isn't enforcing yet; and a
+                    # PARTIAL index (indpred) only constrains the rows its
+                    # WHERE clause matches, which is not the guarantee the
+                    # write paths assume. All three are rejected.
+                    #
+                    # NOTE: daily_bites' uq_daily_bites_user_item_date IS
+                    # deliberately partial (WHERE library_item_id IS NOT NULL)
+                    # — see this repo's own prod-DB notes — so it is checked
+                    # for validity/readiness but exempted from the
+                    # totality requirement.
+                    partial_ok = name in _PARTIAL_INDEX_EXEMPTIONS
+                    rows = list(conn.execute(
+                        text(
+                            "SELECT a.attname, i.indisvalid, i.indisready, "
+                            "       (i.indpred IS NOT NULL) AS is_partial "
+                            "FROM pg_index i "
+                            "JOIN pg_class idx ON idx.oid = i.indexrelid "
+                            "JOIN pg_class rel ON rel.oid = i.indrelid "
+                            "JOIN pg_namespace n ON n.oid = rel.relnamespace "
+                            "JOIN unnest(i.indkey) WITH ORDINALITY AS k(attnum, ord) ON TRUE "
+                            "JOIN pg_attribute a ON a.attrelid = rel.oid AND a.attnum = k.attnum "
+                            "WHERE n.nspname = 'public' AND rel.relname = :t "
+                            "AND idx.relname = :name AND i.indisunique "
+                            "ORDER BY k.ord"
+                        ),
+                        {"t": t, "name": name},
+                    ))
+                    if rows:
+                        valid, ready, is_partial = rows[0][1], rows[0][2], rows[0][3]
+                        if not valid:
+                            missing.append(f"constraint-invalid:{t}.{name} (index is INVALID)")
+                            continue
+                        if not ready:
+                            missing.append(f"constraint-not-ready:{t}.{name}")
+                            continue
+                        if is_partial and not partial_ok:
+                            missing.append(
+                                f"constraint-partial:{t}.{name} only covers a subset of rows"
+                            )
+                            continue
+                    actual = [r[0] for r in rows]
                 if sorted(actual) != sorted(cols):
                     missing.append(
                         f"constraint-shape:{t}.{name} covers {sorted(actual) or 'nothing unique'}, "

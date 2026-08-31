@@ -253,12 +253,26 @@ def validate_wisdom(
                 _fail(provider, "card %d is %r, expected insight" % (i, card.get("kind")))
 
     if source_chunks:
-        haystack = _normalize_for_grounding("\n".join(source_chunks))
+        # Round-4: checked against each chunk INDIVIDUALLY, never a
+        # concatenation. Joining first creates text that exists in no source
+        # passage, so a "quote" spanning the seam between two unrelated
+        # excerpts matched and was rendered to the user as one continuous
+        # sentence from the book.
+        normalized_chunks = [_normalize_for_grounding(c) for c in source_chunks]
         for i, card in enumerate(cards):
             quote = str(card.get("highlight") or "").strip()
             if len(quote) < MIN_GROUNDED_QUOTE_CHARS:
+                # A short fragment of ordinary prose can appear anywhere by
+                # coincidence, so matching it proves little — but an
+                # UNMATCHED short quote still proves fabrication. Kept as a
+                # skip rather than a check because this is the shared deck
+                # path where false positives would disable the whole guard;
+                # the personalization path (validate_personalization) has no
+                # such exemption, since its quotes are far fewer and each is
+                # presented as the book's own words.
                 continue
-            if _normalize_for_grounding(quote) not in haystack:
+            needle = _normalize_for_grounding(quote)
+            if not any(needle in c for c in normalized_chunks):
                 _fail(provider,
                       "card %d has a highlight quote that does not appear in the source" % i)
 
