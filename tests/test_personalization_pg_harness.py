@@ -251,6 +251,73 @@ check("every successful response matches the canonical stored answer",
 check("no response carries a null profile_id",
       all(r.get("profile_id") == "prof-1" for r in succeeded), succeeded)
 
+# The auditor's finding: the checks above pass even if the LOSER never
+# actually converges — they only check that whichever responses happened to
+# be 200 agree with each other. With a Barrier(2) both callers enter
+# interpretation together, so in practice one gets 200 and the other gets a
+# retryable 409 personalize_processing (never two 200s, since the loser's
+# finalize is superseded and it re-reads the answered row itself — but nail
+# down "loser gets a real 409" too, so this test still means something if the
+# claim/finalize logic ever changes shape). Prove the FULL contract the
+# docstring on submit_personalize_answer promises: a caller that receives the
+# 409 retries against the SAME endpoint and converges on the winner's exact
+# stored answer — not merely that nobody printed a wrong value the first
+# time around.
+losers = [(label, r) for label, r in results.items() if not r.get("ok")]
+check("exactly one caller received the retryable 409 (or both raced to 200 via the answered-row replay)",
+      len(losers) in (0, 1), results)
+
+if losers:
+    loser_label, loser_result = losers[0]
+    check("the loser's failure is the retryable personalize_processing 409",
+          loser_result.get("error") == "HTTPException"
+          and isinstance(loser_result.get("detail"), dict)
+          and loser_result["detail"].get("code") == "personalize_processing",
+          loser_result)
+
+    # Real retry: a brand-new DB session, a second genuine call into the
+    # SAME endpoint function (not a mock, not a re-read of `final` above) —
+    # exactly what a client does when it sees a retryable 409.
+    retry_db = SessionLocal()
+    try:
+        retry_resp = bites_router.submit_personalize_answer.__wrapped__(
+            request=_Req(), bite_id=bid,
+            data=bites_router.PersonalizeAnswerRequest(free_text="answer-from-" + loser_label),
+            current_user=_FakeUser(uid), db=retry_db,
+        )
+        retry_ok, retry_detail = True, {
+            "tags": list(retry_resp.tags),
+            "profile_id": retry_resp.profile_id,
+            "summary": retry_resp.interpreted_summary,
+        }
+    except Exception as e:
+        retry_ok, retry_detail = False, {"error": type(e).__name__, "detail": getattr(e, "detail", None)}
+    finally:
+        retry_db.close()
+
+    check("the retried request succeeds (200), proving the loser is not stuck",
+          retry_ok, retry_detail)
+    if retry_ok:
+        check("the retry's tags EXACTLY match the winner's canonical stored tags",
+              retry_detail["tags"] == final["tags"],
+              {"stored": final["tags"], "retry": retry_detail["tags"]})
+        check("the retry's profile_id matches the canonical stored profile_id",
+              retry_detail["profile_id"] == "prof-1", retry_detail)
+        # The row must still show exactly the winner's answer after the
+        # retry — proving the retry READ the canonical answer rather than
+        # re-interpreting and re-writing a second time.
+        after_retry = db_row(bid)
+        check("the database is UNCHANGED by the retry (no second write occurred)",
+              after_retry == final, {"before_retry": final, "after_retry": after_retry})
+else:
+    # Both calls happened to observe the row as already-answered (e.g. the
+    # loser's claim attempt landed after the winner had already finalized,
+    # so it took the "current.status == 'answered'" replay branch inside the
+    # handler itself instead of racing into a live 409). Convergence is then
+    # already proven by "every successful response matches the canonical
+    # stored answer" above — nothing further to retry.
+    check("(no 409 occurred this run — both responses already converged, see note above)", True)
+
 
 # ═════════════════════════════════════════════════════════════════════════
 section("PG2 — a superseded worker cannot finalize or release")
