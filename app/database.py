@@ -811,11 +811,44 @@ REQUIRED_PG_CONSTRAINT_SHAPES = [
     ("chat_context_chunks", "uq_chat_context_chunk", ["user_id", "book_id", "chunk_index"]),
 ]
 
-# Indexes that are legitimately PARTIAL by design — exempt from the
-# "must cover all rows" rule, still required to be valid and ready.
-# uq_daily_bites_user_item_date is `WHERE library_item_id IS NOT NULL`
-# (legacy pre-session bites carry no item and must not collide).
-_PARTIAL_INDEX_EXEMPTIONS = {"uq_daily_bites_user_item_date"}
+# Indexes that are legitimately PARTIAL by design. Round-5: a NAME-based
+# exemption is not enough — it accepts ANY predicate, including a decoy like
+# `WHERE false`, which indexes no rows and therefore enforces nothing while
+# looking present, unique, valid and ready. The EXPECTED PREDICATE is
+# recorded here and compared against pg_get_expr(indpred, indrelid).
+#
+# Postgres normalises what it stores, so the comparison is normalised too
+# (whitespace collapsed, outer parens and explicit casts stripped) rather
+# than demanding a byte-exact string.
+_PARTIAL_INDEX_PREDICATES = {
+    # legacy pre-session bites carry no item and must not collide
+    "uq_daily_bites_user_item_date": "library_item_id IS NOT NULL",
+}
+
+
+def _normalize_predicate(expr: str) -> str:
+    """Normalise a pg_get_expr predicate for comparison."""
+    if not expr:
+        return ""
+    s = " ".join(str(expr).split()).lower()
+    s = s.replace("::text", "").replace("::character varying", "")
+    while s.startswith("(") and s.endswith(")"):
+        inner = s[1:-1]
+        # only strip when the parens are actually a matching outer pair
+        depth = 0
+        balanced = True
+        for ch in inner:
+            if ch == "(":
+                depth += 1
+            elif ch == ")":
+                depth -= 1
+                if depth < 0:
+                    balanced = False
+                    break
+        if not balanced or depth != 0:
+            break
+        s = inner.strip()
+    return s
 
 
 def verify_required_schema() -> "tuple[bool, list[str]]":
@@ -923,11 +956,11 @@ def verify_required_schema() -> "tuple[bool, list[str]]":
                     # — see this repo's own prod-DB notes — so it is checked
                     # for validity/readiness but exempted from the
                     # totality requirement.
-                    partial_ok = name in _PARTIAL_INDEX_EXEMPTIONS
+                    expected_pred = _PARTIAL_INDEX_PREDICATES.get(name)
                     rows = list(conn.execute(
                         text(
                             "SELECT a.attname, i.indisvalid, i.indisready, "
-                            "       (i.indpred IS NOT NULL) AS is_partial "
+                            "       pg_get_expr(i.indpred, i.indrelid) AS pred "
                             "FROM pg_index i "
                             "JOIN pg_class idx ON idx.oid = i.indexrelid "
                             "JOIN pg_class rel ON rel.oid = i.indrelid "
@@ -941,16 +974,22 @@ def verify_required_schema() -> "tuple[bool, list[str]]":
                         {"t": t, "name": name},
                     ))
                     if rows:
-                        valid, ready, is_partial = rows[0][1], rows[0][2], rows[0][3]
+                        valid, ready, pred = rows[0][1], rows[0][2], rows[0][3]
                         if not valid:
                             missing.append(f"constraint-invalid:{t}.{name} (index is INVALID)")
                             continue
                         if not ready:
                             missing.append(f"constraint-not-ready:{t}.{name}")
                             continue
-                        if is_partial and not partial_ok:
+                        got_pred = _normalize_predicate(pred)
+                        want_pred = _normalize_predicate(expected_pred)
+                        # Round-5: the PREDICATE itself is verified, not just
+                        # "is it partial". `WHERE false` indexes zero rows and
+                        # enforces nothing, while passing every other check.
+                        if got_pred != want_pred:
                             missing.append(
-                                f"constraint-partial:{t}.{name} only covers a subset of rows"
+                                f"constraint-predicate:{t}.{name} has predicate "
+                                f"{got_pred or '(none)'!r}, expected {want_pred or '(none)'!r}"
                             )
                             continue
                     actual = [r[0] for r in rows]

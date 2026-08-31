@@ -18,6 +18,7 @@ from app.schemas.bite import (
 )
 from app.services import mixpanel_service
 from app.services.llm import LLMService
+from app.services.llm.personalization_deltas import sanitize_tags
 from app.services.session_service import generate_session_for_item, SessionGenerationError, CARD_TARGETS
 from app.services.entitlement_service import is_source_unlocked
 
@@ -453,38 +454,20 @@ PERSONALIZE_FREE_TEXT_MAX = 2000
 PERSONALIZE_CLAIM_MINUTES = 3
 
 
-# Tag pairs that cannot both be true of one answer. The model picks from a
-# closed vocabulary but nothing stopped it returning BOTH halves of an
-# opposing pair (re-audit finding #9), which the app would then apply in
-# sequence — a +0.05 and a -0.05 that quietly cancel, or a contentMode set
-# twice with the last one silently winning. Neither is a defensible reading
-# of one answer, so the conflict is dropped rather than guessed at.
-_OPPOSING_TAGS = [
-    ("increase_confidence", "decrease_confidence"),
-    ("prefers_automation", "prefers_manual_control"),
-    ("prefers_analytical_depth", "prefers_simplicity"),
-    ("shift_practical", "shift_reflective"),
-    ("shift_practical", "shift_analytical"),
-    ("shift_reflective", "shift_analytical"),
-]
-
-
 def _normalize_tags(tags) -> List[str]:
-    """Order-preserving dedupe, then drop both halves of any opposing pair.
+    """Sanitize tags for RETURN — new answers and historical rows alike.
 
-    Dropping BOTH (rather than keeping the first) is deliberate: if a model
-    says a user both wants more confidence and less, it has not expressed a
-    preference — applying either half would be inventing one.
+    Round-5: the rule now lives in one place (llm.personalization_deltas.
+    sanitize_tags) and is applied on every path that returns applied_tags,
+    not only where a new answer is resolved. Rows answered before the rule
+    existed still hold contradictory pairs; returning those raw let the
+    client apply both halves.
     """
-    clean = list(dict.fromkeys(t for t in (tags or []) if t))
-    conflicted = set()
-    for a, b in _OPPOSING_TAGS:
-        if a in clean and b in clean:
-            conflicted.add(a)
-            conflicted.add(b)
-    if conflicted:
-        logger.warning("personalization: dropping contradictory tags %s", sorted(conflicted))
-    return [t for t in clean if t not in conflicted]
+    clean = sanitize_tags(tags)
+    if len(clean) != len(list(dict.fromkeys(t for t in (tags or []) if t))):
+        logger.warning("personalization: sanitized contradictory/duplicate tags %s -> %s",
+                        tags, clean)
+    return clean
 
 
 # ── Lease primitives (round-4 rewrite) ──────────────────────────────────────
@@ -742,9 +725,21 @@ def submit_personalize_answer(
     if not row:
         raise HTTPException(status_code=404, detail="No personalization question on this session.")
 
+    # Round-5 (#4): availability is checked BEFORE the answered-replay return.
+    # Previously an ANSWERED row with a null profile_id returned 200 with
+    # profile_id=None — a client then had tags and no target, and fell back to
+    # whatever profile was active, which is the original wrong-profile bug
+    # reached through the replay path. An unattributable row is unusable
+    # whatever its status.
+    if not row.profile_id:
+        raise HTTPException(status_code=409, detail={
+            "code": "personalize_unavailable",
+            "message": "This question is no longer available.",
+        })
+
     if row.status == "answered":
         return PersonalizeAnswerResponse(
-            tags=row.applied_tags or [],
+            tags=_normalize_tags(row.applied_tags),
             interpreted_summary=row.interpreted_summary,
             profile_id=row.profile_id,
         )
@@ -755,15 +750,6 @@ def submit_personalize_answer(
             status_code=403,
             detail={"code": "source_locked", "message": "This source is Premium-only right now."},
         )
-
-    # A card whose target profile can't be determined must not be
-    # answerable at all — see the migration note in session_service. Refused
-    # here as well as hidden client-side, so an older build can't answer one.
-    if not row.profile_id:
-        raise HTTPException(status_code=409, detail={
-            "code": "personalize_unavailable",
-            "message": "This question is no longer available.",
-        })
 
     # Resolve the option BEFORE claiming, so an unknown id is rejected
     # without burning the row — a stale client sending "otp0" used to
@@ -788,7 +774,7 @@ def submit_personalize_answer(
         current = _read_personalization_row(db, bite_id, current_user.id)
         if current and current.status == "answered":
             return PersonalizeAnswerResponse(
-                tags=current.applied_tags or [],
+                tags=_normalize_tags(current.applied_tags),
                 interpreted_summary=current.interpreted_summary,
                 profile_id=current.profile_id,
             )
@@ -840,7 +826,7 @@ def submit_personalize_answer(
         current = _read_personalization_row(db, bite_id, current_user.id)
         if current and current.status == "answered":
             return PersonalizeAnswerResponse(
-                tags=current.applied_tags or [],
+                tags=_normalize_tags(current.applied_tags),
                 interpreted_summary=current.interpreted_summary,
                 profile_id=current.profile_id,
             )
@@ -943,7 +929,35 @@ def get_session_history(
     # surface in Review.
     rows = _filter_locked_sources(db, current_user, rows)
 
-    return SessionHistoryResponse(sessions=rows, total=len(rows))
+    # Round-5 (#4): this endpoint serves STORED decks too and was the one
+    # deck-returning path the repair did not cover. History/Review is
+    # replay-only — a personalization card here can only ever be re-answered,
+    # which is exactly the unsafe path — so the card is REMOVED outright
+    # rather than repaired. That also makes archived playback structurally
+    # incapable of submitting an answer, which is the precondition the
+    # auditor set for #8 remaining a product decision.
+    #
+    # ORM rows are returned directly here, so a detached copy is built
+    # instead of mutating the persisted object (an accidental flush of a
+    # mutated `cards` would rewrite the stored deck).
+    sanitized = []
+    for r in rows:
+        cards = r.cards or []
+        if any(isinstance(c, dict) and c.get("kind") == "personalize" for c in cards):
+            sanitized.append(SessionHistoryItem(
+                id=r.id, library_item_id=r.library_item_id, date=r.date,
+                mode=r.mode or "wisdom", read_length=r.read_length or 5,
+                title=r.title, chapter=r.chapter, headline=r.headline,
+                preview=r.preview,
+                cards=[c for c in cards
+                       if not (isinstance(c, dict) and c.get("kind") == "personalize")],
+                quiz=r.quiz, goal_passage=r.goal_passage,
+                read_at=getattr(r, "read_at", None),
+            ))
+        else:
+            sanitized.append(r)
+
+    return SessionHistoryResponse(sessions=sanitized, total=len(sanitized))
 
 
 @router.post("/{bite_id}/save", response_model=dict)

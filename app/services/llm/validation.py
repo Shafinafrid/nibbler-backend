@@ -261,16 +261,15 @@ def validate_wisdom(
         normalized_chunks = [_normalize_for_grounding(c) for c in source_chunks]
         for i, card in enumerate(cards):
             quote = str(card.get("highlight") or "").strip()
-            if len(quote) < MIN_GROUNDED_QUOTE_CHARS:
-                # A short fragment of ordinary prose can appear anywhere by
-                # coincidence, so matching it proves little — but an
-                # UNMATCHED short quote still proves fabrication. Kept as a
-                # skip rather than a check because this is the shared deck
-                # path where false positives would disable the whole guard;
-                # the personalization path (validate_personalization) has no
-                # such exemption, since its quotes are far fewer and each is
-                # presented as the book's own words.
+            if not quote:
                 continue
+            # Round-5: NO length exemption. The old skip reasoned that a short
+            # fragment could match by coincidence so checking proved little —
+            # but that argument is about FALSE POSITIVES, and the risk here is
+            # the opposite one. An unmatched short quote is positive evidence
+            # of fabrication, and every highlight is rendered to the user
+            # inside quotation marks as the book's own words. A quote too
+            # short to verify should be null, not unverified.
             needle = _normalize_for_grounding(quote)
             if not any(needle in c for c in normalized_chunks):
                 _fail(provider,
