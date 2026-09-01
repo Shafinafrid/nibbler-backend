@@ -180,7 +180,6 @@ class LLMService:
         card_target: int,
         read_length: int,
         image_options: Optional[str] = None,
-        personalization: Optional[dict] = None,
     ) -> dict:
         """A personalized card deck built only from the user's own excerpts.
 
@@ -190,12 +189,10 @@ class LLMService:
         are suggestions, and session_service re-validates every one of them
         against the stored rows before anything reaches a card.
 
-        `personalization` (Aug 2026) is the already-generated, already
-        grounding-validated result of `generate_personalization_question`, or
-        None on an ordinary session. When supplied, the caller (session_service)
-        has ALREADY added 1 to `card_target` to make room for it — this method
-        does not adjust card_target itself, only threads the pinned-card
-        instruction and the ordering rule through to the prompt and validator.
+        A personalization card, when today's session has one, is inserted by
+        session_service AFTER this returns — this method neither knows nor
+        cares about it. See `_insert_personalization_card`'s call site for
+        why that card must never round-trip through the deck model.
 
         Raises `ProviderError` when no provider produces a valid deck — the
         caller (session_service) turns that into its existing generation
@@ -208,7 +205,7 @@ class LLMService:
         user_message = build_wisdom_user_message(
             book_title=book_title, author=author, profile=profile,
             context_chunks=context_chunks, card_target=card_target,
-            read_length=read_length, personalization=personalization,
+            read_length=read_length,
         )
         if with_images:
             user_message += "\n\n" + image_options
@@ -230,7 +227,6 @@ class LLMService:
                 # The excerpts go in so pull-quotes can be checked against the
                 # book rather than trusted because the prompt asked nicely.
                 source_chunks=context_chunks,
-                has_personalization=bool(personalization),
             )
 
         result = self.router.run(request, finalize)

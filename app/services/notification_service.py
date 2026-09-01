@@ -277,6 +277,12 @@ def _build_profile_dict(growth_state: dict, item) -> dict:
         return {}
     interests = [(i.get("tag") if isinstance(i, dict) else i) for i in (gp.get("interests") or [])]
     return {
+        # Audit fix (Aug 2026): the id was missing here while the app's own
+        # buildSessionPayload sent it, so every SCHEDULER-generated session
+        # — the majority of premium delivery — persisted profile_id=None and
+        # its personalization answer fell back to "whatever profile is
+        # active right now" instead of the one that fed the question.
+        "id": gp.get("id"),
         "name": gp.get("profileName") or gp.get("name"),
         "lifeArea": gp.get("lifeArea"),
         "aspirationLabel": gp.get("aspirationLabel"),

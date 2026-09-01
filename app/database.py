@@ -523,6 +523,12 @@ def _run_migrations():
         "ALTER TABLE library_items ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT now()",
         # library_items — active nibble sources (July 2026)
         "ALTER TABLE library_items ADD COLUMN IF NOT EXISTS is_active BOOLEAN DEFAULT TRUE",
+        # personalization_questions.claimed_until (audit fix, Aug 2026) — the
+        # answer endpoint's claim lease. The table itself was created by
+        # create_all on first deploy, but this column was added afterwards,
+        # so an existing production table needs the ALTER.
+        "ALTER TABLE personalization_questions ADD COLUMN IF NOT EXISTS claimed_until TIMESTAMP",
+        "ALTER TABLE personalization_questions ADD COLUMN IF NOT EXISTS claimed_by VARCHAR",
         # Did the ORIGINAL file reach S3? `processed` never meant that.
         "ALTER TABLE library_items ADD COLUMN IF NOT EXISTS archive_status VARCHAR",
         # daily_bites — per-book card-deck sessions (July 2026)
@@ -538,11 +544,23 @@ def _run_migrations():
         # daily_bites — session lifecycle: scheduled generation + hold-until-read (July 2026)
         "ALTER TABLE daily_bites ADD COLUMN IF NOT EXISTS origin VARCHAR DEFAULT 'manual'",
         "ALTER TABLE daily_bites ADD COLUMN IF NOT EXISTS read_at TIMESTAMP",
+        # daily_bites — generation claim/lease (finding #5, Aug 2026): protects
+        # the expensive LLM call itself, not just the stored row, from a
+        # concurrent double-tap/retry racing generate_session_for_item. See
+        # the model's docstring in app/models/bite.py.
+        "ALTER TABLE daily_bites ADD COLUMN IF NOT EXISTS claimed_by VARCHAR",
+        "ALTER TABLE daily_bites ADD COLUMN IF NOT EXISTS claimed_until TIMESTAMP",
         # users
         "ALTER TABLE users ADD COLUMN IF NOT EXISTS premium_until TIMESTAMP",
         "ALTER TABLE users ADD COLUMN IF NOT EXISTS display_name VARCHAR",
         # profiles — local-first growth state sync (July 2026)
         "ALTER TABLE profiles ADD COLUMN IF NOT EXISTS growth_state JSON",
+        # profiles — deletion tombstones (finding #7, Sep 2026): a never-
+        # shrinking union of profile ids any device has recorded as deleted,
+        # enforced on every PUT /profile/growth independent of the whole-blob
+        # LWW outcome, so a stale device can't resurrect a deleted profile by
+        # pushing a later timestamp. See app/models/profile.py.
+        "ALTER TABLE profiles ADD COLUMN IF NOT EXISTS deleted_profile_ids JSON",
         # push_tokens — minute-precision delivery (July 2026)
         "ALTER TABLE push_tokens ADD COLUMN IF NOT EXISTS notification_minute INTEGER DEFAULT 0",
         "ALTER TABLE push_tokens ADD COLUMN IF NOT EXISTS streak_alerts_enabled BOOLEAN DEFAULT TRUE",
@@ -734,6 +752,10 @@ REQUIRED_COLUMNS = [
     ("library_items", "is_active"),
     ("users", "reserved_sources_count"), ("users", "entitlement_source"),
     ("daily_bites", "origin"), ("daily_bites", "read_at"),
+    # Finding #5 (Aug 2026) — the generation claim/lease. Missing either
+    # column would mean the claim silently can't be taken/verified,
+    # collapsing straight back to the double-LLM-call bug this fix closes.
+    ("daily_bites", "claimed_by"), ("daily_bites", "claimed_until"),
     # Task 20 — the durable delivery-cycle ledger itself must be verified
     # present/correct at boot, per Task 20's own requirement #11 ("the
     # backend must not report ready if its required durable delivery
@@ -745,12 +767,34 @@ REQUIRED_COLUMNS = [
     # paths would silently fall back to corrupting the shared premium_until
     # again, exactly the bug this migration exists to close.
     ("users", "paid_premium_until"), ("users", "complimentary_until"),
+    # Finding #7 (Sep 2026) — deletion tombstones. Missing this column would
+    # mean the tombstone filter silently has nothing to consult/union into,
+    # collapsing straight back to the stale-device resurrection bug this fix
+    # closes. See app/models/profile.py / app/routers/profile.py.
+    ("profiles", "deleted_profile_ids"),
     ("chat_context_chunks", "book_id"), ("chat_context_chunks", "chunk_index"),
-    # Personalization questions (Aug 2026) — the answer endpoint's
-    # idempotent-replay guarantee (app/routers/bites.py) depends on this
-    # row existing with these columns; see app/models/personalization.py.
-    ("personalization_questions", "daily_bite_id"), ("personalization_questions", "status"),
+    # Personalization questions (Aug 2026). EVERY column the runtime paths
+    # actually read or write is listed — audit fix: registering only three
+    # of them meant a partially-restored table missing e.g. `options` still
+    # reported /ready healthy, then 500'd on the first answer submission
+    # (false-green readiness, exactly what this registry exists to prevent).
+    ("personalization_questions", "id"),
     ("personalization_questions", "user_id"),
+    ("personalization_questions", "daily_bite_id"),
+    ("personalization_questions", "library_item_id"),
+    ("personalization_questions", "profile_id"),
+    ("personalization_questions", "question"),
+    ("personalization_questions", "options"),
+    ("personalization_questions", "source_chunk_ids"),
+    ("personalization_questions", "status"),
+    ("personalization_questions", "claimed_until"),
+    ("personalization_questions", "claimed_by"),
+    ("personalization_questions", "answer_option_id"),
+    ("personalization_questions", "answer_free_text"),
+    ("personalization_questions", "applied_tags"),
+    ("personalization_questions", "interpreted_summary"),
+    ("personalization_questions", "answered_at"),
+    ("personalization_questions", "created_at"),
 ]
 # Postgres only — a named UNIQUE constraint/index is how each of these
 # integrity guarantees is actually enforced by the database, not just
@@ -769,6 +813,63 @@ REQUIRED_PG_CONSTRAINTS = [
     ("chat_context_chunks", "uq_chat_context_chunk"),
     ("personalization_questions", "uq_personalization_daily_bite"),
 ]
+
+# (table, constraint/index name, expected columns) — the subset of the above
+# whose COLUMN SHAPE is also verified, not just its existence by name. Each
+# of these is a uniqueness guarantee a write path relies on for idempotency
+# or dedupe, and a same-named non-unique index (or one on different columns)
+# would enforce nothing while passing a name-only check (re-audit #10).
+REQUIRED_PG_CONSTRAINT_SHAPES = [
+    ("personalization_questions", "uq_personalization_daily_bite", ["daily_bite_id"]),
+    ("chat_turns", "uq_chat_turn_user_turn", ["user_id", "turn_id"]),
+    ("daily_bites", "uq_daily_bites_user_item_date", ["user_id", "library_item_id", "date"]),
+    ("delivery_cycles", "uq_delivery_cycle_user_date", ["user_id", "cycle_date"]),
+    # Round-4: the remaining three guarantees now have shape checks too —
+    # previously only four of seven did, so the rest were name-only.
+    ("saved_bites", "uq_saved_bites_user_bite", ["user_id", "bite_id"]),
+    ("cleanup_tasks", "uq_cleanup_task_identity_v2",
+     ["item_id", "attempt_token", "artifact_kind", "artifact_key"]),
+    ("chat_context_chunks", "uq_chat_context_chunk", ["user_id", "book_id", "chunk_index"]),
+]
+
+# Indexes that are legitimately PARTIAL by design. Round-5: a NAME-based
+# exemption is not enough — it accepts ANY predicate, including a decoy like
+# `WHERE false`, which indexes no rows and therefore enforces nothing while
+# looking present, unique, valid and ready. The EXPECTED PREDICATE is
+# recorded here and compared against pg_get_expr(indpred, indrelid).
+#
+# Postgres normalises what it stores, so the comparison is normalised too
+# (whitespace collapsed, outer parens and explicit casts stripped) rather
+# than demanding a byte-exact string.
+_PARTIAL_INDEX_PREDICATES = {
+    # legacy pre-session bites carry no item and must not collide
+    "uq_daily_bites_user_item_date": "library_item_id IS NOT NULL",
+}
+
+
+def _normalize_predicate(expr: str) -> str:
+    """Normalise a pg_get_expr predicate for comparison."""
+    if not expr:
+        return ""
+    s = " ".join(str(expr).split()).lower()
+    s = s.replace("::text", "").replace("::character varying", "")
+    while s.startswith("(") and s.endswith(")"):
+        inner = s[1:-1]
+        # only strip when the parens are actually a matching outer pair
+        depth = 0
+        balanced = True
+        for ch in inner:
+            if ch == "(":
+                depth += 1
+            elif ch == ")":
+                depth -= 1
+                if depth < 0:
+                    balanced = False
+                    break
+        if not balanced or depth != 0:
+            break
+        s = inner.strip()
+    return s
 
 
 def verify_required_schema() -> "tuple[bool, list[str]]":
@@ -831,6 +932,93 @@ def verify_required_schema() -> "tuple[bool, list[str]]":
             for t, name in REQUIRED_PG_CONSTRAINTS:
                 if (t, name) not in existing_named:
                     missing.append(f"constraint:{t}.{name}")
+
+            # Re-audit finding #10: existence-by-name is not the guarantee
+            # these entries stand for. Every one of them is a UNIQUENESS
+            # guarantee some write path depends on (idempotency keys, dedupe
+            # constraints) — and a plain non-unique index, or a unique
+            # constraint on the WRONG columns, satisfies the name check while
+            # enforcing nothing. Verify the actual shape where the expected
+            # columns are known.
+            for t, name, cols in REQUIRED_PG_CONSTRAINT_SHAPES:
+                if (t, name) not in existing_named:
+                    continue    # already reported missing above
+                actual = [
+                    row[0] for row in conn.execute(
+                        text(
+                            "SELECT a.attname "
+                            "FROM pg_constraint c "
+                            "JOIN pg_class rel ON rel.oid = c.conrelid "
+                            "JOIN pg_namespace n ON n.oid = rel.relnamespace "
+                            "JOIN unnest(c.conkey) WITH ORDINALITY AS k(attnum, ord) ON TRUE "
+                            "JOIN pg_attribute a ON a.attrelid = rel.oid AND a.attnum = k.attnum "
+                            "WHERE n.nspname = 'public' AND rel.relname = :t "
+                            "AND c.conname = :name AND c.contype IN ('u', 'p') "
+                            "ORDER BY k.ord"
+                        ),
+                        {"t": t, "name": name},
+                    )
+                ]
+                if not actual:
+                    # Not a unique/primary constraint at all — check whether a
+                    # UNIQUE INDEX of that name covers the same columns, since
+                    # this codebase creates some guarantees that way.
+                    #
+                    # Round-4: an index only ENFORCES anything when it is
+                    # valid, ready and total. A CREATE INDEX CONCURRENTLY that
+                    # failed leaves an INVALID index that still appears in the
+                    # catalog; a not-ready index isn't enforcing yet; and a
+                    # PARTIAL index (indpred) only constrains the rows its
+                    # WHERE clause matches, which is not the guarantee the
+                    # write paths assume. All three are rejected.
+                    #
+                    # NOTE: daily_bites' uq_daily_bites_user_item_date IS
+                    # deliberately partial (WHERE library_item_id IS NOT NULL)
+                    # — see this repo's own prod-DB notes — so it is checked
+                    # for validity/readiness but exempted from the
+                    # totality requirement.
+                    expected_pred = _PARTIAL_INDEX_PREDICATES.get(name)
+                    rows = list(conn.execute(
+                        text(
+                            "SELECT a.attname, i.indisvalid, i.indisready, "
+                            "       pg_get_expr(i.indpred, i.indrelid) AS pred "
+                            "FROM pg_index i "
+                            "JOIN pg_class idx ON idx.oid = i.indexrelid "
+                            "JOIN pg_class rel ON rel.oid = i.indrelid "
+                            "JOIN pg_namespace n ON n.oid = rel.relnamespace "
+                            "JOIN unnest(i.indkey) WITH ORDINALITY AS k(attnum, ord) ON TRUE "
+                            "JOIN pg_attribute a ON a.attrelid = rel.oid AND a.attnum = k.attnum "
+                            "WHERE n.nspname = 'public' AND rel.relname = :t "
+                            "AND idx.relname = :name AND i.indisunique "
+                            "ORDER BY k.ord"
+                        ),
+                        {"t": t, "name": name},
+                    ))
+                    if rows:
+                        valid, ready, pred = rows[0][1], rows[0][2], rows[0][3]
+                        if not valid:
+                            missing.append(f"constraint-invalid:{t}.{name} (index is INVALID)")
+                            continue
+                        if not ready:
+                            missing.append(f"constraint-not-ready:{t}.{name}")
+                            continue
+                        got_pred = _normalize_predicate(pred)
+                        want_pred = _normalize_predicate(expected_pred)
+                        # Round-5: the PREDICATE itself is verified, not just
+                        # "is it partial". `WHERE false` indexes zero rows and
+                        # enforces nothing, while passing every other check.
+                        if got_pred != want_pred:
+                            missing.append(
+                                f"constraint-predicate:{t}.{name} has predicate "
+                                f"{got_pred or '(none)'!r}, expected {want_pred or '(none)'!r}"
+                            )
+                            continue
+                    actual = [r[0] for r in rows]
+                if sorted(actual) != sorted(cols):
+                    missing.append(
+                        f"constraint-shape:{t}.{name} covers {sorted(actual) or 'nothing unique'}, "
+                        f"expected {sorted(cols)}"
+                    )
         else:
             # SQLite (local/test): tables + columns come straight from the
             # ORM via Base.metadata.create_all() — checked the same way, for

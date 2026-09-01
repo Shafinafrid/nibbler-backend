@@ -22,6 +22,40 @@ vocabulary a model may choose from, and that module's docstring for why the
 mapping itself is fixed/deterministic rather than LLM-emitted.
 """
 
+# Tag pairs that cannot both be true of one answer. Round-5: sanitation runs
+# on every REPLAY path, not only when a new answer is recorded — rows
+# answered before this rule existed still hold contradictory pairs, and
+# returning them raw lets a client apply both halves (a +0.05 and a -0.05
+# that cancel, or a contentMode assigned twice with the last write winning).
+OPPOSING_TAG_PAIRS = [
+    ("increase_confidence", "decrease_confidence"),
+    ("prefers_automation", "prefers_manual_control"),
+    ("prefers_analytical_depth", "prefers_simplicity"),
+    ("shift_practical", "shift_reflective"),
+    ("shift_practical", "shift_analytical"),
+    ("shift_reflective", "shift_analytical"),
+]
+
+
+def sanitize_tags(tags):
+    """Order-preserving dedupe, then drop BOTH halves of any opposing pair.
+
+    Dropping both rather than keeping the first is deliberate: an answer
+    claiming a user wants both more and less confidence expresses no
+    preference, and picking a half would invent one.
+
+    Applied to newly-resolved answers AND to historical `applied_tags` on
+    every path that returns them.
+    """
+    clean = list(dict.fromkeys(t for t in (tags or []) if t))
+    conflicted = set()
+    for a, b in OPPOSING_TAG_PAIRS:
+        if a in clean and b in clean:
+            conflicted.add(a)
+            conflicted.add(b)
+    return [t for t in clean if t not in conflicted]
+
+
 PERSONALIZATION_TAG_DELTAS = {
     "prefers_automation": {
         "interestBump": ("automation", 0.15),

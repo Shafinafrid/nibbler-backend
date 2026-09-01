@@ -1,11 +1,11 @@
 from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks, Request
 from sqlalchemy.orm import Session, joinedload
 from sqlalchemy.exc import IntegrityError
-from sqlalchemy import or_
+from sqlalchemy import or_, update
 from datetime import date, datetime, timedelta, timezone
 from typing import Optional, List
-from pydantic import BaseModel
-from app.database import get_db
+from pydantic import BaseModel, Field
+from app.database import get_db, SessionLocal
 from app.middleware.auth import get_current_user
 from app.rate_limit import limiter
 from app.models.user import User
@@ -18,6 +18,7 @@ from app.schemas.bite import (
 )
 from app.services import mixpanel_service
 from app.services.llm import LLMService
+from app.services.llm.personalization_deltas import sanitize_tags
 from app.services.session_service import generate_session_for_item, SessionGenerationError, CARD_TARGETS
 from app.services.entitlement_service import is_source_unlocked
 
@@ -59,7 +60,12 @@ def _bite_source_locked(db: Session, user: User, bite: DailyBite) -> bool:
         return False
     return not is_source_unlocked(user, item)
 from app.config import get_settings
+import logging
+import os
+import threading
 import uuid
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/bites", tags=["bites"])
 settings = get_settings()
@@ -173,7 +179,68 @@ class SessionResponse(BaseModel):
     goal_passage: Optional[str] = None  # today's most goal-relevant excerpt (wisdom only)
 
 
-def _bite_to_session(bite: DailyBite) -> SessionResponse:
+def _repair_personalize_cards(db: Session, bite: DailyBite, cards: list) -> list:
+    """Make a STORED deck's personalize card safe to answer, or remove it.
+
+    Round-4 (re-audit #3): decks persisted by the pre-fix code are frozen
+    JSON snapshots. They carry no `profileId`, and their `personalizeOptions`
+    may be in a different ORDER than the options persisted on the question
+    row — the original defect, where tapping "opt0" applied the tag belonging
+    to a different answer. New decks are correct, but every already-generated
+    one stays wrong forever unless repaired.
+
+    Repaired on READ rather than by a batch migration: this is the single
+    function every stored deck passes through, so no row can be missed, and
+    a deck that is never opened costs nothing.
+
+      · question row found WITH a profile_id → replace the card's options
+        with the row's authoritative list and stamp profileId. The row is
+        the source of truth the answer endpoint resolves against.
+      · no row, or profile_id is NULL (scheduler-era rows generated before
+        _build_profile_dict carried the id) → the answer's target cannot be
+        determined, so the card is REMOVED from the deck. It is not
+        answerable (the endpoint refuses it too), and showing an
+        un-answerable question is worse than showing none.
+
+    Never raises: a deck must render even if repair cannot run.
+    """
+    if not cards or not any(
+        isinstance(c, dict) and c.get("kind") == "personalize" for c in cards
+    ):
+        return cards
+    try:
+        row = db.query(PersonalizationQuestion).filter(
+            PersonalizationQuestion.daily_bite_id == bite.id,
+        ).first()
+        repaired = []
+        for card in cards:
+            if not (isinstance(card, dict) and card.get("kind") == "personalize"):
+                repaired.append(card)
+                continue
+            if not row or not row.profile_id or not row.options:
+                logger.info(
+                    "Dropping unattributable personalize card from bite %s", bite.id,
+                )
+                continue    # unsafe to answer — omit entirely
+            repaired.append({
+                **card,
+                "personalizeOptions": row.options,   # authoritative order + ids
+                "profileId": row.profile_id,
+            })
+        return repaired
+    except Exception:
+        logger.exception("Personalize-card repair failed for bite %s", bite.id)
+        # Fail SAFE: strip the card rather than serve a possibly-mismatched one.
+        return [
+            c for c in cards
+            if not (isinstance(c, dict) and c.get("kind") == "personalize")
+        ]
+
+
+def _bite_to_session(bite: DailyBite, db: Session = None) -> SessionResponse:
+    cards = bite.cards or []
+    if db is not None:
+        cards = _repair_personalize_cards(db, bite, cards)
     return SessionResponse(
         id=bite.id,
         library_item_id=bite.library_item_id,
@@ -184,7 +251,7 @@ def _bite_to_session(bite: DailyBite) -> SessionResponse:
         chapter=bite.chapter,
         headline=bite.headline,
         preview=bite.preview,
-        cards=bite.cards or [],
+        cards=cards,
         quiz=bite.quiz,
         story_finished=bool(bite.theme == "story_finished"),
         goal_passage=bite.goal_passage,
@@ -236,7 +303,7 @@ def get_or_create_session(
         DailyBite.date == today,
     ).first()
     if existing and existing.cards:
-        return _bite_to_session(existing)
+        return _bite_to_session(existing, db)
     # `force_new` used to live here: it hard-DELETED the existing row before
     # regenerating, which freed its own quota slot (so the cap could be spent
     # repeatedly), cascaded away any saved_bites row pointing at it, orphaned
@@ -290,12 +357,24 @@ def get_or_create_session(
             today=today, origin="manual",
         )
     except SessionGenerationError as e:
+        # A `code` (currently only 'session_generating' — finding #5's
+        # claim/lease fix) is surfaced as a structured detail, the SAME
+        # {code, message} shape as daily_limit_reached/source_locked/
+        # personalize_processing above, so the app can branch on `code`
+        # (ApiError.code — see src/services/api.js) rather than parsing
+        # prose. A code-less error keeps the original plain-string detail,
+        # unchanged for every pre-existing failure path.
+        if e.code:
+            raise HTTPException(
+                status_code=e.status_code,
+                detail={"code": e.code, "message": e.message},
+            )
         raise HTTPException(status_code=e.status_code, detail=e.message)
 
     background_tasks.add_task(mixpanel_service.track, "session_generated", current_user.id, {
         "mode": bite.mode, "read_length": bite.read_length, "cards": len(bite.cards or []),
     })
-    return _bite_to_session(bite)
+    return _bite_to_session(bite, db)
 
 
 @router.get("/daily", response_model=List[SessionResponse])
@@ -335,7 +414,7 @@ def get_daily_nibbles(
         return []
     # Return only the most-recent scheduled date's set (held-unread wins over today).
     top_date = rows[0].date
-    return [_bite_to_session(b) for b in rows if b.date == top_date]
+    return [_bite_to_session(b, db) for b in rows if b.date == top_date]
 
 
 @router.post("/{bite_id}/read")
@@ -374,18 +453,236 @@ def mark_bite_read(
 
 # ── Dynamic growth-profile personalization (Aug 2026) ───────────────────────
 
+# Free text is a person typing one sentence about how they like to learn.
+# Bounded because it reaches an LLM: this endpoint has no premium gate, so
+# the cap is what stops one account turning a preference box into a cheap
+# prompt channel. Matches ChatRequest.message's own max_length idiom.
+PERSONALIZE_FREE_TEXT_MAX = 2000
+
+# How long one interpretation attempt may hold the row before another
+# request may take it over. Generous enough that a genuinely slow provider
+# chain (LLMService can try three providers) is never raced by a retry;
+# short enough that a dead worker self-heals inside one user retry.
+PERSONALIZE_CLAIM_MINUTES = 3
+
+
+def _normalize_tags(tags) -> List[str]:
+    """Sanitize tags for RETURN — new answers and historical rows alike.
+
+    Round-5: the rule now lives in one place (llm.personalization_deltas.
+    sanitize_tags) and is applied on every path that returns applied_tags,
+    not only where a new answer is resolved. Rows answered before the rule
+    existed still hold contradictory pairs; returning those raw let the
+    client apply both halves.
+    """
+    clean = sanitize_tags(tags)
+    if len(clean) != len(list(dict.fromkeys(t for t in (tags or []) if t))):
+        logger.warning("personalization: sanitized contradictory/duplicate tags %s -> %s",
+                        tags, clean)
+    return clean
+
+
+# ── Lease primitives (round-4 rewrite) ──────────────────────────────────────
+# All three of these are ATOMIC CONDITIONAL UPDATEs — `UPDATE ... WHERE
+# <ownership predicate>`, checking `rowcount == 1` — never "load an ORM
+# object, inspect its attributes, then write".
+#
+# Round 3 did the latter and it silently did not work. SQLAlchemy's identity
+# map returns the CACHED object when a session re-queries a row it has
+# already loaded, so a superseded worker re-reading "its" row saw its own
+# stale `claimed_by` and happily finalized over the worker that had taken
+# over. Two real sessions were needed to see it; the round-3 test used one
+# and hand-edited ownership, so it passed against broken code.
+#
+# A conditional UPDATE has no such failure mode: the predicate is evaluated
+# by the DATABASE against committed state, and rowcount reports what actually
+# matched. See tests/test_personalization_lease_concurrency.py.
+
+
+def _claim_personalization_row(db: Session, bite_id: str, user_id: str, worker_id: str) -> bool:
+    """Claim a pending row (or take over an expired lease) for `worker_id`.
+
+    Returns True if this worker now owns the claim. False means someone
+    else holds a LIVE claim, or the row is already answered/missing — the
+    caller must not proceed to generate.
+    """
+    now = datetime.utcnow()
+    result = db.execute(
+        update(PersonalizationQuestion)
+        .where(
+            PersonalizationQuestion.daily_bite_id == bite_id,
+            PersonalizationQuestion.user_id == user_id,
+            PersonalizationQuestion.status != "answered",
+            # Claimable when nobody holds it, or the holder's lease lapsed.
+            or_(
+                PersonalizationQuestion.status == "pending",
+                PersonalizationQuestion.claimed_until.is_(None),
+                PersonalizationQuestion.claimed_until < now,
+            ),
+        )
+        .values(
+            status="processing",
+            claimed_by=worker_id,
+            claimed_until=now + timedelta(minutes=PERSONALIZE_CLAIM_MINUTES),
+        )
+        .execution_options(synchronize_session=False)
+    )
+    db.commit()
+    return result.rowcount == 1
+
+
+def _renew_personalization_claim(db: Session, bite_id: str, user_id: str, worker_id: str) -> bool:
+    """Extend this worker's lease while it is still working.
+
+    The provider fallback chain can legitimately outlast a fixed lease (up
+    to three providers, each with a retry), and a lease that expires under a
+    still-running worker is what invites the takeover race in the first
+    place. Mirrors _ChatTurnHeartbeat's renewal half in connect.py.
+    """
+    result = db.execute(
+        update(PersonalizationQuestion)
+        .where(
+            PersonalizationQuestion.daily_bite_id == bite_id,
+            PersonalizationQuestion.user_id == user_id,
+            PersonalizationQuestion.claimed_by == worker_id,
+            PersonalizationQuestion.status == "processing",
+        )
+        .values(claimed_until=datetime.utcnow() + timedelta(minutes=PERSONALIZE_CLAIM_MINUTES))
+        .execution_options(synchronize_session=False)
+    )
+    db.commit()
+    return result.rowcount == 1
+
+
+def _finalize_personalization_answer(
+    db: Session, bite_id: str, user_id: str, worker_id: str,
+    *, tags, interpreted_summary, option_id, free_text,
+) -> bool:
+    """Write the answer — only if `worker_id` still owns the claim.
+
+    Returns False when this worker has been superseded or another worker
+    already answered; the caller then reads the canonical row and returns
+    THAT, rather than its own result.
+    """
+    values = {
+        "applied_tags": tags,
+        "interpreted_summary": interpreted_summary,
+        "status": "answered",
+        "claimed_by": None,
+        "claimed_until": None,
+        "answered_at": datetime.utcnow(),
+    }
+    if option_id:
+        values["answer_option_id"] = option_id
+    else:
+        values["answer_free_text"] = free_text
+
+    result = db.execute(
+        update(PersonalizationQuestion)
+        .where(
+            PersonalizationQuestion.daily_bite_id == bite_id,
+            PersonalizationQuestion.user_id == user_id,
+            # BOTH halves matter: ownership, and not-already-answered.
+            PersonalizationQuestion.claimed_by == worker_id,
+            PersonalizationQuestion.status == "processing",
+        )
+        .values(**values)
+        .execution_options(synchronize_session=False)
+    )
+    db.commit()
+    return result.rowcount == 1
+
+
+def _release_claim_if_owner(db: Session, bite_id: str, user_id: str, worker_id: str) -> None:
+    """Return a claimed row to 'pending' — but only if `worker_id` still owns
+    it. A superseded worker releasing unconditionally would reset the claim
+    of the worker that legitimately took over."""
+    db.execute(
+        update(PersonalizationQuestion)
+        .where(
+            PersonalizationQuestion.daily_bite_id == bite_id,
+            PersonalizationQuestion.user_id == user_id,
+            PersonalizationQuestion.claimed_by == worker_id,
+            PersonalizationQuestion.status == "processing",
+        )
+        .values(status="pending", claimed_by=None, claimed_until=None)
+        .execution_options(synchronize_session=False)
+    )
+    db.commit()
+
+
+def _read_personalization_row(db: Session, bite_id: str, user_id: str):
+    """Committed state, free of any identity-map cache this session holds."""
+    db.expire_all()
+    return db.query(PersonalizationQuestion).filter(
+        PersonalizationQuestion.daily_bite_id == bite_id,
+        PersonalizationQuestion.user_id == user_id,
+    ).first()
+
+
+_PERSONALIZE_HEARTBEAT_SECONDS = 30.0
+
+
+class _PersonalizeHeartbeat:
+    """Renews this worker's lease while it is blocked in the LLM call.
+
+    Without it, a fixed lease can expire under a worker that is still
+    genuinely working — which is what invites a takeover, and then a race
+    between two live workers. Same design as connect.py's
+    _ChatTurnHeartbeat, including its own SessionLocal (the request's
+    session is idle on another thread's stack and must not be shared).
+    Renewal is ownership-conditional, so once superseded it simply stops.
+    """
+
+    def __init__(self, bite_id: str, user_id: str, worker_id: str, interval=None):
+        self.bite_id = bite_id
+        self.user_id = user_id
+        self.worker_id = worker_id
+        self.interval = interval if interval is not None else _PERSONALIZE_HEARTBEAT_SECONDS
+        self._stop = threading.Event()
+        self._thread = None
+
+    def _run(self):
+        while not self._stop.wait(self.interval):
+            db = SessionLocal()
+            try:
+                if not _renew_personalization_claim(db, self.bite_id, self.user_id, self.worker_id):
+                    return   # no longer the owner — stop renewing
+            except Exception:
+                logger.exception("Personalization heartbeat failed for bite %s", self.bite_id)
+            finally:
+                db.close()
+
+    def start(self):
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def stop(self):
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=5.0)
+
+
 class PersonalizeAnswerRequest(BaseModel):
     # Mutually exclusive: a listed option's id, OR free text for the
     # always-present "something else" affordance the app renders client-side
     # (never LLM-authored — see schemas.py's personalization_option_schema
-    # docstring).
+    # docstring). Enforced in the handler, not just documented here.
     option_id: Optional[str] = None
-    free_text: Optional[str] = None
+    free_text: Optional[str] = Field(default=None, max_length=PERSONALIZE_FREE_TEXT_MAX)
 
 
 class PersonalizeAnswerResponse(BaseModel):
     tags: List[str]
     interpreted_summary: Optional[str] = None
+    # The growth profile this answer belongs to — the one that was active
+    # when the QUESTION was generated, not whatever is active now. Without
+    # it the app applied every answer to its current activeProfileId, so a
+    # finance book's question could sharpen a career profile (audit finding
+    # #2). None for rows written before this field existed, and for
+    # scheduler-generated sessions from before _build_profile_dict carried
+    # the id — the app falls back to its old behavior in that case.
+    profile_id: Optional[str] = None
 
 
 @router.post("/{bite_id}/personalize-answer", response_model=PersonalizeAnswerResponse)
@@ -405,24 +702,58 @@ def submit_personalize_answer(
     growth profile (the app's own existing debounced PUT /profile/growth
     push), never a race between two direct writers.
 
-    Idempotent by construction: the PersonalizationQuestion row was created
-    at GENERATION time (session_service._roll_personalization), not here, so
-    a second submit against an already-'answered' row (a retry, or a second
-    device racing the first) returns the SAME resolved tags rather than
-    re-applying or re-interpreting anything.
+    Idempotent, and safe against two concurrent submits. The
+    PersonalizationQuestion row is created at GENERATION time
+    (session_service._roll_personalization), and this handler CLAIMS it
+    under a row lock before doing any slow work, so:
+
+      · a submit against an already-'answered' row returns the stored
+        answer verbatim — a retry or a second device never re-interprets,
+        never re-charges an LLM call, and never changes the recorded answer;
+      · two simultaneous submits (the real case: tapping a listed option
+        while a free-text interpretation is still in flight) cannot both
+        win — the loser is told the answer is already being resolved and
+        re-reads the winner's result, instead of silently overwriting it.
+
+    Round-4 rewrite: every ownership decision is an ATOMIC CONDITIONAL
+    UPDATE (see the lease primitives above), never an inspect-then-write on
+    a loaded ORM object. The previous version did the latter and it did not
+    work — SQLAlchemy's identity map handed a superseded worker its own
+    stale row on re-query, so its ownership check passed and it overwrote
+    the worker that had legitimately taken over.
     """
-    row = db.query(PersonalizationQuestion).filter(
-        PersonalizationQuestion.daily_bite_id == bite_id,
-        PersonalizationQuestion.user_id == current_user.id,
-    ).first()
+    free_text = (data.free_text or "").strip()
+
+    # Exactly one answer field. Previously "option_id wins if present" was
+    # implicit in the if/elif, so a client bug sending both got a silent,
+    # arbitrary resolution of an ambiguous request.
+    if bool(data.option_id) == bool(free_text):
+        raise HTTPException(
+            status_code=422,
+            detail="Provide exactly one of option_id or free_text.",
+        )
+
+    row = _read_personalization_row(db, bite_id, current_user.id)
     if not row:
         raise HTTPException(status_code=404, detail="No personalization question on this session.")
 
+    # Round-5 (#4): availability is checked BEFORE the answered-replay return.
+    # Previously an ANSWERED row with a null profile_id returned 200 with
+    # profile_id=None — a client then had tags and no target, and fell back to
+    # whatever profile was active, which is the original wrong-profile bug
+    # reached through the replay path. An unattributable row is unusable
+    # whatever its status.
+    if not row.profile_id:
+        raise HTTPException(status_code=409, detail={
+            "code": "personalize_unavailable",
+            "message": "This question is no longer available.",
+        })
+
     if row.status == "answered":
-        # Idempotent replay — not an error. Mirrors update_growth_state's own
-        # "a redundant write is a no-op, not a 409" convention.
         return PersonalizeAnswerResponse(
-            tags=row.applied_tags or [], interpreted_summary=row.interpreted_summary,
+            tags=_normalize_tags(row.applied_tags),
+            interpreted_summary=row.interpreted_summary,
+            profile_id=row.profile_id,
         )
 
     bite = db.query(DailyBite).filter(DailyBite.id == bite_id, DailyBite.user_id == current_user.id).first()
@@ -432,32 +763,95 @@ def submit_personalize_answer(
             detail={"code": "source_locked", "message": "This source is Premium-only right now."},
         )
 
-    free_text = (data.free_text or "").strip()
-    interpreted_summary = None
-
+    # Resolve the option BEFORE claiming, so an unknown id is rejected
+    # without burning the row — a stale client sending "otp0" used to
+    # permanently mark the question answered with zero tags.
+    matched = None
     if data.option_id:
-        options = row.options or []
-        matched = next((o for o in options if o.get("id") == data.option_id or o.get("text") == data.option_id), None)
-        tags = [matched["tag"]] if matched and matched.get("tag") else []
-        row.answer_option_id = data.option_id
-    elif free_text:
-        llm = LLMService()
-        interpreted = llm.interpret_personalization_answer(
-            question=row.question, options=row.options or [], free_text=free_text,
+        matched = next(
+            (o for o in (row.options or []) if o.get("id") == data.option_id),
+            None,
         )
-        tags = interpreted.get("tags") or []
-        interpreted_summary = interpreted.get("summary")
-        row.answer_free_text = free_text
-    else:
-        raise HTTPException(status_code=422, detail="Provide either option_id or free_text.")
+        if not matched:
+            raise HTTPException(status_code=422, detail={
+                "code": "unknown_option",
+                "message": "That answer option isn't part of this question.",
+            })
 
-    row.applied_tags = tags
-    row.interpreted_summary = interpreted_summary
-    row.status = "answered"
-    row.answered_at = datetime.utcnow()
-    db.commit()
+    worker_id = f"{os.getpid()}-{uuid.uuid4().hex[:8]}"
+    if not _claim_personalization_row(db, bite_id, current_user.id, worker_id):
+        # Somebody else holds a LIVE claim, or answered while we were
+        # checking. Re-read: an answered row is returned canonically, a
+        # live claim is a retryable 409.
+        current = _read_personalization_row(db, bite_id, current_user.id)
+        if current and current.status == "answered":
+            return PersonalizeAnswerResponse(
+                tags=_normalize_tags(current.applied_tags),
+                interpreted_summary=current.interpreted_summary,
+                profile_id=current.profile_id,
+            )
+        raise HTTPException(status_code=409, detail={
+            "code": "personalize_processing",
+            "message": "Still recording your last answer — hang tight.",
+        })
 
-    return PersonalizeAnswerResponse(tags=tags, interpreted_summary=interpreted_summary)
+    interpreted_summary = None
+    heartbeat = None
+    try:
+        if matched:
+            tags = [matched["tag"]] if matched.get("tag") else []
+        else:
+            # The provider chain can outlast a fixed lease; renew while the
+            # call is genuinely still running so a live worker is never
+            # raced by a takeover it invited itself.
+            heartbeat = _PersonalizeHeartbeat(bite_id, current_user.id, worker_id)
+            heartbeat.start()
+            llm = LLMService()
+            interpreted = llm.interpret_personalization_answer(
+                question=row.question, options=row.options or [], free_text=free_text,
+            )
+            tags = interpreted.get("tags") or []
+            interpreted_summary = interpreted.get("summary")
+    except Exception:
+        logger.exception("Personalization interpretation failed for bite %s", bite_id)
+        if heartbeat:
+            heartbeat.stop()
+        _release_claim_if_owner(db, bite_id, current_user.id, worker_id)
+        raise HTTPException(status_code=502, detail={
+            "code": "interpretation_failed",
+            "message": "Couldn't process that answer — you can try again.",
+        })
+    finally:
+        if heartbeat:
+            heartbeat.stop()
+
+    tags = _normalize_tags(tags)
+
+    if not _finalize_personalization_answer(
+        db, bite_id, current_user.id, worker_id,
+        tags=tags, interpreted_summary=interpreted_summary,
+        option_id=data.option_id, free_text=free_text,
+    ):
+        # Superseded, or someone answered first. Their answer is canonical —
+        # return THAT, never this worker's discarded result, so the client
+        # reconciles to the same state every other device sees.
+        current = _read_personalization_row(db, bite_id, current_user.id)
+        if current and current.status == "answered":
+            return PersonalizeAnswerResponse(
+                tags=_normalize_tags(current.applied_tags),
+                interpreted_summary=current.interpreted_summary,
+                profile_id=current.profile_id,
+            )
+        raise HTTPException(status_code=409, detail={
+            "code": "personalize_processing",
+            "message": "Still recording your last answer — hang tight.",
+        })
+
+    final = _read_personalization_row(db, bite_id, current_user.id)
+    return PersonalizeAnswerResponse(
+        tags=tags, interpreted_summary=interpreted_summary,
+        profile_id=final.profile_id if final else row.profile_id,
+    )
 
 
 def _bite_to_response(bite: DailyBite, saved_ids: set) -> BiteResponse:
@@ -547,7 +941,35 @@ def get_session_history(
     # surface in Review.
     rows = _filter_locked_sources(db, current_user, rows)
 
-    return SessionHistoryResponse(sessions=rows, total=len(rows))
+    # Round-5 (#4): this endpoint serves STORED decks too and was the one
+    # deck-returning path the repair did not cover. History/Review is
+    # replay-only — a personalization card here can only ever be re-answered,
+    # which is exactly the unsafe path — so the card is REMOVED outright
+    # rather than repaired. That also makes archived playback structurally
+    # incapable of submitting an answer, which is the precondition the
+    # auditor set for #8 remaining a product decision.
+    #
+    # ORM rows are returned directly here, so a detached copy is built
+    # instead of mutating the persisted object (an accidental flush of a
+    # mutated `cards` would rewrite the stored deck).
+    sanitized = []
+    for r in rows:
+        cards = r.cards or []
+        if any(isinstance(c, dict) and c.get("kind") == "personalize" for c in cards):
+            sanitized.append(SessionHistoryItem(
+                id=r.id, library_item_id=r.library_item_id, date=r.date,
+                mode=r.mode or "wisdom", read_length=r.read_length or 5,
+                title=r.title, chapter=r.chapter, headline=r.headline,
+                preview=r.preview,
+                cards=[c for c in cards
+                       if not (isinstance(c, dict) and c.get("kind") == "personalize")],
+                quiz=r.quiz, goal_passage=r.goal_passage,
+                read_at=getattr(r, "read_at", None),
+            ))
+        else:
+            sanitized.append(r)
+
+    return SessionHistoryResponse(sessions=sanitized, total=len(sanitized))
 
 
 @router.post("/{bite_id}/save", response_model=dict)

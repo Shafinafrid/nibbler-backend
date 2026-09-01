@@ -152,13 +152,20 @@ def validate_personalization(
 ) -> Dict[str, Any]:
     """Semantic check for the standalone personalization-question call
     (generate_personalization_question), BEFORE its result is spliced into
-    the deck-generation prompt (see session_service._roll_personalization).
-    Grounding is checked here, not just left to validate_wisdom's later
-    pass, because this is the call that actually derived the question from
-    the book's excerpts — validate_wisdom's own check on the same
-    `highlight` field afterward is defense in depth against the deck model
-    disobeying the instruction to reproduce it verbatim, not a substitute
-    for checking it at the source."""
+    the card that gets inserted server-side (see
+    session_service._insert_personalization_card). This is the ONLY place
+    this question's grounding is ever checked — nothing downstream re-checks
+    it — so it must be strict here.
+
+    Audit fix (Aug 2026): every non-empty pull-quote is verified, with NO
+    minimum-length exemption. validate_wisdom skips quotes under
+    MIN_GROUNDED_QUOTE_CHARS because a short fragment of prose could
+    coincidentally appear anywhere, making the check meaningless there. That
+    reasoning does not transfer: a short quote here is still rendered to the
+    user in quotation marks as the book's own words, so an invented "Stay
+    curious." is exactly the fabrication the grounding promise exists to
+    prevent. If a quote is too short to verify, the correct answer is to
+    have no quote (null), not an unverified one."""
     if not str(question.get("question") or "").strip():
         _fail(provider, "personalization question is empty")
     if not str(question.get("eyebrow") or "").strip():
@@ -166,9 +173,14 @@ def validate_personalization(
     _validate_personalize_options(provider, question.get("options"), "personalization question")
 
     quote = str(question.get("highlight") or "").strip()
-    if source_chunks and len(quote) >= MIN_GROUNDED_QUOTE_CHARS:
-        haystack = _normalize_for_grounding("\n".join(source_chunks))
-        if _normalize_for_grounding(quote) not in haystack:
+    if source_chunks and quote:
+        # Checked against each chunk INDIVIDUALLY, never a concatenation
+        # (re-audit finding #13). Joining chunks first creates text that
+        # exists in no source passage: a "quote" spanning the seam between
+        # two unrelated excerpts would match the joined haystack and be
+        # presented to the user as one continuous sentence from the book.
+        needle = _normalize_for_grounding(quote)
+        if not any(needle in _normalize_for_grounding(c) for c in source_chunks):
             _fail(provider, "personalization highlight quote does not appear in the source")
 
     return question
@@ -182,7 +194,6 @@ def validate_wisdom(
     quiz_target: int,
     interaction_kind: str,
     source_chunks: Optional[List[str]] = None,
-    has_personalization: bool = False,
 ) -> Dict[str, Any]:
     """Full semantic check of a Wisdom deck. Returns the session unchanged.
 
@@ -197,14 +208,11 @@ def validate_wisdom(
     words, so an invented one is the product's core promise breaking silently —
     and a prompt instruction is not a guarantee.
 
-    `has_personalization` (Aug 2026): true when session_service rolled a
-    dynamic growth-profile question into this deck's card_target. When true,
-    the tail shape gains one more pinned position — [..., interaction_card,
-    "personalize", "summary"] instead of [..., interaction_card, "summary"] —
-    since the personalize card's own question/options were pre-generated and
-    validated separately (see validate_personalization) and are handed to
-    THIS call already spliced into `cards` by the prompt; this function only
-    confirms the deck-generation model actually placed it where asked.
+    This function validates the MODEL'S deck only. A personalization card,
+    when today's session has one, is inserted by session_service after this
+    has already passed — it is never part of what the model returns, so no
+    ordering rule here accounts for it (audit fix, Aug 2026: it used to be,
+    and that round-trip is exactly what let option order silently diverge).
     """
     for key in ("title", "headline", "preview"):
         if not str(session.get(key) or "").strip():
@@ -228,8 +236,6 @@ def validate_wisdom(
             _fail(provider, "card %d has no title" % i)
         if kind == "quiz":
             _validate_options(provider, card.get("options"), "card %d" % i)
-        elif kind == "personalize":
-            _validate_personalize_options(provider, card.get("personalizeOptions"), "card %d" % i)
         elif not str(card.get("body") or "").strip():
             _fail(provider, "card %d (%s) has no body" % (i, kind))
 
@@ -238,32 +244,34 @@ def validate_wisdom(
     if cards[-1].get("kind") != "summary":
         _fail(provider, "last card is %r, expected summary" % cards[-1].get("kind"))
 
-    # tail_offset: how far from the end the interaction card sits. Normally
-    # it's -2 (right before summary); with a personalize card also pinned
-    # to -2, the interaction card is pushed one further back to -3.
-    if has_personalization:
-        if len(cards) < 2 or cards[-2].get("kind") != "personalize":
-            _fail(provider, "expected personalize card at position -2")
-        tail_offset = 3
-    else:
-        tail_offset = 2
-
-    if len(cards) >= tail_offset + 1:
-        interaction_index = -tail_offset
-        got = cards[interaction_index].get("kind")
+    if len(cards) >= 3:
+        got = cards[-2].get("kind")
         if got != interaction_kind:
             _fail(provider, "interaction card is %r, expected %r" % (got, interaction_kind))
-        for i, card in enumerate(cards[1:interaction_index], start=1):
+        for i, card in enumerate(cards[1:-2], start=1):
             if card.get("kind") not in _MIDDLE_KINDS:
                 _fail(provider, "card %d is %r, expected insight" % (i, card.get("kind")))
 
     if source_chunks:
-        haystack = _normalize_for_grounding("\n".join(source_chunks))
+        # Round-4: checked against each chunk INDIVIDUALLY, never a
+        # concatenation. Joining first creates text that exists in no source
+        # passage, so a "quote" spanning the seam between two unrelated
+        # excerpts matched and was rendered to the user as one continuous
+        # sentence from the book.
+        normalized_chunks = [_normalize_for_grounding(c) for c in source_chunks]
         for i, card in enumerate(cards):
             quote = str(card.get("highlight") or "").strip()
-            if len(quote) < MIN_GROUNDED_QUOTE_CHARS:
+            if not quote:
                 continue
-            if _normalize_for_grounding(quote) not in haystack:
+            # Round-5: NO length exemption. The old skip reasoned that a short
+            # fragment could match by coincidence so checking proved little —
+            # but that argument is about FALSE POSITIVES, and the risk here is
+            # the opposite one. An unmatched short quote is positive evidence
+            # of fabrication, and every highlight is rendered to the user
+            # inside quotation marks as the book's own words. A quote too
+            # short to verify should be null, not unverified.
+            needle = _normalize_for_grounding(quote)
+            if not any(needle in c for c in normalized_chunks):
                 _fail(provider,
                       "card %d has a highlight quote that does not appear in the source" % i)
 
