@@ -555,6 +555,12 @@ def _run_migrations():
         "ALTER TABLE users ADD COLUMN IF NOT EXISTS display_name VARCHAR",
         # profiles — local-first growth state sync (July 2026)
         "ALTER TABLE profiles ADD COLUMN IF NOT EXISTS growth_state JSON",
+        # profiles — deletion tombstones (finding #7, Sep 2026): a never-
+        # shrinking union of profile ids any device has recorded as deleted,
+        # enforced on every PUT /profile/growth independent of the whole-blob
+        # LWW outcome, so a stale device can't resurrect a deleted profile by
+        # pushing a later timestamp. See app/models/profile.py.
+        "ALTER TABLE profiles ADD COLUMN IF NOT EXISTS deleted_profile_ids JSON",
         # push_tokens — minute-precision delivery (July 2026)
         "ALTER TABLE push_tokens ADD COLUMN IF NOT EXISTS notification_minute INTEGER DEFAULT 0",
         "ALTER TABLE push_tokens ADD COLUMN IF NOT EXISTS streak_alerts_enabled BOOLEAN DEFAULT TRUE",
@@ -761,6 +767,11 @@ REQUIRED_COLUMNS = [
     # paths would silently fall back to corrupting the shared premium_until
     # again, exactly the bug this migration exists to close.
     ("users", "paid_premium_until"), ("users", "complimentary_until"),
+    # Finding #7 (Sep 2026) — deletion tombstones. Missing this column would
+    # mean the tombstone filter silently has nothing to consult/union into,
+    # collapsing straight back to the stale-device resurrection bug this fix
+    # closes. See app/models/profile.py / app/routers/profile.py.
+    ("profiles", "deleted_profile_ids"),
     ("chat_context_chunks", "book_id"), ("chat_context_chunks", "chunk_index"),
     # Personalization questions (Aug 2026). EVERY column the runtime paths
     # actually read or write is listed — audit fix: registering only three
