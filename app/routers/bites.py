@@ -357,6 +357,18 @@ def get_or_create_session(
             today=today, origin="manual",
         )
     except SessionGenerationError as e:
+        # A `code` (currently only 'session_generating' — finding #5's
+        # claim/lease fix) is surfaced as a structured detail, the SAME
+        # {code, message} shape as daily_limit_reached/source_locked/
+        # personalize_processing above, so the app can branch on `code`
+        # (ApiError.code — see src/services/api.js) rather than parsing
+        # prose. A code-less error keeps the original plain-string detail,
+        # unchanged for every pre-existing failure path.
+        if e.code:
+            raise HTTPException(
+                status_code=e.status_code,
+                detail={"code": e.code, "message": e.message},
+            )
         raise HTTPException(status_code=e.status_code, detail=e.message)
 
     background_tasks.add_task(mixpanel_service.track, "session_generated", current_user.id, {

@@ -281,7 +281,14 @@ c.raises(lambda: svc.generate_story_metadata("Book", None, BODIES, 1), ProviderE
 
 import inspect  # noqa: E402
 from app.services import session_service  # noqa: E402
-story_src = inspect.getsource(session_service.generate_session_for_item)
+# Finding #5 (Aug 2026, session-generation claim/lease): the actual
+# generation logic — including this story-metadata fallback and the
+# server-side card split checked below — moved from generate_session_for_item
+# into _build_session_content, which ONLY the claim-winning worker calls.
+# generate_session_for_item itself is now the claim/dispatch wrapper (see
+# its own docstring); the code these two checks look for still exists
+# unchanged, just at the new location.
+story_src = inspect.getsource(session_service._build_session_content)
 c.ok("serving plain headings" in story_src and "except Exception" in story_src,
      "session_service still falls back to plain headings when metadata fails")
 c.ok('"kind": "story"' in story_src and '"body": body' in story_src,

@@ -544,6 +544,12 @@ def _run_migrations():
         # daily_bites — session lifecycle: scheduled generation + hold-until-read (July 2026)
         "ALTER TABLE daily_bites ADD COLUMN IF NOT EXISTS origin VARCHAR DEFAULT 'manual'",
         "ALTER TABLE daily_bites ADD COLUMN IF NOT EXISTS read_at TIMESTAMP",
+        # daily_bites — generation claim/lease (finding #5, Aug 2026): protects
+        # the expensive LLM call itself, not just the stored row, from a
+        # concurrent double-tap/retry racing generate_session_for_item. See
+        # the model's docstring in app/models/bite.py.
+        "ALTER TABLE daily_bites ADD COLUMN IF NOT EXISTS claimed_by VARCHAR",
+        "ALTER TABLE daily_bites ADD COLUMN IF NOT EXISTS claimed_until TIMESTAMP",
         # users
         "ALTER TABLE users ADD COLUMN IF NOT EXISTS premium_until TIMESTAMP",
         "ALTER TABLE users ADD COLUMN IF NOT EXISTS display_name VARCHAR",
@@ -740,6 +746,10 @@ REQUIRED_COLUMNS = [
     ("library_items", "is_active"),
     ("users", "reserved_sources_count"), ("users", "entitlement_source"),
     ("daily_bites", "origin"), ("daily_bites", "read_at"),
+    # Finding #5 (Aug 2026) — the generation claim/lease. Missing either
+    # column would mean the claim silently can't be taken/verified,
+    # collapsing straight back to the double-LLM-call bug this fix closes.
+    ("daily_bites", "claimed_by"), ("daily_bites", "claimed_until"),
     # Task 20 — the durable delivery-cycle ledger itself must be verified
     # present/correct at boot, per Task 20's own requirement #11 ("the
     # backend must not report ready if its required durable delivery
