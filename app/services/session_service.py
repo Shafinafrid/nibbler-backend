@@ -295,7 +295,10 @@ STORY_WORDS = {5: 1100, 10: 2200, 15: 3300}
 # surrounding DailyBite per-day cache (this function is only ever reached
 # once per (user, item, day) — see generate_session_for_item's docstring),
 # not from the roll itself being deterministic.
-PERSONALIZATION_PROBABILITY = 0.20
+# Read live from settings.personalization_probability (Railway env
+# PERSONALIZATION_PROBABILITY, default 0.20) rather than a fixed constant, so
+# it can be raised to 1.0 for on-device testing and reverted without a
+# redeploy — just a Railway dashboard variable change + restart.
 # Below this, the retrieved excerpts are too thin to ground a genuine
 # preference question in the book's actual content, not just its topic.
 PERSONALIZATION_MIN_CHUNK_CHARS = 400
@@ -327,7 +330,8 @@ def _roll_personalization(db: Session, user: User, item: LibraryItem, chunks: Li
     )
     if not prior_exists:
         return False
-    return random.random() < PERSONALIZATION_PROBABILITY
+    from app.config import get_settings
+    return random.random() < get_settings().personalization_probability
 
 
 def _insert_personalization_card(result: dict, question: dict, profile_id=None) -> None:

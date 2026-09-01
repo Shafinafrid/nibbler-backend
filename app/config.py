@@ -160,6 +160,13 @@ class Settings(BaseSettings):
     max_pdf_upload_mb: int = 50
     max_extracted_text_chars: int = 2_000_000
 
+    # Dynamic growth-profile personalization (Aug 2026): chance any single
+    # eligible wisdom session also carries a book-grounded "personalize" card.
+    # Founder-tunable via Railway without a redeploy — e.g. set to 1.0
+    # temporarily while testing on a real device, then back to 0.2 for normal
+    # operation. See _roll_personalization in session_service.py.
+    personalization_probability: float = 0.20
+
     class Config:
         env_file = ".env"
         case_sensitive = False
