@@ -132,6 +132,7 @@ os.environ["APP_ENV"] = "test"
 os.environ["DATABASE_URL"] = database_url
 
 import uuid
+import time
 import datetime
 import threading as _threading
 from sqlalchemy import text as sa_text
@@ -433,6 +434,195 @@ succeeded3 = [r for r in results3.values() if r.get("ok")]
 check("every successful caller's id matches the single canonical row",
       len(rows3) == 1 and all(r["id"] == rows3[0]["id"] for r in succeeded3),
       {"canonical": rows3[0]["id"] if rows3 else None, "results": results3})
+
+
+# ═════════════════════════════════════════════════════════════════════════
+section("PG4 — re-audit finding #5-4: heartbeat keeps a lease alive during a slow generation")
+# ═════════════════════════════════════════════════════════════════════════
+# Shrink the lease window and heartbeat interval so this test runs in
+# seconds instead of minutes, then hold a "slow" generation past the
+# (shrunk) lease window with the heartbeat RUNNING. Without a heartbeat,
+# GENERATION_CLAIM_MINUTES has no renewal at all — a provider slower than
+# the fixed window would let a retry steal the "expired" lease and trigger
+# a SECOND real generation while the first is still genuinely in flight
+# (the exact double-LLM-call cost finding #5 exists to prevent). This
+# proves the heartbeat closes that gap on real Postgres with two real
+# threads/sessions, and the negative control (heartbeat explicitly
+# disabled) proves the test would have caught the regression.
+ss.GENERATION_CLAIM_MINUTES = 0.05          # 3 seconds
+ss._GENERATION_HEARTBEAT_SECONDS = 1.0       # renew every 1s — well under 3s
+
+uid4, iid4 = seed("ep4")
+generation_hold = _threading.Event()
+generation_may_finish = _threading.Event()
+call_count4 = {"n": 0}
+call_lock4 = _threading.Lock()
+
+
+def _held_generate_wisdom_session(self, **kwargs):
+    with call_lock4:
+        call_count4["n"] += 1
+    generation_hold.set()
+    # Hold well past the (shrunk) lease window — long enough that, WITHOUT
+    # a working heartbeat, the lease would expire and a second attempt
+    # could steal it.
+    generation_may_finish.wait(timeout=20)
+    return _fast_deck()
+
+
+ss.LLMService.generate_wisdom_session = _held_generate_wisdom_session
+
+# ── Positive case: heartbeat enabled (the actual fix) ───────────────────
+worker4_result = {}
+
+
+def worker4():
+    db = SessionLocal()
+    try:
+        current_user = db.query(User).filter(User.id == uid4).first()
+        data = bites_router.SessionRequest(library_item_id=iid4, read_length=5)
+        resp = bites_router.get_or_create_session.__wrapped__(
+            request=_Req(), data=data, background_tasks=_BG(),
+            current_user=current_user, db=db,
+        )
+        worker4_result["ok"] = True
+        worker4_result["id"] = resp.id
+    except Exception as e:
+        worker4_result["ok"] = False
+        worker4_result["error"] = type(e).__name__
+    finally:
+        db.close()
+
+
+t4 = _threading.Thread(target=worker4)
+t4.start()
+generation_hold.wait(timeout=15)
+
+# Generation is now confirmed in flight. Wait past the (shrunk) 3s lease
+# window WHILE it is still running, then attempt a second concurrent
+# request for the same slot — this is exactly the "retry during a slow
+# provider" scenario the auditor described. With a working heartbeat, the
+# lease has been renewed and this second request must see a LIVE claim
+# (not an expired one) and get the retryable 409 rather than triggering
+# its own generation.
+time.sleep(5.0)
+
+second_attempt_result = {}
+db2 = SessionLocal()
+try:
+    current_user2 = db2.query(User).filter(User.id == uid4).first()
+    data2 = bites_router.SessionRequest(library_item_id=iid4, read_length=5)
+    resp2 = bites_router.get_or_create_session.__wrapped__(
+        request=_Req(), data=data2, background_tasks=_BG(),
+        current_user=current_user2, db=db2,
+    )
+    second_attempt_result["ok"] = True
+    second_attempt_result["id"] = resp2.id
+except Exception as e:
+    second_attempt_result["ok"] = False
+    second_attempt_result["error"] = type(e).__name__
+    second_attempt_result["detail"] = getattr(e, "detail", None)
+finally:
+    db2.close()
+
+generation_may_finish.set()
+t4.join(timeout=20)
+
+# The second request must NEVER trigger its own generation (that's what
+# call_count4 below proves). It's allowed to resolve either way depending
+# on exact timing against GENERATION_POLL_TIMEOUT_SECONDS: a retryable 409
+# if it arrives while still genuinely generating, OR the SAME canonical row
+# if the poll-and-wait path (_wait_for_daily_bite) catches the winner
+# finishing within the poll window — both are correct outcomes of "the
+# heartbeat kept this worker's ownership alive," never a stolen lease.
+second_attempt_is_409 = (
+    second_attempt_result.get("ok") is False
+    and isinstance(second_attempt_result.get("detail"), dict)
+    and second_attempt_result["detail"].get("code") == "session_generating"
+)
+second_attempt_converged = (
+    second_attempt_result.get("ok") is True
+    and second_attempt_result.get("id") == worker4_result.get("id")
+)
+check("with the heartbeat running, a concurrent request during a slow (past-lease-window) "
+      "generation either gets the retryable session_generating error, or converges on the "
+      "SAME canonical row via the poll-and-wait path — never a stolen lease of its own",
+      second_attempt_is_409 or second_attempt_converged,
+      second_attempt_result)
+check("the original slow generation still completed successfully",
+      worker4_result.get("ok") is True, worker4_result)
+check("the LLM was invoked EXACTLY ONCE — the heartbeat prevented a takeover-triggered second call",
+      call_count4["n"] == 1, call_count4)
+
+rows4 = db_rows(uid4, iid4)
+check("exactly ONE DailyBite row exists for the slot after the heartbeat-protected race",
+      len(rows4) == 1, rows4)
+
+# ── Negative control: heartbeat DISABLED — proves this test has real teeth ──
+# Same scenario, but with the heartbeat's renewal function forced to be a
+# no-op (simulating the pre-fix code, which had no renewal at all). This
+# must reproduce the exact bug the auditor described: a takeover during
+# still-active generation, and a SECOND real LLM call.
+uid5, iid5 = seed("ep5")
+_orig_renew = ss._renew_daily_bite_claim
+ss._renew_daily_bite_claim = lambda db, bite_id, worker_id: False  # heartbeat renewal always "fails"
+
+generation_hold.clear()
+generation_may_finish.clear()
+call_count4["n"] = 0
+
+worker5_result = {}
+
+
+def worker5():
+    db = SessionLocal()
+    try:
+        current_user = db.query(User).filter(User.id == uid5).first()
+        data = bites_router.SessionRequest(library_item_id=iid5, read_length=5)
+        resp = bites_router.get_or_create_session.__wrapped__(
+            request=_Req(), data=data, background_tasks=_BG(),
+            current_user=current_user, db=db,
+        )
+        worker5_result["ok"] = True
+        worker5_result["id"] = resp.id
+    except Exception as e:
+        worker5_result["ok"] = False
+        worker5_result["error"] = type(e).__name__
+    finally:
+        db.close()
+
+
+t5 = _threading.Thread(target=worker5)
+t5.start()
+generation_hold.wait(timeout=15)
+time.sleep(5.0)
+
+second_attempt_result5 = {}
+db3 = SessionLocal()
+try:
+    current_user3 = db3.query(User).filter(User.id == uid5).first()
+    data3 = bites_router.SessionRequest(library_item_id=iid5, read_length=5)
+    resp3 = bites_router.get_or_create_session.__wrapped__(
+        request=_Req(), data=data3, background_tasks=_BG(),
+        current_user=current_user3, db=db3,
+    )
+    second_attempt_result5["ok"] = True
+    second_attempt_result5["id"] = resp3.id
+except Exception as e:
+    second_attempt_result5["ok"] = False
+    second_attempt_result5["error"] = type(e).__name__
+finally:
+    db3.close()
+
+generation_may_finish.set()
+t5.join(timeout=20)
+ss._renew_daily_bite_claim = _orig_renew
+
+check("NEGATIVE CONTROL (heartbeat disabled): a second request during the same slow window "
+      "DOES steal the lease and trigger its own generation — proving PG4's positive result "
+      "above is a genuine effect of the heartbeat, not a timing coincidence",
+      second_attempt_result5.get("ok") is True and call_count4["n"] == 2,
+      {"second_attempt": second_attempt_result5, "call_count": call_count4})
 
 
 print()

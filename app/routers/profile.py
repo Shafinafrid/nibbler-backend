@@ -22,10 +22,31 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/profile", tags=["profile"])
 
 
-def _get_or_create_profile(user: User, db: Session) -> Profile:
+def _get_or_create_profile(user: User, db: Session, *, for_update: bool = False) -> Profile:
     """Local-first onboarding never creates a backend profile row, so the
     row is created lazily — a 404 here used to break every local-onboarded
-    user (and legacy /bites/today)."""
+    user (and legacy /bites/today).
+
+    Re-audit finding #7-3 (Sep 2026): `for_update=True` takes a real
+    `SELECT ... FOR UPDATE` row lock, matching this codebase's established
+    idiom (entitlement_service.py, delivery_lifecycle.py, connect.py all use
+    the same primitive for a serialized read-modify-write). `user.profile`
+    is a relationship attribute that may already be populated from an
+    earlier, UNLOCKED read on this same request (e.g. get_current_user's own
+    query) — trusting it here would make `for_update` a no-op in exactly the
+    case that matters, so a locked caller always re-queries explicitly with
+    `populate_existing()` to force a fresh, lock-holding read from the
+    database rather than SQLAlchemy's identity map handing back the
+    already-loaded (unlocked) object.
+    """
+    if for_update and user.profile:
+        return (
+            db.query(Profile)
+            .filter(Profile.id == user.profile.id)
+            .populate_existing()
+            .with_for_update()
+            .first()
+        )
     if user.profile:
         return user.profile
     profile = Profile(
@@ -37,6 +58,14 @@ def _get_or_create_profile(user: User, db: Session) -> Profile:
     db.commit()
     db.refresh(profile)
     db.refresh(user)
+    if for_update:
+        return (
+            db.query(Profile)
+            .filter(Profile.id == profile.id)
+            .populate_existing()
+            .with_for_update()
+            .first()
+        )
     return profile
 
 
@@ -96,8 +125,24 @@ def update_growth_state(
     """Store the app's full local growth state ({person, profiles[],
     activeProfileId}) so onboarding survives reinstalls and new devices.
     The app pushes on every ProfileRepository.saveState and pulls when its
-    local copy is empty at sign-in."""
-    profile = _get_or_create_profile(current_user, db)
+    local copy is empty at sign-in.
+
+    Re-audit finding #7-3 (Sep 2026): `for_update=True` takes a real row
+    lock (`SELECT ... FOR UPDATE`) for the DURATION of this whole
+    read-modify-write, held until `db.commit()` below. Before this fix, two
+    concurrent requests for the same profile (e.g. device A deleting profile
+    X and device B deleting profile Y, syncing at the same moment) each read
+    the row's `deleted_profile_ids`/`growth_state` independently, computed
+    their own union in Python, and whichever commit landed LAST won outright
+    — silently discarding the other request's tombstone/growth_state union
+    entirely (reproduced: A's tombstone for X was lost when B's commit
+    landed after A's). The lock serializes the two requests instead: B's
+    `SELECT ... FOR UPDATE` blocks until A's transaction commits, then B
+    reads A's ALREADY-COMMITTED union as its own starting point — so the
+    second writer's union is computed from up-to-date state, not a stale
+    snapshot, and no tombstone or edit from either side is lost.
+    """
+    profile = _get_or_create_profile(current_user, db, for_update=True)
 
     # Deletion tombstones (finding #7, Sep 2026) — applied FIRST, before either
     # existing guard below, and unconditionally (regardless of which side

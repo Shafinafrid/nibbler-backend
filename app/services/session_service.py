@@ -14,6 +14,7 @@ use it without a request context.
 import os
 import random
 import re
+import threading
 import time
 import uuid
 import logging
@@ -24,6 +25,7 @@ from sqlalchemy import update
 from sqlalchemy.orm import Session
 from sqlalchemy.exc import IntegrityError
 
+from app.database import SessionLocal
 from app.models.bite import DailyBite
 from app.models.library import LibraryItem
 from app.models.personalization import PersonalizationQuestion
@@ -178,6 +180,76 @@ def _release_daily_bite_claim(db: Session, bite_id: str, worker_id: str) -> None
         )
     )
     db.commit()
+
+
+def _renew_daily_bite_claim(db: Session, bite_id: str, worker_id: str) -> bool:
+    """Extend this worker's generation lease while it is still working.
+
+    Re-audit finding #5-4 (Sep 2026): the fixed GENERATION_CLAIM_MINUTES
+    lease had nothing renewing it. Story metadata, wisdom generation, and an
+    optional personalization-question call first can together legitimately
+    exceed the lease window on a slow provider — at which point a retried
+    request (or the scheduler re-attempting the same slot) could steal the
+    "expired" lease and start a SECOND real generation while the first was
+    still genuinely in flight, exactly the double-LLM-call cost this whole
+    mechanism exists to prevent. Same shape as bites.py's
+    _renew_personalization_claim / connect.py's chat-turn renewal: an atomic
+    `UPDATE ... WHERE id = :id AND claimed_by = :worker_id`, rowcount
+    checked — renewal is ownership-conditional, so a worker that has already
+    been superseded simply stops renewing rather than fighting the new
+    owner.
+    """
+    result = db.execute(
+        update(DailyBite)
+        .where(DailyBite.id == bite_id, DailyBite.claimed_by == worker_id)
+        .values(claimed_until=datetime.utcnow() + timedelta(minutes=GENERATION_CLAIM_MINUTES))
+        .execution_options(synchronize_session=False)
+    )
+    db.commit()
+    return result.rowcount == 1
+
+
+_GENERATION_HEARTBEAT_SECONDS = 60.0
+
+
+class _GenerationHeartbeat:
+    """Renews this worker's DailyBite generation lease while it is blocked
+    in one or more LLM calls (re-audit finding #5-4).
+
+    Same design as bites.py's _PersonalizeHeartbeat / connect.py's
+    _ChatTurnHeartbeat: a background daemon thread with its OWN SessionLocal
+    (the caller's session is idle on another stack while blocked in network
+    I/O and must not be shared across threads), renewing on a fixed
+    interval well under the lease window, stopping silently the moment it
+    is no longer the owner (superseded) or `stop()` is called.
+    """
+
+    def __init__(self, bite_id: str, worker_id: str, interval=None):
+        self.bite_id = bite_id
+        self.worker_id = worker_id
+        self.interval = interval if interval is not None else _GENERATION_HEARTBEAT_SECONDS
+        self._stop = threading.Event()
+        self._thread = None
+
+    def _run(self):
+        while not self._stop.wait(self.interval):
+            db = SessionLocal()
+            try:
+                if not _renew_daily_bite_claim(db, self.bite_id, self.worker_id):
+                    return   # no longer the owner — stop renewing
+            except Exception:
+                logger.exception("Generation heartbeat failed for bite %s", self.bite_id)
+            finally:
+                db.close()
+
+    def start(self):
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def stop(self):
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=5.0)
 
 
 def _wait_for_daily_bite(db: Session, user_id: str, item_id: str, today: date_cls) -> Optional[DailyBite]:
@@ -465,6 +537,16 @@ def generate_session_for_item(
     # We won the claim: `claimed_row` is OUR placeholder (cards is NULL).
     # Generate into it; finalize on success, release (delete) on failure —
     # never leave a dangling claimed-but-broken row blocking the slot.
+    #
+    # Re-audit finding #5-4: a heartbeat renews the lease for the whole
+    # duration of generation, so a slow provider (retries, a fallback chain,
+    # an optional personalization-question call first) can never outlive
+    # GENERATION_CLAIM_MINUTES while this worker is still genuinely working
+    # — closing the takeover-during-active-generation gap. Started before
+    # the call and stopped in `finally` so it never outlives this attempt
+    # either way (success, failure, or an unexpected exception).
+    heartbeat = _GenerationHeartbeat(claimed_row.id, worker_id)
+    heartbeat.start()
     try:
         bite = _build_session_content(
             db, user=user, item=item, read_length=read_length,
@@ -474,6 +556,8 @@ def generate_session_for_item(
     except BaseException:
         _release_daily_bite_claim(db, claimed_row.id, worker_id)
         raise
+    finally:
+        heartbeat.stop()
     if bite is None:
         # Finalize reported we no longer own the claim (an expired lease was
         # taken over mid-generation) — our work is discarded, and whichever
