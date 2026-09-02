@@ -728,7 +728,22 @@ def _build_session_content(
             logger.warning("Fresh retrieval failed (%s) — raw-text fallback", e)
             fresh = []
         chunks = [f["text"] for f in fresh if f.get("text")]
-        chunk_ids = [f["chunk_index"] for f in fresh if isinstance(f.get("chunk_index"), int)]
+        # Pinecone's metadata store has no integer type — every number comes
+        # back as a float (confirmed live: chunk_index round-trips as 1.0,
+        # not 1), even though embedding_service.index_text wrote it as a
+        # plain int. `isinstance(x, int)` alone silently dropped every
+        # chunk_index here, which made chunk_ids empty for EVERY wisdom
+        # session (verified back to at least 2026-08-15, well before the
+        # personalization card existed) — harmless while nothing depended on
+        # chunk_ids being non-empty, but it silently blocked the "chunk_ids"
+        # truthiness gate below the moment that gate shipped. bool excluded
+        # explicitly since bool is an int subclass in Python and Pinecone's
+        # metadata could in principle round-trip one.
+        chunk_ids = [
+            int(f["chunk_index"]) for f in fresh
+            if isinstance(f.get("chunk_index"), (int, float))
+            and not isinstance(f.get("chunk_index"), bool)
+        ]
         # Retrieval is ranked by similarity to the growth profile, so the top
         # chunk IS today's most goal-relevant passage (Connect tab uses it).
         if chunks and pq:
