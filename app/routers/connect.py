@@ -34,6 +34,7 @@ from app.models.library import LibraryItem
 from app.models.bite import DailyBite
 from app.models.user_data import ChatTurn, ChatContextChunk
 from app.rate_limit import limiter
+from app.services.profile_resolution import resolve_assigned_profile, scoring_fingerprint
 from app.services.llm import LLMService, CONNECT_MAX_TOKENS, CONNECT_BROAD_MAX_TOKENS
 from app.services.embedding_service import EmbeddingService, EmbeddingError
 from app.services import mixpanel_service
@@ -115,6 +116,16 @@ class InsightsResponse(BaseModel):
     top_passages: List[str]
     chunk_count: int
     mode: str
+    # WHICH profile this score was actually computed against, and a digest of
+    # the exact inputs used (Sep 2026). The client caches per book per DAY,
+    # so without these a score computed for profile A was still served after
+    # the book was reassigned to B — the same day, silently, with the new
+    # goal's name printed beside the old goal's number.
+    #
+    # The client must refuse to display or cache a response whose identity no
+    # longer matches the book's current assignment.
+    resolved_profile_id: Optional[str] = None
+    scoring_fingerprint: Optional[str] = None
 
 
 class GoalPassage(BaseModel):
@@ -126,6 +137,10 @@ class BookStatsResponse(BaseModel):
     sessions_read: int      # unique sessions COMPLETED (server read receipts — re-reads can't inflate)
     sessions_total: int     # how many nibbles this book can produce in total
     explored_pct: int       # distinct chunks actually read / all chunks
+    # Which profile this book currently resolves to, so the client can verify
+    # the goal passage below belongs to the goal it is about to display it
+    # under (the counts above are profile-independent and always valid).
+    resolved_profile_id: Optional[str] = None
     chunk_count: int
     goal_passage: Optional[GoalPassage] = None
 
@@ -393,6 +408,25 @@ def _require_premium(user: User):
         )
 
 
+def _resolve_profile_for_item(db: Session, user: User, item: LibraryItem):
+    """The growth profile THIS book is assigned to, from server data only.
+
+    Never trusts a client-supplied profile object: the client cannot be the
+    authority on which goal a book serves, or the score it renders is
+    unverifiable. Uses the same resolver as session generation so the number
+    Connect shows and the nibbles the user reads are measured against the
+    same profile.
+    """
+    from app.models.profile import Profile
+
+    prof = db.query(Profile).filter(Profile.user_id == user.id).first()
+    if not prof:
+        return None
+    return resolve_assigned_profile(
+        prof.growth_state or {}, item, set(prof.deleted_profile_ids or []),
+    )
+
+
 def _get_item(item_id: str, user: User, db: Session) -> LibraryItem:
     item = db.query(LibraryItem).filter(
         LibraryItem.id == item_id,
@@ -545,6 +579,12 @@ def get_insights(
     _require_premium(current_user)
     item = _get_item(data.library_item_id, current_user, db)
 
+    # Resolved BEFORE any early return, so every response — including the
+    # "Unknown" ones — carries the identity of the profile it relates to.
+    # A client that cannot tell which profile a response belongs to cannot
+    # safely cache it.
+    resolved = _resolve_profile_for_item(db, current_user, item)
+
     def _unknown() -> InsightsResponse:
         # The app shows "analytics will be ready in a moment" for this band and
         # refuses to cache it — a transient failure must never stick, and a
@@ -553,15 +593,33 @@ def get_insights(
             relevance_pct=0, relevance_band="Unknown",
             top_passages=[], chunk_count=item.chunk_count or 0,
             mode=item.mode or "wisdom",
+            resolved_profile_id=(resolved or {}).get("id"),
+            scoring_fingerprint=scoring_fingerprint(resolved),
         )
 
-    profile = data.growth_profile
+    # ── Server-authoritative profile resolution (Sep 2026) ───────────────
+    #
+    # This used to score against whatever growth_profile the CLIENT sent —
+    # in practice always `getActiveProfile(...)`, which ignores the book's
+    # own assignment entirely. And since `activeProfileId` can never be
+    # changed by a user (it is written only at onboarding and on
+    # delete-fallback), every book was measured against the ONBOARDING
+    # profile forever, no matter what the Library said it served.
+    #
+    # The resolver is now the same one session generation uses, so the
+    # percentage and the nibbles can never disagree about which goal a book
+    # is being judged against. `data.growth_profile` is still ACCEPTED for
+    # request compatibility with older builds, but deliberately ignored.
     query_bits = []
-    if profile:
+    if resolved:
+        interests = [
+            (i.get("tag") if isinstance(i, dict) else i)
+            for i in (resolved.get("interests") or [])
+        ]
         query_bits = [
-            profile.aspirationUnderstanding or profile.aspirationLabel or "",
-            " ".join(profile.interests or []),
-            profile.lifeArea or "",
+            resolved.get("aspirationUnderstanding") or resolved.get("aspirationLabel") or "",
+            " ".join([i for i in interests if i]),
+            resolved.get("lifeArea") or "",
         ]
     query = " ".join(b for b in query_bits if b).strip() or "personal growth and learning"
 
@@ -605,6 +663,8 @@ def get_insights(
         top_passages=passages,
         chunk_count=item.chunk_count or 0,
         mode=item.mode or "wisdom",
+        resolved_profile_id=(resolved or {}).get("id"),
+        scoring_fingerprint=scoring_fingerprint(resolved),
     )
 
 
@@ -659,9 +719,28 @@ def get_book_stats(
     else:
         explored = 0
 
+    # ── Goal passage, filtered by PROVENANCE (Sep 2026) ──────────────────
+    #
+    # A goal passage is the excerpt that spoke to ONE specific goal, chosen
+    # when that nibble was generated. The row used to carry no record of
+    # which profile that was, so after a book was reassigned Connect happily
+    # showed a passage picked for the OLD goal directly beneath the NEW
+    # goal's name — the most convincing kind of wrong, because every part of
+    # it is real.
+    #
+    # Now a passage is shown only when it was written for the profile the
+    # book currently resolves to. Legacy rows (growth_profile_id NULL,
+    # written before this column existed) are HIDDEN rather than guessed at:
+    # "nothing yet" is honest, "probably yours" is not. They age out
+    # naturally as new nibbles are read.
+    resolved = _resolve_profile_for_item(db, current_user, item)
+    resolved_id = (resolved or {}).get("id")
+
     goal_passage = None
     for b in read:  # newest first
-        if b.goal_passage:
+        if not b.goal_passage:
+            continue
+        if resolved_id and getattr(b, "growth_profile_id", None) == resolved_id:
             goal_passage = GoalPassage(text=b.goal_passage, date=b.date.isoformat())
             break
 
@@ -671,6 +750,7 @@ def get_book_stats(
         explored_pct=max(0, min(100, explored)),
         chunk_count=chunk_count,
         goal_passage=goal_passage,
+        resolved_profile_id=resolved_id,
     )
 
 

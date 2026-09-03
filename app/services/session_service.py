@@ -858,6 +858,12 @@ def _build_session_content(
         headline=(result.get("headline") or "")[:500],
         preview=result.get("preview") or "",
         goal_passage=goal_passage,
+        # WHICH growth profile this session — and so its goal passage — was
+        # generated for (Sep 2026). Connect uses it to avoid showing a
+        # passage chosen for a previous assignment under the book's current
+        # goal. Same source as the personalization card's own profileId, so
+        # a session and its question can never disagree.
+        growth_profile_id=(profile or {}).get("id"),
         chunk_ids=chunk_ids,
         origin=origin,
     )
