@@ -37,7 +37,15 @@ class LibraryItem(Base):
     mode = Column(String, default="wisdom")            # wisdom | story
     kind = Column(String, default="book")              # book | article | paper
     author = Column(String, nullable=True)
-    growth_profile_name = Column(String, nullable=True)  # premium: which profile this feeds
+    # Which growth profile this book feeds.
+    #
+    # `growth_profile_id` is the ASSIGNMENT IDENTITY (Sep 2026) — stable
+    # across renames. `growth_profile_name` is now a server-DERIVED display
+    # snapshot, re-derived from the id on every write; it is also the only
+    # thing legacy rows (and pre-update clients) have, so it stays readable
+    # as a fallback. Never treat the name as identity in new code.
+    growth_profile_id = Column(String, nullable=True, index=True)
+    growth_profile_name = Column(String, nullable=True)  # derived/legacy display
     story_progress = Column(Integer, default=0)          # story mode: next chunk index to read
     is_active = Column(Boolean, default=True)            # feeds nibble generation (≤5 active per user)
     # Free-tier lock selection (Task 2, Aug 2026): true if this item is one of

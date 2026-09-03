@@ -517,6 +517,29 @@ def _run_migrations():
         "ALTER TABLE library_items ADD COLUMN IF NOT EXISTS ocr_pages_total INTEGER DEFAULT 0",
         "ALTER TABLE library_items ADD COLUMN IF NOT EXISTS author VARCHAR",
         "ALTER TABLE library_items ADD COLUMN IF NOT EXISTS growth_profile_name VARCHAR",
+        # Growth-profile assignment integrity (Sep 2026). Books used to
+        # reference a profile by NAME alone, so renaming a profile silently
+        # orphaned every book assigned to it (the name no longer matched
+        # anything) and duplicate names were indistinguishable. The stable id
+        # is now the assignment identity; `growth_profile_name` is retained as
+        # a server-DERIVED display/legacy field, re-derived from the id on
+        # every write so it can never drift. Nullable on purpose — see the
+        # three assignment states in app/services/profile_resolution.py:
+        # assigned (id set), bootstrap-unassigned (BOTH null) and unresolved
+        # legacy (id null, name set) are genuinely different situations and
+        # must stay distinguishable.
+        "ALTER TABLE library_items ADD COLUMN IF NOT EXISTS growth_profile_id VARCHAR",
+        "CREATE INDEX IF NOT EXISTS ix_library_items_growth_profile_id "
+        "ON library_items (growth_profile_id)",
+        # Goal-passage provenance (Sep 2026). A nibble's goal passage is
+        # written for ONE growth profile, but the row carried no record of
+        # which — so after a book was reassigned, Connect kept showing the
+        # previous profile's passage as if it belonged to the new goal.
+        # Stamped by BOTH generation paths (on-demand session_service and the
+        # scheduler), and filtered against the book's current assignment in
+        # GET /connect/stats. Legacy rows stay NULL and are hidden rather than
+        # guessed at.
+        "ALTER TABLE daily_bites ADD COLUMN IF NOT EXISTS growth_profile_id VARCHAR",
         "ALTER TABLE library_items ADD COLUMN IF NOT EXISTS story_progress INTEGER DEFAULT 0",
         "ALTER TABLE library_items ADD COLUMN IF NOT EXISTS source_url VARCHAR",
         "ALTER TABLE library_items ADD COLUMN IF NOT EXISTS file_size INTEGER",
@@ -772,6 +795,16 @@ REQUIRED_COLUMNS = [
     # collapsing straight back to the stale-device resurrection bug this fix
     # closes. See app/models/profile.py / app/routers/profile.py.
     ("profiles", "deleted_profile_ids"),
+    # Growth-profile assignment integrity (Sep 2026). Without
+    # library_items.growth_profile_id the resolver silently falls all the way
+    # back to legacy name matching for EVERY book — which is precisely the
+    # orphaning bug the stable id exists to close, and it would fail silently
+    # rather than loudly. daily_bites.growth_profile_id is what lets
+    # /connect/stats tell a goal passage written for THIS profile apart from
+    # one written for a previous assignment; missing it would resurrect the
+    # "wrong profile's passage" bug with no error anywhere.
+    ("library_items", "growth_profile_id"),
+    ("daily_bites", "growth_profile_id"),
     ("chat_context_chunks", "book_id"), ("chat_context_chunks", "chunk_index"),
     # Personalization questions (Aug 2026). EVERY column the runtime paths
     # actually read or write is listed — audit fix: registering only three

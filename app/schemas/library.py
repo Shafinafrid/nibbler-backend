@@ -11,6 +11,10 @@ class LibraryItemCreate(BaseModel):
     mode: Optional[str] = "wisdom"          # wisdom | story
     kind: Optional[str] = "book"            # book | article | paper
     author: Optional[str] = None
+    # Assignment identity (Sep 2026). New clients send `growth_profile_id`;
+    # `growth_profile_name` is accepted only for pre-update clients and is
+    # re-derived server-side from whichever profile actually resolves.
+    growth_profile_id: Optional[str] = None
     growth_profile_name: Optional[str] = None
 
 
@@ -19,6 +23,7 @@ class LibraryItemUrlCreate(BaseModel):
     title: Optional[str] = Field(None, max_length=300)
     mode: Optional[str] = "wisdom"
     kind: Optional[str] = "article"
+    growth_profile_id: Optional[str] = None
     growth_profile_name: Optional[str] = None
 
 
@@ -39,6 +44,10 @@ class LibraryItemResponse(BaseModel):
     mode: Optional[str] = "wisdom"
     kind: Optional[str] = "book"
     author: Optional[str] = None
+    # The stable assignment identity, plus its server-derived display name.
+    # Clients must key their pickers off the ID — the name is a snapshot that
+    # the server re-derives, and two profiles can legitimately share one.
+    growth_profile_id: Optional[str] = None
     growth_profile_name: Optional[str] = None
     story_progress: Optional[int] = 0
     is_active: Optional[bool] = True
@@ -95,9 +104,29 @@ class UpdateItemRequest(BaseModel):
 
     So switching a book that has been OCR'd costs nothing and needs no
     re-upload — which is the whole point, because OCR is the expensive part.
+
+    ── Assignment fields (Sep 2026) ──────────────────────────────────────
+    Changing which goal a book serves is a PREMIUM capability, enforced in
+    the route (403 `premium_required`), so these two fields are handled
+    differently from `title`/`mode`.
+
+    OMISSION and EXPLICIT NULL mean different things here, and `is not None`
+    cannot tell them apart — the route inspects `model_fields_set` instead:
+
+      · field omitted        -> leave the assignment unchanged
+      · growth_profile_id=null -> RESET to the server-resolved default
+                                  profile (a wisdom book must always end up
+                                  with a profile; "unassigned" is a
+                                  transient bootstrap state, not a choice)
+      · growth_profile_id="x"  -> assign to that profile, if the caller owns
+                                  it and it is live
+
+    `growth_profile_name` remains accepted for pre-update clients only; the
+    stored name is always re-derived from whichever profile resolves.
     """
     title: Optional[str] = Field(default=None, min_length=1, max_length=300)
     mode: Optional[str] = None                    # 'wisdom' | 'story'
+    growth_profile_id: Optional[str] = None
     growth_profile_name: Optional[str] = None
 
 

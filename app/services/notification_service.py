@@ -256,42 +256,31 @@ def _load_growth_state(db, user_id: str) -> dict:
 
 
 def _pick_profile(growth_state: dict, item):
-    """Mirror the app's buildSessionPayload: book-matched profile, else active, else first."""
-    profiles = growth_state.get("profiles") or []
-    if not profiles:
-        return None
-    gp = None
-    name = getattr(item, "growth_profile_name", None)
-    if name:
-        gp = next((p for p in profiles if (p.get("profileName") or p.get("name")) == name), None)
-    if gp is None:
-        active_id = growth_state.get("activeProfileId")
-        gp = next((p for p in profiles if p.get("id") == active_id or p.get("profileId") == active_id), None)
-    return gp or profiles[0]
+    """Which growth profile this book feeds.
+
+    Sep 2026: delegates to the SHARED resolver so the scheduler, the
+    on-demand session path and Connect's goal-match can never disagree about
+    which profile a book belongs to. This used to be a private copy that
+    matched on `growth_profile_name` only — it had no notion of the stable
+    `growth_profile_id`, so a renamed profile silently orphaned its books
+    here too.
+    """
+    from app.services.profile_resolution import resolve_assigned_profile
+
+    return resolve_assigned_profile(growth_state, item)
 
 
 def _build_profile_dict(growth_state: dict, item) -> dict:
-    """Same shape the app sends in growth_profile (sessionPrefetch.buildSessionPayload)."""
-    gp = _pick_profile(growth_state, item)
-    if not gp:
-        return {}
-    interests = [(i.get("tag") if isinstance(i, dict) else i) for i in (gp.get("interests") or [])]
-    return {
-        # Audit fix (Aug 2026): the id was missing here while the app's own
-        # buildSessionPayload sent it, so every SCHEDULER-generated session
-        # — the majority of premium delivery — persisted profile_id=None and
-        # its personalization answer fell back to "whatever profile is
-        # active right now" instead of the one that fed the question.
-        "id": gp.get("id"),
-        "name": gp.get("profileName") or gp.get("name"),
-        "lifeArea": gp.get("lifeArea"),
-        "aspirationLabel": gp.get("aspirationLabel"),
-        "aspirationUnderstanding": gp.get("aspirationUnderstanding"),
-        "confidenceStyle": gp.get("confidenceStyle"),
-        "goalOrientation": gp.get("goalOrientation"),
-        "contentMode": gp.get("contentMode"),
-        "interests": [i for i in interests if i],
-    }
+    """Same shape the app sends in growth_profile (sessionPrefetch.buildSessionPayload).
+
+    `id` is load-bearing (audit fix, Aug 2026): without it a
+    scheduler-generated session persisted profile_id=None, and its
+    personalization answer was attributed to "whatever profile is active
+    right now" rather than the one that actually fed the question.
+    """
+    from app.services.profile_resolution import build_profile_payload
+
+    return build_profile_payload(_pick_profile(growth_state, item))
 
 
 def _read_length_for(growth_state: dict, item) -> int:
