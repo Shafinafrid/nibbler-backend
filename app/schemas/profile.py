@@ -75,6 +75,71 @@ class GrowthStateUpdate(BaseModel):
     deletedProfileIds: List[str] = Field(default_factory=list)
 
 
+class GrowthPushResult(ProfileResponse):
+    """A growth push's outcome — the profile PLUS what the server did to it.
+
+    A push is never rejected wholesale with a 4xx. The client outbox treats a
+    non-401/408/429 4xx as permanently rejected: it drops the operation and
+    moves on, so the valid ledger/pacing/tombstone edits bundled into that
+    same push would be lost server-side with no way to retry, and the device
+    would receive no reconciliation data at all. Partial acceptance keeps the
+    valid parts and tells the client exactly what to fix locally.
+
+    An UPDATED client reconciles these before settling the outbox op. A truly
+    pre-update binary ignores them — the server stays authoritative and
+    protected, but that device may keep showing a rejected profile or a stale
+    name until it upgrades, restores from the server, signs in afresh, or
+    reinstalls. That is a local display divergence, never server data loss.
+    """
+    # Profile ids the server refused to create (not entitled). The client
+    # must drop these locally, and repair activeProfileId if it pointed here.
+    rejectedProfileIds: List[str] = Field(default_factory=list)
+    # Ids whose incoming body was accepted (created or updated).
+    acceptedProfileIds: List[str] = Field(default_factory=list)
+    # Server-canonical field values the push tried to change but may not —
+    # names above all (renaming goes through PATCH /profile/profiles/{id}).
+    # Shape: [{"id": "...", "fields": {"profileName": "...", ...}}]
+    canonicalProfileFields: List[dict] = Field(default_factory=list)
+    # The tier the server actually applied, so the client never has to guess
+    # from its own possibly-stale purchase state.
+    effectivePremium: bool = False
+
+    @property
+    def deleted_profile_ids(self):
+        """Snake_case alias for the tombstone list.
+
+        `PUT /profile/growth` used to return the ORM Profile row itself, so
+        in-process callers (notably the Postgres concurrency harness, which
+        invokes the endpoint function directly rather than over HTTP) read
+        `resp.deleted_profile_ids`. Returning a Pydantic model instead would
+        break them with an AttributeError even though the JSON on the wire is
+        unchanged. The wire format stays camelCase; this is purely for
+        attribute-access compatibility.
+        """
+        return self.deletedProfileIds
+
+
+class GrowthProfileCreate(BaseModel):
+    """Create ONE additional growth profile (Premium).
+
+    Server-authoritative on purpose: UI gating alone is not enforcement, and
+    PUT /profile/growth accepts a whole array, so creation had to move to a
+    route that can check entitlement and uniqueness under the row lock.
+    """
+    profile: dict
+
+
+class GrowthProfileRename(BaseModel):
+    """Rename ONE growth profile. Available to every tier — renaming a
+    profile you already own is not a premium capability.
+
+    Authoritative because books reference a profile by stable id and carry a
+    DERIVED name snapshot: the rename and the snapshot refresh must happen in
+    one transaction, or assigned books are left showing a stale goal.
+    """
+    name: str = Field(..., min_length=1, max_length=120)
+
+
 class OnboardingMessage(BaseModel):
     message: str
     conversation_history: List[dict] = []

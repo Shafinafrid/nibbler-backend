@@ -12,14 +12,64 @@ from app.schemas.profile import (
     AspirationRequest,
     AspirationResult,
     GrowthStateUpdate,
+    GrowthPushResult,
+    GrowthProfileCreate,
+    GrowthProfileRename,
 )
 from app.services.llm import LLMService
+from app.services.growth_merge import merge_growth_state, CANONICAL_NAME_FLAG
+from app.services.profile_resolution import (
+    attach_unassigned_wisdom_books,
+    find_profile_by_id,
+    live_profiles,
+    lock_user_scope,
+    normalize_profile_name,
+    profile_display_name,
+    promote_resolvable_legacy_rows,
+    reassign_books_from_deleted_profile,
+    redetermine_assignment_names,
+)
 import logging
 import uuid
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/profile", tags=["profile"])
+
+
+def _sync_assignments(db: Session, user_id: str, growth_state: dict, tombstones) -> None:
+    """Keep library assignments consistent with the profile set.
+
+    Runs inside the caller's transaction and lock, on every path that can
+    change which profiles exist or what they are called:
+
+      1. attach bootstrap rows (both assignment fields NULL) — these were
+         created before the profile row existed server-side and have no
+         name to preserve
+      2. promote legacy rows whose name is NOW uniquely matchable
+      3. re-derive the display-name snapshot on every assigned row, which is
+         what makes rename automatically safe
+
+    Never raises into the request: a repair pass failing must not take down
+    an otherwise-valid growth push. The passes are idempotent, so whatever
+    fails here is simply retried on the next call.
+    """
+    try:
+        attach_unassigned_wisdom_books(db, user_id, growth_state, tombstones)
+        promote_resolvable_legacy_rows(db, user_id, growth_state, tombstones)
+        redetermine_assignment_names(db, user_id, growth_state, tombstones)
+    except Exception:
+        logger.exception("assignment sync failed for %s (non-fatal)", user_id)
+
+
+def _growth_push_result(profile: Profile, merged: dict, user: User) -> GrowthPushResult:
+    """Attach the reconciliation payload to the normal profile response."""
+    result = GrowthPushResult.model_validate(profile, from_attributes=True)
+    result.rejectedProfileIds = merged.get("rejected_profile_ids") or []
+    result.acceptedProfileIds = merged.get("accepted_profile_ids") or []
+    result.canonicalProfileFields = merged.get("canonical_profile_fields") or []
+    result.effectivePremium = bool(user.effective_premium)
+    return result
 
 
 def _get_or_create_profile(user: User, db: Session, *, for_update: bool = False) -> Profile:
@@ -116,7 +166,7 @@ def get_profile(
     return profile
 
 
-@router.put("/growth", response_model=ProfileResponse)
+@router.put("/growth", response_model=GrowthPushResult)
 def update_growth_state(
     data: GrowthStateUpdate,
     current_user: User = Depends(get_current_user),
@@ -142,6 +192,12 @@ def update_growth_state(
     second writer's union is computed from up-to-date state, not a stale
     snapshot, and no tombstone or edit from either side is lost.
     """
+    # Lock ordering, step 1 of 3 (advisory -> profile row -> library rows).
+    # The profile row lock alone does not serialize a concurrent library
+    # INSERT that hasn't committed, so ensure/create could race and strand a
+    # freshly-created book with no assignment. Every path that touches
+    # profiles or assignments takes these in this same order.
+    lock_user_scope(db, current_user.id)
     profile = _get_or_create_profile(current_user, db, for_update=True)
 
     # Deletion tombstones (finding #7, Sep 2026) — applied FIRST, before either
@@ -201,44 +257,310 @@ def update_growth_state(
     if union_tombstones != stored_tombstones:
         profile.deleted_profile_ids = sorted(union_tombstones)
 
-    # Last-writer-wins by timestamp, so a device that has been offline can't
-    # push a stale profile over newer edits made elsewhere. Before this there
-    # was no version field at all: outside the special "unreconciled" path in
-    # AppContext.init(), whichever device saved last simply won, however old
-    # its copy was.
+    # ── ID-aware merge (Sep 2026) ────────────────────────────────────────
     #
-    # Returned as a normal 200 rather than a 409 — the client's push is
-    # correctly a no-op, not an error, and a 4xx here would make the outbox
-    # treat it as permanently rejected. Only applied when BOTH sides carry a
-    # timestamp, so older clients keep working unchanged.
-    incoming_at = incoming_growth_state.get("updatedAt")
-    stored_at = (profile.growth_state or {}).get("updatedAt")
-    if incoming_at and stored_at and str(incoming_at) < str(stored_at):
-        logger.info(
-            "growth push ignored for %s: incoming %s is older than stored %s",
-            current_user.id, incoming_at, stored_at,
-        )
-        # The growth_state BODY is dropped as stale (existing LWW behavior,
-        # unchanged), but the tombstone union above must still take effect —
-        # including against the STORED profiles[] this response is about to
-        # return. Without this, a push whose only new information is a
-        # deletion (and which loses LWW on its unrelated growth_state
-        # timestamp) would have its tombstone persisted but the already-
-        # stored profiles[] would still show the now-deleted profile until
-        # some later push's growth_state happens to win and re-triggers the
-        # filter above.
-        _filter_tombstoned_profiles(profile)
-        db.commit()
-        db.refresh(profile)
-        return profile
+    # This used to assign the incoming blob WHOLESALE, with a single
+    # root-level last-writer-wins compare deciding the fate of the entire
+    # profiles array. That is unsafe now that profiles can also be created
+    # and renamed through their own canonical endpoints:
+    #
+    #   · a stale push carrying only {A} would DELETE a profile B that was
+    #     just created canonically — with no tombstone anywhere
+    #   · a stale push carrying an old name would REVERT a canonical rename,
+    #     because an unrelated personalization answer bumps that profile's
+    #     timestamp and makes the stale body look newer
+    #
+    # merge_growth_state applies: absence != deletion, tombstones always win
+    # and block recreation, per-profile whole-body LWW on each profile's OWN
+    # parsed timestamp (ties keep the stored body), canonical fields restored
+    # afterwards, and explicit per-key rules for the root fields.
+    #
+    # Note the old compare was `str(incoming) < str(stored)` — a raw string
+    # compare that orders differing UTC offsets and fractional precisions
+    # wrongly. Timestamps are parsed to instants now.
+    allow_new = bool(current_user.effective_premium)
+    merged = merge_growth_state(
+        (profile.growth_state or {}),
+        incoming_growth_state,
+        tombstones=union_tombstones,
+        allow_new_profile_ids=allow_new,
+    )
 
-    profile.growth_state = incoming_growth_state
-    person_name = ((incoming_growth_state.get("person") or {}).get("name") or "").strip()
+    if merged["rejected_profile_ids"]:
+        logger.info(
+            "growth push for %s: rejected %d unentitled new profile id(s): %s",
+            current_user.id, len(merged["rejected_profile_ids"]),
+            merged["rejected_profile_ids"],
+        )
+    if merged["tie_conflicts"]:
+        logger.info(
+            "growth push for %s: %d profile(s) had equal timestamps with "
+            "differing bodies; kept the stored body: %s",
+            current_user.id, len(merged["tie_conflicts"]), merged["tie_conflicts"],
+        )
+
+    profile.growth_state = merged["state"]
+    person_name = ((merged["state"].get("person") or {}).get("name") or "").strip()
     if person_name:
         profile.name = person_name
+
+    # Keep assignments consistent with whatever the merge settled on, inside
+    # this same transaction and lock: attach bootstrap rows created before
+    # the profile row existed, promote legacy rows whose name is now uniquely
+    # matchable, and refresh every assigned row's derived display name.
+    _sync_assignments(db, current_user.id, merged["state"], union_tombstones)
+
+    db.commit()
+    db.refresh(profile)
+    return _growth_push_result(profile, merged, current_user)
+
+
+def _require_premium_for_profiles(user: User):
+    if not user.effective_premium:
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "code": "premium_required",
+                "message": "Running several growth journeys at once is available with Nibbler Pro.",
+            },
+        )
+
+
+def _reject_duplicate_name(growth_state: dict, name: str, tombstones, *, exclude_id=None):
+    """Refuse a name that collides with another LIVE profile of this user.
+
+    Uniqueness is what makes legacy name-matching decidable at all: with two
+    profiles called "Money", a book that names one is ambiguous forever and
+    can never be promoted to a stable id.
+    """
+    key = normalize_profile_name(name)
+    for p in live_profiles(growth_state, tombstones):
+        if exclude_id and p.get("id") == exclude_id:
+            continue
+        if normalize_profile_name(profile_display_name(p)) == key:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "duplicate_profile_name",
+                    "message": "You already have a growth profile with that name.",
+                },
+            )
+
+
+@router.post("/growth/ensure", response_model=ProfileResponse)
+def ensure_growth_state(
+    data: GrowthStateUpdate,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Idempotently make sure this user HAS a backend profile row.
+
+    Local-first onboarding never creates one, so between "onboarded on the
+    device" and "first growth push landed" the server genuinely has zero
+    profiles. Anything created in that window (an upload, say) cannot be
+    assigned to anything yet.
+
+    Calling this before the first library create closes that window. It is
+    safe to call repeatedly: an existing row is returned untouched, and only
+    the assignment repair passes run.
+    """
+    lock_user_scope(db, current_user.id)
+    profile = _get_or_create_profile(current_user, db, for_update=True)
+    tombstones = set(profile.deleted_profile_ids or [])
+
+    existing = live_profiles(profile.growth_state or {}, tombstones)
+    if not existing:
+        incoming = dict(data.growth_state or {})
+        incoming_profiles = [
+            p for p in (incoming.get("profiles") or [])
+            if isinstance(p, dict) and p.get("id") and p.get("id") not in tombstones
+        ]
+        if incoming_profiles:
+            # Seed from the client's onboarding profile. Only the FIRST is
+            # taken: bootstrapping is not a way to create several profiles
+            # without entitlement.
+            incoming["profiles"] = incoming_profiles[:1]
+            incoming["activeProfileId"] = incoming_profiles[0].get("id")
+            profile.growth_state = incoming
+            person_name = ((incoming.get("person") or {}).get("name") or "").strip()
+            if person_name:
+                profile.name = person_name
+
+    _sync_assignments(db, current_user.id, profile.growth_state or {}, tombstones)
     db.commit()
     db.refresh(profile)
     return profile
+
+
+@router.post("/profiles", response_model=GrowthPushResult)
+def create_growth_profile(
+    data: GrowthProfileCreate,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Create ONE additional growth profile. Premium, server-enforced.
+
+    This is the authoritative path for current clients. The generic growth
+    PUT keeps its own id-diff filter, but only as defence-in-depth for
+    pre-update binaries — UI gating is not enforcement, and that endpoint
+    accepts a whole array.
+
+    Returns the canonical state so the client can apply it as a TARGETED
+    local mutation (insert just this profile by id) rather than overwriting
+    its own blob, which would discard personalization events recorded on
+    that device while this request was in flight.
+    """
+    _require_premium_for_profiles(current_user)
+
+    incoming = data.profile or {}
+    profile_id = (incoming.get("id") or "").strip()
+    name = (profile_display_name(incoming) or "").strip()
+    if not profile_id:
+        raise HTTPException(status_code=400, detail="A profile id is required.")
+    if not name:
+        raise HTTPException(status_code=400, detail="A profile name is required.")
+
+    lock_user_scope(db, current_user.id)
+    profile = _get_or_create_profile(current_user, db, for_update=True)
+    tombstones = set(profile.deleted_profile_ids or [])
+    state = dict(profile.growth_state or {})
+
+    if profile_id in tombstones:
+        raise HTTPException(
+            status_code=409,
+            detail="That profile was deleted and cannot be recreated.",
+        )
+    if find_profile_by_id(state, profile_id, tombstones):
+        # Idempotent: a retried create is not an error.
+        merged = {"rejected_profile_ids": [], "accepted_profile_ids": [profile_id],
+                  "canonical_profile_fields": [], "tie_conflicts": []}
+        return _growth_push_result(profile, merged, current_user)
+
+    _reject_duplicate_name(state, name, tombstones)
+
+    body = dict(incoming)
+    body["id"] = profile_id
+    body["name"] = name
+    body["profileName"] = name
+    state["profiles"] = list(state.get("profiles") or []) + [body]
+    state.setdefault("activeProfileId", profile_id)
+    profile.growth_state = state
+
+    _sync_assignments(db, current_user.id, state, tombstones)
+    db.commit()
+    db.refresh(profile)
+
+    merged = {"rejected_profile_ids": [], "accepted_profile_ids": [profile_id],
+              "canonical_profile_fields": [], "tie_conflicts": []}
+    return _growth_push_result(profile, merged, current_user)
+
+
+@router.patch("/profiles/{profile_id}", response_model=GrowthPushResult)
+def rename_growth_profile(
+    profile_id: str,
+    data: GrowthProfileRename,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Rename ONE growth profile. Available to EVERY tier.
+
+    Authoritative because books reference a profile by stable id and store a
+    DERIVED name snapshot: the rename and the snapshot refresh have to happen
+    in the same transaction, or every assigned book is left advertising a
+    goal that no longer exists. That was the old orphaning bug — and it
+    needed no client PATCH fan-out to fix, because the backend owns both
+    datasets.
+    """
+    new_name = data.name.strip()
+    if not new_name:
+        raise HTTPException(status_code=400, detail="A profile name cannot be blank.")
+
+    lock_user_scope(db, current_user.id)
+    profile = _get_or_create_profile(current_user, db, for_update=True)
+    tombstones = set(profile.deleted_profile_ids or [])
+    state = dict(profile.growth_state or {})
+
+    target = find_profile_by_id(state, profile_id, tombstones)
+    if not target:
+        raise HTTPException(status_code=404, detail="Growth profile not found.")
+
+    _reject_duplicate_name(state, new_name, tombstones, exclude_id=profile_id)
+
+    updated = []
+    for p in state.get("profiles") or []:
+        if isinstance(p, dict) and p.get("id") == profile_id:
+            p = dict(p)
+            p["name"] = new_name
+            p["profileName"] = new_name
+            # Mark the name as CANONICALLY established, so a stale device
+            # still holding the old one cannot silently revert it via the
+            # generic growth PUT (see growth_merge's I2). Only names set
+            # here are defended; an ordinary offline rename through the blob
+            # keeps working as it always did.
+            p[CANONICAL_NAME_FLAG] = True
+        updated.append(p)
+    state["profiles"] = updated
+    profile.growth_state = state
+
+    # Same transaction: every assigned book's derived snapshot is refreshed,
+    # so nothing is orphaned by the rename.
+    _sync_assignments(db, current_user.id, state, tombstones)
+    db.commit()
+    db.refresh(profile)
+
+    merged = {"rejected_profile_ids": [], "accepted_profile_ids": [profile_id],
+              "canonical_profile_fields": [], "tie_conflicts": []}
+    return _growth_push_result(profile, merged, current_user)
+
+
+@router.delete("/profiles/{profile_id}", response_model=GrowthPushResult)
+def delete_growth_profile(
+    profile_id: str,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Delete ONE growth profile. Available to every tier.
+
+    In ONE transaction: tombstone the id, repair activeProfileId, and
+    deterministically move its books to
+    activeProfileId-excluding-the-deleted -> first surviving -> NULL
+    (defensive only; the client refuses to delete the last profile).
+    """
+    lock_user_scope(db, current_user.id)
+    profile = _get_or_create_profile(current_user, db, for_update=True)
+    tombstones = set(profile.deleted_profile_ids or [])
+    state = dict(profile.growth_state or {})
+
+    target = find_profile_by_id(state, profile_id, tombstones)
+    if not target:
+        raise HTTPException(status_code=404, detail="Growth profile not found.")
+    if len(live_profiles(state, tombstones)) <= 1:
+        raise HTTPException(
+            status_code=409,
+            detail="You need at least one growth profile — Nibbler uses it to pick your nibbles.",
+        )
+
+    # Books move BEFORE the profile leaves the state, so the reassignment
+    # target is computed against the pre-deletion picture.
+    reassign_books_from_deleted_profile(db, current_user.id, profile_id, state, tombstones)
+
+    state["profiles"] = [
+        p for p in (state.get("profiles") or [])
+        if not (isinstance(p, dict) and p.get("id") == profile_id)
+    ]
+    survivors = [p.get("id") for p in live_profiles(state, tombstones)]
+    if state.get("activeProfileId") == profile_id:
+        state["activeProfileId"] = survivors[0] if survivors else None
+    profile.growth_state = state
+    profile.deleted_profile_ids = sorted(tombstones | {profile_id})
+
+    _sync_assignments(db, current_user.id, state, set(profile.deleted_profile_ids))
+    db.commit()
+    db.refresh(profile)
+
+    merged = {"rejected_profile_ids": [], "accepted_profile_ids": [],
+              "canonical_profile_fields": [], "tie_conflicts": []}
+    return _growth_push_result(profile, merged, current_user)
 
 
 @router.put("/", response_model=ProfileResponse)

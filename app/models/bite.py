@@ -25,6 +25,12 @@ class DailyBite(Base):
     headline = Column(String, nullable=True)
     preview = Column(Text, nullable=True)
     goal_passage = Column(Text, nullable=True)   # this nibble's most goal-relevant excerpt (Connect tab)
+    # WHICH growth profile that goal passage was written for (Sep 2026).
+    # Without it, Connect showed a passage chosen for a previous assignment
+    # as though it spoke to the book's current goal. Stamped by both the
+    # on-demand and scheduler generation paths; NULL on legacy rows, which
+    # /connect/stats hides rather than guessing at.
+    growth_profile_id = Column(String, nullable=True)
     chunk_ids = Column(JSON, nullable=True)      # chunk indexes this session drew from — drives honest Explored % + no-repeat retrieval
     generated_at = Column(DateTime, server_default=func.now())
     # ── Session lifecycle (July 2026): scheduled generation + hold-until-read ──

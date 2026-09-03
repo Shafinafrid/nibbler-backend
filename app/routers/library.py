@@ -22,6 +22,7 @@ import logging
 import uuid
 import threading
 from datetime import datetime
+from typing import Optional
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/library", tags=["library"])
@@ -47,6 +48,67 @@ def _should_start_active(db: Session, user_id: str) -> bool:
         LibraryItem.is_active.is_(True),
     ).count()
     return active_count < MAX_ACTIVE_SOURCES
+
+
+def _load_growth(db: Session, user_id: str):
+    """(growth_state, tombstones) for this user — empty when no row exists yet.
+
+    A missing row is normal, not an error: local-first onboarding never
+    creates one server-side, so it appears on the first growth push.
+    """
+    from app.models.profile import Profile
+
+    prof = db.query(Profile).filter(Profile.user_id == user_id).first()
+    if not prof:
+        return {}, set()
+    return (prof.growth_state or {}), set(prof.deleted_profile_ids or [])
+
+
+def _assignment_for_new_item(db: Session, user: User, mode: str,
+                             requested_id: Optional[str],
+                             requested_name: Optional[str]):
+    """The (id, name) a newly-created item should store.
+
+    Rules (see the plan's §4.1/§4.2):
+      · story mode        -> (None, None); assignment is a wisdom-only concept
+      · not entitled      -> the client's request is IGNORED and the server's
+                             default profile is substituted. Deliberately NOT
+                             a 403: choosing is Premium, but *uploading* is
+                             not, and a Free upload must never fail because
+                             of a field the user never saw. Older builds also
+                             still send a name unprompted.
+      · entitled          -> honour the request when it resolves to a live
+                             profile the caller owns; fall back to the
+                             default otherwise (a stale id is not worth
+                             failing an upload over)
+      · no profiles yet   -> (None, None) — the bootstrap window. The repair
+                             pass attaches these once the profile row lands.
+
+    The stored name is always DERIVED from the resolved profile, never taken
+    from the client, so it cannot drift from the id.
+    """
+    from app.services.profile_resolution import (
+        default_profile, find_profile_by_id, find_unique_profile_by_name,
+        profile_display_name,
+    )
+
+    if (mode or "wisdom") != "wisdom":
+        return None, None
+
+    growth_state, tombstones = _load_growth(db, user.id)
+
+    target = None
+    if user.effective_premium:
+        if requested_id:
+            target = find_profile_by_id(growth_state, requested_id, tombstones)
+        if target is None and requested_name:
+            target = find_unique_profile_by_name(growth_state, requested_name, tombstones)
+    if target is None:
+        target = default_profile(growth_state, tombstones)
+
+    if not target:
+        return None, None
+    return target.get("id"), profile_display_name(target)
 
 
 def check_upload_limit(user: User, db: Session):
@@ -116,6 +178,10 @@ def add_library_item(
 ):
     check_upload_limit(current_user, db)
 
+    gp_id, gp_name = _assignment_for_new_item(
+        db, current_user, data.mode or "wisdom",
+        data.growth_profile_id, data.growth_profile_name,
+    )
     item = LibraryItem(
         id=str(uuid.uuid4()),
         user_id=current_user.id,
@@ -125,7 +191,8 @@ def add_library_item(
         mode=data.mode or "wisdom",
         kind=data.kind or "book",
         author=data.author,
-        growth_profile_name=data.growth_profile_name if (data.mode or "wisdom") == "wisdom" else None,
+        growth_profile_id=gp_id,
+        growth_profile_name=gp_name,
         processed=False,
         is_active=_should_start_active(db, current_user.id),
     )
@@ -149,6 +216,7 @@ def upload_pdf(
     mode: str = Form("wisdom"),
     kind: str = Form("book"),
     author: str = Form(None),
+    growth_profile_id: str = Form(None),
     growth_profile_name: str = Form(None),
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
@@ -199,6 +267,9 @@ def upload_pdf(
         # never waits on Claude, Pinecone, or a slow/broken AWS setup.
         import re as _re
         clean_title = _re.sub(r"\.(pdf|epub)$", "", file.filename or "", flags=_re.IGNORECASE)
+        gp_id, gp_name = _assignment_for_new_item(
+            db, current_user, mode or "wisdom", growth_profile_id, growth_profile_name,
+        )
         item = LibraryItem(
             id=str(uuid.uuid4()),
             user_id=current_user.id,
@@ -209,7 +280,8 @@ def upload_pdf(
             mode=mode or "wisdom",
             kind=kind or "book",
             author=author,
-            growth_profile_name=growth_profile_name if (mode or "wisdom") == "wisdom" else None,
+            growth_profile_id=gp_id,
+            growth_profile_name=gp_name,
             processed=False,
             is_active=_should_start_active(db, current_user.id),
         )
@@ -249,6 +321,10 @@ def add_url(
     except UnsafeUrlError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
+    gp_id, gp_name = _assignment_for_new_item(
+        db, current_user, data.mode or "wisdom",
+        data.growth_profile_id, data.growth_profile_name,
+    )
     item = LibraryItem(
         id=str(uuid.uuid4()),
         user_id=current_user.id,
@@ -257,7 +333,8 @@ def add_url(
         source_url=data.url,
         mode=data.mode or "wisdom",
         kind=data.kind or "article",
-        growth_profile_name=data.growth_profile_name if (data.mode or "wisdom") == "wisdom" else None,
+        growth_profile_id=gp_id,
+        growth_profile_name=gp_name,
         processed=False,
         is_active=_should_start_active(db, current_user.id),
     )
@@ -415,8 +492,14 @@ def rename_library_item(
     # mutation route here (set_item_active, etc.) already refuses. Any
     # requested field on a locked source is now refused BEFORE any
     # mutation is applied, using the same established 403 shape.
+    # Sep 2026: PRESENCE, not "is not None". For the assignment fields an
+    # explicit null is a real instruction ("reset to my default profile"),
+    # so `is not None` would silently treat it as "field absent" and ignore
+    # a request the user deliberately made.
+    sent = data.model_fields_set
+    wants_assignment = "growth_profile_id" in sent or "growth_profile_name" in sent
     wants_mutation = (
-        data.title is not None or data.mode is not None or data.growth_profile_name is not None
+        data.title is not None or data.mode is not None or wants_assignment
     )
     if wants_mutation and not is_source_unlocked(current_user, item):
         raise HTTPException(
@@ -443,8 +526,63 @@ def rename_library_item(
             item.story_progress = 0
         item.mode = data.mode
 
-    if data.growth_profile_name is not None:
-        item.growth_profile_name = data.growth_profile_name or None
+    # ── Assignment: a PREMIUM choice, validated against real profiles ──────
+    if wants_assignment:
+        # Unlike the create paths (where ignoring the field keeps a Free
+        # upload working), this is an explicit, deliberate user action. A
+        # silent no-op here would show the picker "succeeding" while the
+        # server ignored it, so it fails loudly instead.
+        if not current_user.effective_premium:
+            raise HTTPException(
+                status_code=403,
+                detail={
+                    "code": "premium_required",
+                    "message": "Choosing which goal a book serves is available with Nibbler Pro.",
+                },
+            )
+
+        from app.services.profile_resolution import (
+            default_profile, find_profile_by_id, find_unique_profile_by_name,
+            profile_display_name,
+        )
+
+        # Story books have no goal to serve; keep both fields NULL rather
+        # than storing an assignment nothing will ever read.
+        if (item.mode or "wisdom") != "wisdom":
+            item.growth_profile_id = None
+            item.growth_profile_name = None
+        else:
+            growth_state, tombstones = _load_growth(db, current_user.id)
+            requested_id = data.growth_profile_id if "growth_profile_id" in sent else None
+            requested_name = data.growth_profile_name if "growth_profile_name" in sent else None
+
+            target = None
+            if requested_id:
+                target = find_profile_by_id(growth_state, requested_id, tombstones)
+                if target is None:
+                    # Ownership/liveness failure: the id is not one of THIS
+                    # user's live profiles. Never fall back silently — that
+                    # would quietly assign the book to something else.
+                    raise HTTPException(
+                        status_code=400,
+                        detail="That growth profile doesn't exist or is no longer available.",
+                    )
+            elif requested_name:
+                target = find_unique_profile_by_name(growth_state, requested_name, tombstones)
+                if target is None:
+                    raise HTTPException(
+                        status_code=400,
+                        detail="That growth profile name is ambiguous or unknown.",
+                    )
+            else:
+                # Explicit null on both -> reset to the server-resolved
+                # default. A wisdom book must always end up with a profile.
+                target = default_profile(growth_state, tombstones)
+
+            item.growth_profile_id = target.get("id") if target else None
+            # Always DERIVED, never the client's string, so id and name
+            # cannot drift apart.
+            item.growth_profile_name = profile_display_name(target) if target else None
 
     db.commit()
     db.refresh(item)
