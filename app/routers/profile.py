@@ -278,7 +278,18 @@ def update_growth_state(
     # Note the old compare was `str(incoming) < str(stored)` — a raw string
     # compare that orders differing UTC offsets and fractional precisions
     # wrongly. Timestamps are parsed to instants now.
-    allow_new = bool(current_user.effective_premium)
+    #
+    # PG5 (Sep 2026, real-Postgres harness finding): `current_user` is a
+    # FastAPI-injected object, fetched ONCE by get_current_user before this
+    # route body ever runs and never re-queried — the exact same identity-
+    # map staleness `_get_or_create_profile`'s own docstring above already
+    # warns about for `user.profile`, just not yet applied to entitlement.
+    # A webhook flipping premium_until INSIDE this request's window (the
+    # lock above is what makes that window observable/reproducible) would
+    # otherwise have this write evaluated against a snapshot of entitlement
+    # from before the request began. Re-queried fresh, inside the lock,
+    # immediately before the one decision it gates.
+    allow_new = bool(_refresh_effective_premium(db, current_user))
     merged = merge_growth_state(
         (profile.growth_state or {}),
         incoming_growth_state,
@@ -315,8 +326,32 @@ def update_growth_state(
     return _growth_push_result(profile, merged, current_user)
 
 
-def _require_premium_for_profiles(user: User):
-    if not user.effective_premium:
+def _refresh_effective_premium(db: Session, user: User) -> bool:
+    """Re-query `user`'s entitlement fields fresh, bypassing SQLAlchemy's
+    identity map, and return the CURRENT `effective_premium`.
+
+    `current_user` is a FastAPI-injected object fetched once by
+    get_current_user before the route body runs — the identity map then
+    hands back that SAME cached object to any later `db.query(User)...`
+    call in this request, so a plain re-query would silently return the
+    stale value, not a fresh one. `populate_existing()` forces the actual
+    row read (same technique `_get_or_create_profile` already uses for
+    `user.profile`, applied here to entitlement, which had the identical
+    gap: a webhook flipping `premium_until` inside this request's window —
+    between get_current_user's read and the write actually committing —
+    was evaluated against the request-start snapshot, never the current row.
+    """
+    fresh = (
+        db.query(User)
+        .filter(User.id == user.id)
+        .populate_existing()
+        .first()
+    )
+    return bool(fresh.effective_premium) if fresh else False
+
+
+def _require_premium_for_profiles(db: Session, user: User):
+    if not _refresh_effective_premium(db, user):
         raise HTTPException(
             status_code=403,
             detail={
@@ -410,8 +445,6 @@ def create_growth_profile(
     its own blob, which would discard personalization events recorded on
     that device while this request was in flight.
     """
-    _require_premium_for_profiles(current_user)
-
     incoming = data.profile or {}
     profile_id = (incoming.get("id") or "").strip()
     name = (profile_display_name(incoming) or "").strip()
@@ -421,6 +454,11 @@ def create_growth_profile(
         raise HTTPException(status_code=400, detail="A profile name is required.")
 
     lock_user_scope(db, current_user.id)
+    # PG5: checked INSIDE the lock, on a freshly re-queried row — see
+    # _refresh_effective_premium's docstring. A cheap 400 (missing id/name)
+    # can fail before taking the lock; the entitlement decision itself must
+    # not be made from a snapshot older than the lock we're about to hold.
+    _require_premium_for_profiles(db, current_user)
     profile = _get_or_create_profile(current_user, db, for_update=True)
     tombstones = set(profile.deleted_profile_ids or [])
     state = dict(profile.growth_state or {})

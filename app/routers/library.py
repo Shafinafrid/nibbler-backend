@@ -86,15 +86,29 @@ def _assignment_for_new_item(db: Session, user: User, mode: str,
 
     The stored name is always DERIVED from the resolved profile, never taken
     from the client, so it cannot drift from the id.
+
+    Takes the SAME user-scoped advisory lock `ensure`/the growth-state PUT
+    take (lock ordering: advisory -> profile row -> library rows, §4.0),
+    BEFORE reading growth_state. Without it, this read can race the
+    bootstrap-repair pass's own attach sweep (§1.4): `ensure` locks, reads
+    "every currently-unassigned book", attaches them, and commits — a
+    library create whose OWN unassigned-book INSERT lands after that read
+    but is never itself serialized against it would be invisible to that
+    sweep, stranding the new row as bootstrap-unassigned until some LATER
+    pass (a future growth push, library read, or scheduler tick) happens to
+    run the repair again. Not silent data loss — the idempotent repair pass
+    is exactly the belt for this — but a real, avoidable delay this lock
+    closes for the common case.
     """
     from app.services.profile_resolution import (
         default_profile, find_profile_by_id, find_unique_profile_by_name,
-        profile_display_name,
+        lock_user_scope, profile_display_name,
     )
 
     if (mode or "wisdom") != "wisdom":
         return None, None
 
+    lock_user_scope(db, user.id)
     growth_state, tombstones = _load_growth(db, user.id)
 
     target = None
@@ -532,7 +546,22 @@ def rename_library_item(
         # upload working), this is an explicit, deliberate user action. A
         # silent no-op here would show the picker "succeeding" while the
         # server ignored it, so it fails loudly instead.
-        if not current_user.effective_premium:
+        from app.services.profile_resolution import (
+            default_profile, find_profile_by_id, find_unique_profile_by_name,
+            profile_display_name,
+        )
+
+        # Re-queried fresh, bypassing the identity map — `current_user` is
+        # the same FastAPI-injected object fetched once at request entry
+        # (see profile.py's _refresh_effective_premium for the fuller
+        # rationale, found via a real-Postgres concurrency harness: a
+        # webhook flipping premium_until inside this request's window would
+        # otherwise be evaluated against a stale snapshot).
+        fresh_user = (
+            db.query(User).filter(User.id == current_user.id).populate_existing().first()
+        )
+        entitled = bool(fresh_user and fresh_user.effective_premium)
+        if not entitled and get_settings().strict_assignment_enforcement:
             raise HTTPException(
                 status_code=403,
                 detail={
@@ -541,11 +570,6 @@ def rename_library_item(
                 },
             )
 
-        from app.services.profile_resolution import (
-            default_profile, find_profile_by_id, find_unique_profile_by_name,
-            profile_display_name,
-        )
-
         # Story books have no goal to serve; keep both fields NULL rather
         # than storing an assignment nothing will ever read.
         if (item.mode or "wisdom") != "wisdom":
@@ -553,11 +577,26 @@ def rename_library_item(
             item.growth_profile_name = None
         else:
             growth_state, tombstones = _load_growth(db, current_user.id)
-            requested_id = data.growth_profile_id if "growth_profile_id" in sent else None
-            requested_name = data.growth_profile_name if "growth_profile_name" in sent else None
+            # Rollout tolerance: with strict enforcement OFF, a non-entitled
+            # request already passed the 403 check above — so this is either
+            # a genuinely entitled user, or an old client whose tap is being
+            # tolerated. In the tolerated case the client's requested
+            # id/name is IGNORED (same substitution rule as the unentitled
+            # CREATE paths, §4.2) rather than honored, so a free/lapsed user
+            # can never end up choosing an assignment — only ever landing on
+            # the server's own default.
+            honor_request = entitled
+            requested_id = (
+                data.growth_profile_id if honor_request and "growth_profile_id" in sent else None
+            )
+            requested_name = (
+                data.growth_profile_name if honor_request and "growth_profile_name" in sent else None
+            )
 
             target = None
-            if requested_id:
+            if not honor_request:
+                target = default_profile(growth_state, tombstones)
+            elif requested_id:
                 target = find_profile_by_id(growth_state, requested_id, tombstones)
                 if target is None:
                     # Ownership/liveness failure: the id is not one of THIS

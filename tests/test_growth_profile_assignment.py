@@ -357,11 +357,31 @@ check("derived name matches the substituted profile",
       r.json().get("growth_profile_name") == "Money")
 free_item_id = r.json()["id"]
 
+# Rollout flag defaults to OFF (plan Phase 10): a shipped pre-feature client
+# tapping this used to succeed unconditionally, so it must keep succeeding
+# post-deploy — never a NEW 403 for a tap that used to work — until the flag
+# is explicitly flipped once the four Phase-10 step-3 conditions are live.
+from app.config import get_settings  # noqa: E402
+_settings = get_settings()
+check("strict_assignment_enforcement defaults to False",
+      _settings.strict_assignment_enforcement is False)
+
 r = client.patch("/library/%s" % free_item_id, json={"growth_profile_id": "B"})
-check("free PATCH of the assignment 403s", r.status_code == 403, str(r.status_code))
-check("403 carries premium_required",
-      (r.json().get("detail") or {}).get("code") == "premium_required", str(r.json()))
-check("assignment unchanged", item(free_item_id).growth_profile_id == "A")
+check("free PATCH of the assignment TOLERATES (200) while enforcement is off",
+      r.status_code == 200, str(r.status_code))
+check("client's unentitled choice IGNORED even in tolerant mode — never honors B",
+      r.json().get("growth_profile_id") == "A", str(r.json().get("growth_profile_id")))
+check("assignment unchanged (still the default, not B)", item(free_item_id).growth_profile_id == "A")
+
+_settings.strict_assignment_enforcement = True
+try:
+    r = client.patch("/library/%s" % free_item_id, json={"growth_profile_id": "B"})
+    check("free PATCH of the assignment 403s once enforcement is on", r.status_code == 403, str(r.status_code))
+    check("403 carries premium_required",
+          (r.json().get("detail") or {}).get("code") == "premium_required", str(r.json()))
+    check("assignment unchanged", item(free_item_id).growth_profile_id == "A")
+finally:
+    _settings.strict_assignment_enforcement = False
 
 r = client.patch("/library/%s" % free_item_id, json={"title": "Renamed"})
 check("free PATCH of title still works", r.status_code == 200, str(r.status_code))

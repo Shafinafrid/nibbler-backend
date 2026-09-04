@@ -167,6 +167,29 @@ class Settings(BaseSettings):
     # operation. See _roll_personalization in session_service.py.
     personalization_probability: float = 0.20
 
+    # Growth-profile assignment enforcement rollout (Sep 2026, plan Phase 10).
+    # Shipped pre-feature app builds let ANY tier tap "choose this book's
+    # goal" and have it silently succeed — that is now a Premium-only choice
+    # (PATCH /library/{item_id}'s explicit-assignment branch). Turning
+    # rejection on the moment the backend deploys would turn an old client's
+    # normal tap into a hard 403 for every free/lapsed user still running
+    # that build, before any client ships that even understands the
+    # structured error or reconciles a rejection.
+    #
+    # False (default, safe to deploy immediately): a non-entitled user's
+    # explicit assignment request is tolerated the same way an unentitled
+    # CREATE already is (§4.2) — the requested id/name is ignored and the
+    # server's resolved default is substituted, never a 403. Every other
+    # PATCH field (title, mode) and every entitlement-gated CREATE path is
+    # unaffected either way; this flag narrowly gates the one endpoint that
+    # used to have no gate at all.
+    #
+    # True: PATCH's explicit-assignment branch 403s a non-entitled request,
+    # per this feature's actual product rule (§4.3). Flip only in Railway env
+    # (no deploy needed) after verifying the four Phase-10 step-3 conditions
+    # are live in the shipped app build — see the plan's Phase 10.
+    strict_assignment_enforcement: bool = False
+
     class Config:
         env_file = ".env"
         case_sensitive = False
