@@ -12,6 +12,7 @@ from app.models.user import User
 from app.models.bite import DailyBite, SavedBite
 from app.models.library import LibraryItem
 from app.models.personalization import PersonalizationQuestion
+from app.models.profile import Profile
 from app.schemas.bite import (
     BiteResponse, SavedBiteResponse, BiteHistoryResponse,
     SessionHistoryItem, SessionHistoryResponse,
@@ -21,6 +22,7 @@ from app.services.llm import LLMService
 from app.services.llm.personalization_deltas import sanitize_tags
 from app.services.session_service import generate_session_for_item, SessionGenerationError, CARD_TARGETS
 from app.services.entitlement_service import is_source_unlocked
+from app.services.profile_resolution import resolve_assigned_profile, build_profile_payload
 
 
 def _filter_locked_sources(db: Session, user: User, rows: list):
@@ -349,7 +351,30 @@ def get_or_create_session(
             },
         )
 
-    profile = (data.growth_profile.model_dump() if data.growth_profile else {}) or {}
+    # Server-authoritative (Sep 2026, plan §3.2/§3.3): which growth profile a
+    # session is generated for and personalized against must be decided from
+    # OUR OWN assignment data — the same resolver /connect/insights and the
+    # scheduler use — never trusted from the client's request body. Before
+    # this fix, `data.growth_profile` (whatever local profile the app
+    # happened to have active) was used verbatim, so a stale or spoofed
+    # client value could steer generation to the wrong goal even though the
+    # book's real server-side assignment said otherwise — exactly the
+    # class of bug §3.3 closed for Connect but never for session generation.
+    #
+    # `data.growth_profile` is kept ONLY as a same-shape fallback for the
+    # genuine pre-first-sync bootstrap window (§1.3): a brand-new account can
+    # legitimately have zero profiles on the server yet, and a free upload/
+    # session must never fail because of that timing gap.
+    prof_row = db.query(Profile).filter(Profile.user_id == current_user.id).first()
+    resolved = resolve_assigned_profile(
+        (prof_row.growth_state if prof_row else None) or {},
+        item,
+        set((prof_row.deleted_profile_ids if prof_row else None) or []),
+    )
+    if resolved:
+        profile = build_profile_payload(resolved)
+    else:
+        profile = (data.growth_profile.model_dump() if data.growth_profile else {}) or {}
     try:
         bite = generate_session_for_item(
             db, user=current_user, item=item,

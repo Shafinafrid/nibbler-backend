@@ -957,6 +957,93 @@ for uid in pg7_users:
 
 
 # ═════════════════════════════════════════════════════════════════════════
+section("PG8 — two concurrent canonical creates racing on the SAME normalized name")
+# ═════════════════════════════════════════════════════════════════════════
+# plan Phase 8's test_profile_creation_endpoint.py spec: "concurrent creates
+# serialize". Distinct from PG3 (tombstone vs. edit) and PG7 (lock-order
+# across DIFFERENT users) — this is the uniqueness check itself (§2.4) under
+# real contention: two requests for the SAME user, same normalized name,
+# submitted at genuinely the same instant. Only one may win; the advisory
+# lock must make the second request's uniqueness check see the first's
+# already-committed row rather than both reading "no collision" from a
+# stale pre-commit snapshot.
+uid_pg8 = seed_user(premium=True)
+pid_pg8 = seed_profile(uid_pg8, [{"id": "orig", "name": "Original", "updatedAt": "2026-09-01T00:00:00.000Z"}], "orig")
+
+pg8_holding = _threading.Event()
+pg8_release = _threading.Event()
+pg8_results = {}
+
+_orig_lock_pg8 = profile_resolution.lock_user_scope
+
+
+def _pg8_patched_lock(db, user_id):
+    _orig_lock_pg8(db, user_id)
+    if user_id == uid_pg8 and "first_thread" not in pg8_results:
+        pg8_results["first_thread"] = True
+        pg8_holding.set()
+        pg8_release.wait(timeout=15)
+
+
+profile_resolution.lock_user_scope = _pg8_patched_lock
+profile_router.lock_user_scope = _pg8_patched_lock
+
+
+def pg8_worker_create(label):
+    db = SessionLocal()
+    try:
+        user = db.query(User).filter(User.id == uid_pg8).first()
+        profile_router.create_growth_profile(
+            data=GrowthProfileCreate(profile={"id": f"dup-{label}", "name": "Same Name"}),
+            current_user=user, db=db,
+        )
+        pg8_results[f"{label}_ok"] = True
+    except Exception as e:
+        pg8_results[f"{label}_ok"] = False
+        pg8_results[f"{label}_error"] = type(e).__name__
+        pg8_results[f"{label}_status"] = getattr(e, "status_code", None)
+    finally:
+        db.close()
+
+
+pg8_second_finished = _threading.Event()
+
+
+def pg8_worker_create_second():
+    pg8_holding.wait(timeout=15)
+    time.sleep(0.3)
+    pg8_worker_create("second")
+    pg8_second_finished.set()
+
+
+t13 = _threading.Thread(target=lambda: pg8_worker_create("first"))
+t14 = _threading.Thread(target=pg8_worker_create_second)
+t13.start(); t14.start()
+
+pg8_holding.wait(timeout=15)
+time.sleep(0.6)
+pg8_second_blocked = not pg8_second_finished.is_set()
+pg8_release.set()
+
+t13.join(timeout=20)
+t14.join(timeout=20)
+profile_resolution.lock_user_scope = _orig_lock_pg8
+profile_router.lock_user_scope = _orig_lock_pg8
+
+check("the second create was genuinely blocked on the advisory lock while the first was in flight",
+      pg8_second_blocked, {"second_finished_early": pg8_second_finished.is_set()})
+check("exactly ONE of the two concurrent same-name creates succeeded",
+      sum(1 for k in ("first_ok", "second_ok") if pg8_results.get(k)) == 1, pg8_results)
+check("the loser was rejected as a duplicate name (409), not a generic error",
+      pg8_results.get("first_status") == 409 or pg8_results.get("second_status") == 409, pg8_results)
+
+final_pg8 = read_state(pid_pg8)
+dup_ids_present = [pid for pid in ("dup-first", "dup-second") if pid in profile_names(final_pg8)]
+check("only ONE of the two duplicate-named profiles was actually persisted — no race-created duplicate",
+      len(dup_ids_present) == 1, {"state": final_pg8, "persisted": dup_ids_present})
+
+
+# ═════════════════════════════════════════════════════════════════════════
 print()
 if failures:
     print(f"FAILED: {len(failures)} check(s) — {failures}")
