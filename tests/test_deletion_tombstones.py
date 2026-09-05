@@ -136,8 +136,18 @@ check(
 # B renames P1 and pushes ITS OWN full blob, timestamped LATER than A's push
 # (a completely plausible real-world case: B's edit genuinely happened after
 # A's deletion in wall-clock time, it just didn't know about it).
+#
+# Post-audit fix (Sep 2026): P1's name is canonical from the moment the
+# seed push above established it (growth_merge.py's CANONICAL_NAME_FLAG is
+# now set at bootstrap, not only after an explicit PATCH rename), so B's
+# blob CANNOT rename it — same protection §4.5c always specified, now
+# actually enforced for a profile's ORIGINAL name too, not just a name set
+# via a later rename. This section's own purpose (tombstone resurrection
+# resistance) is unaffected: the checks below still confirm P2 stays dead
+# despite B's later timestamp, using a non-name field to prove B's other,
+# unrelated edits still apply.
 rB = push_growth(
-    [{"id": "p1", "name": "Reading (renamed)"}, P2], "p1",
+    [{"id": "p1", "name": "Reading (renamed)", "lifeArea": "Should Still Apply"}, P2], "p1",
     "2026-09-01T12:00:00.000Z", deleted_ids=[],
 )
 check("B's push OK (not rejected)", rB.status_code == 200, rB.text)
@@ -146,9 +156,12 @@ check(
     "p2" not in profile_ids(rB.json()),
     profile_ids(rB.json()),
 )
-check("B's rename of P1 still applied", profile_ids(rB.json()) == ["p1"], profile_ids(rB.json()))
-names = [p["name"] for p in rB.json()["growth_state"]["profiles"]]
-check("P1's rename survived (only P2 was tombstoned)", names == ["Reading (renamed)"], names)
+check("only P1 survives (P2 stays tombstoned)", profile_ids(rB.json()) == ["p1"], profile_ids(rB.json()))
+b_p1 = next(p for p in rB.json()["growth_state"]["profiles"] if p["id"] == "p1")
+check("B's attempted rename of P1 is BLOCKED — P1's canonical (original, bootstrap) name is untouched",
+      b_p1.get("name") == "Reading", b_p1.get("name"))
+check("...but B's unrelated, non-name edit on P1 in that SAME push still applies",
+      b_p1.get("lifeArea") == "Should Still Apply", b_p1.get("lifeArea"))
 
 # Read-back must agree.
 read_after = get_profile_json()

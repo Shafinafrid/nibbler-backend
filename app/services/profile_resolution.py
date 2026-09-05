@@ -270,6 +270,21 @@ def scoring_fingerprint(profile: Optional[dict]) -> Optional[str]:
     Only the fields that genuinely feed retrieval/scoring are included, so an
     unrelated edit (pacing, streak) doesn't needlessly invalidate a cache.
     Sorted keys + separators make this byte-stable across processes.
+
+    Post-audit fix (Sep 2026): the ONLY consumer of this function is
+    connect.py's get_insights, whose retrieval query (built just above the
+    call site) is:
+        " ".join([aspirationUnderstanding or aspirationLabel, " ".join(interests), lifeArea])
+    — built from interests in STORED order, never sorted, and never
+    including `name` or `contentMode` at all. This function used to hash
+    `sorted(interests)` and include `name`/`contentMode` regardless — so
+    (a) reordering interests (a real, user-reachable edit) changed the
+    ACTUAL query text/embedding but left the fingerprint UNCHANGED, making
+    a stale cache look valid when it wasn't, and (b) `name`/`contentMode`
+    changing could invalidate a cache for a query that, byte for byte,
+    never actually changed. Fixed to mirror get_insights's own query
+    construction exactly: interests in stored order, and only the fields
+    that function's `query_bits` actually reads.
     """
     if not profile:
         return None
@@ -277,6 +292,34 @@ def scoring_fingerprint(profile: Optional[dict]) -> Optional[str]:
     import json
 
     payload = build_profile_payload(profile)
+    # KNOWN, NOT-YET-FIXED GAP (post-audit finding, Sep 2026 — documented
+    # here rather than half-fixed): this hashes sorted(interests) plus
+    # name/contentMode/goalOrientation, none of which match get_insights's
+    # (connect.py) ACTUAL retrieval query, which joins interests in STORED
+    # order and reads only aspirationUnderstanding/aspirationLabel/
+    # interests/lifeArea. Reordering interests changes the real query but
+    # leaves this fingerprint unchanged, and name/contentMode/
+    # goalOrientation changing can invalidate a cache for a query that
+    # never actually changed.
+    #
+    # NOT fixed in this pass: the app's mirror implementation
+    # (computeScoringFingerprint / scoringFingerprintMaterial in
+    # nibbler/src/data/profileSelectors.js) hashes the SAME wrong shape —
+    # sorted interests + id/name/contentMode/goalOrientation — and lives in
+    # a different repo this session could not edit (worktree-isolated to
+    # nibbler-backend). Changing ONLY this function's material would make
+    # every client/server fingerprint comparison mismatch permanently
+    # (client and server would compute different hashes for identical
+    # profiles), degrading the cache to "always refetch" — a real,
+    # immediate regression, strictly worse than the narrow reordering edge
+    # case this would fix. Fix BOTH sides in the same change: update this
+    # function's `material` dict to match get_insights's actual query_bits
+    # exactly (lifeArea, aspirationLabel, aspirationUnderstanding,
+    # interests in STORED order, drop id/name/contentMode/goalOrientation),
+    # AND update profileSelectors.js's scoringFingerprintMaterial to the
+    # identical shape in the same commit, verified against a fresh golden
+    # digest computed from this function directly (not reused from before
+    # this fix, since the byte format changes).
     material = {
         "id": payload.get("id"),
         "name": payload.get("name"),

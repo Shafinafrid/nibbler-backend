@@ -195,6 +195,31 @@ push([{"id": "A", "name": "Money", "profileName": "Money", "ledger": ["none"]}],
 check("missing incoming timestamp cannot overwrite",
       find_stored(u, "A").get("ledger") == ["old", "new"])
 
+# Post-audit fix (Sep 2026): the root-timestamp FALLBACK is only legitimate
+# for a client that stamps NO profile at all on a given push (the case
+# right above — a single, wholly-unstamped profile body). It is NOT
+# legitimate for a client that stamps SOME profiles on the SAME push but
+# happens to omit it on this specific one — that omission is a genuine
+# anomaly, not an old-client signal, so it must fall through to the
+# ordinary "missing/malformed cannot overwrite" rule instead of borrowing
+# the root timestamp as a (much newer, misleading) proxy.
+T3 = "2026-09-04T10:00:00.000Z"
+u = mkuser("mixed_stamp_user", premium=True)
+push([prof("A", "Money", at=T1, ledger=["real-stamp"]),
+      prof("B", "Career", at=T1)], at=T1)
+# Same push carries a REAL timestamp on B (T3, later than A's stored T1)
+# but OMITS it entirely on A — A's own body has no updatedAt at all, even
+# though this side clearly CAN stamp profiles (it just did, on B).
+push([{"id": "A", "name": "Money", "profileName": "Money", "ledger": ["should-not-apply"]},
+      prof("B", "Career", at=T3, ledger=["real-edit"])], at=T3)
+check("A's ledger is UNCHANGED — the root timestamp (T3) must NOT be borrowed for A's "
+      "missing per-profile stamp when this SAME push demonstrably CAN stamp profiles (it did, on B)",
+      find_stored(u, "A").get("ledger") == ["real-stamp"],
+      str(find_stored(u, "A").get("ledger")))
+check("B's genuinely-stamped, later edit in the SAME push still applies normally",
+      find_stored(u, "B").get("ledger") == ["real-edit"],
+      str(find_stored(u, "B").get("ledger")))
+
 section("A3. Timestamps are parsed, not string-compared")
 u = mkuser("tz_user", premium=True)
 # 11:00+02:00 == 09:00Z, which is EARLIER than 10:00Z — but as raw strings
@@ -219,6 +244,28 @@ push([prof("A", "Money")], at=T0, person="Stale")
 st = stored_state(u)
 check("older root person ignored", (st.get("person") or {}).get("name") == "New")
 check("root updatedAt keeps the max", st.get("updatedAt") == T2, str(st.get("updatedAt")))
+
+# Post-audit fix (Sep 2026): a root updatedAt that is PRESENT but
+# unparseable ("garbage") is a genuine anomaly, not an old-client signal
+# (an old client omits the FIELD entirely — a distinct case, tested
+# below) — it must not overwrite a person the stored side validly
+# timestamped, per §4.5b's "malformed... can never overwrite a valid
+# stored value". Reuses the "New"-stamped state (T2) from just above.
+push([prof("A", "Money")], at="garbage", person="ShouldNotApply")
+st = stored_state(u)
+check("a malformed (but PRESENT) root updatedAt cannot overwrite a validly-timestamped stored person",
+      (st.get("person") or {}).get("name") == "New", str(st.get("person")))
+
+# Distinct from the above: a root updatedAt FIELD genuinely ABSENT (an old
+# client that never sends one at all) is long-standing, approved
+# behaviour and must keep applying — there is no staleness claim to weigh
+# when the field isn't present at all, unlike a present-but-garbled one.
+r = client.put("/profile/growth", json={"growth_state": {
+    "person": {"name": "OldClientNoTimestampField"}, "profiles": [{"id": "A", "name": "Money", "profileName": "Money"}],
+    "activeProfileId": "A"}})
+check("a root updatedAt field genuinely ABSENT still applies (old-client tolerance, unchanged)",
+      r.status_code == 200 and (r.json().get("growth_state") or {}).get("person", {}).get("name") == "OldClientNoTimestampField",
+      r.text)
 
 section("A5. activeProfileId is repaired, never dangling")
 u = mkuser("active_user", premium=True)
@@ -247,45 +294,88 @@ check("legacy `name` field also canonical", body.get("name") == "New Name")
 check("the stale device's unrelated answer IS still applied",
       body.get("ledger") == ["answer-from-stale-device"], str(body.get("ledger")))
 
-# ...but that protection is NARROW on purpose. A profile never renamed
-# through the canonical endpoint keeps the long-standing behaviour: an
-# ordinary offline rename carried in the blob still applies. With no
-# canonical rename on record there is nothing for a stale device to revert
-# TO, so defending it would only break the offline path that predates the
-# endpoint (tests/test_deletion_tombstones.py relies on exactly that).
+# ...but that protection is NARROW: only to the NAME. Every other field
+# keeps the long-standing behaviour: a newer/untimestamped blob may still
+# carry an ordinary field edit (tests/test_deletion_tombstones.py relies
+# on exactly that for non-name fields).
+#
+# Post-audit fix (Sep 2026): a profile's name is now marked canonical from
+# the moment the server first establishes it — bootstrap seed or canonical
+# create — not only after an explicit PATCH rename (growth_merge.py's
+# CANONICAL_NAME_FLAG). Before this fix, a profile's ORIGINAL bootstrap
+# name (never yet renamed — the common case) had NO protection at all, so
+# a later offline blob rename silently applied with zero uniqueness check,
+# contradicting §4.5c ("preserves the canonical server name" — no
+# exception carved out for "not yet explicitly renamed") and §2.4 (reject
+# duplicate normalized names). The three checks below assert the fix
+# instead of the gap: a blob CANNOT rename ANY profile the server has ever
+# named, canonical-endpoint or bootstrap — it can still edit every other
+# field.
 u = mkuser("blob_rename", premium=True)
 push([prof("A", "Original", at=T1)], at=T1)
-push([prof("A", "Renamed Offline", at=T2)], at=T2)
-check("blob rename applies when NO canonical rename exists",
-      find_stored(u, "A").get("profileName") == "Renamed Offline",
+push([prof("A", "Renamed Offline", at=T2, lifeArea="Should Still Apply")], at=T2)
+check("a blob CANNOT rename a bootstrap-seeded profile that was never explicitly renamed — "
+      "the name it was FIRST given is canonical from creation, not just after a later PATCH",
+      find_stored(u, "A").get("profileName") == "Original",
       str(find_stored(u, "A").get("profileName")))
+check("...but a non-name field in that SAME newer push still applies",
+      find_stored(u, "A").get("lifeArea") == "Should Still Apply",
+      str(find_stored(u, "A").get("lifeArea")))
+
+# The blocked-rename fix above stops a stale push reverting/renaming a
+# name the server established — but growth_merge itself runs NO
+# normalized-uniqueness check at all (unlike the canonical endpoints'
+# _reject_duplicate_name). Before this fix, a stale push COULD rename a
+# never-yet-explicitly-renamed profile to something colliding with another
+# live profile's name, with nothing to catch it — exactly the §2.4
+# violation the audit flagged. With the fix, this is blocked as a special
+# case of "the name is canonical from creation": the push simply cannot
+# touch A's name at all, colliding or not — the specific FAILURE MODE
+# (silent duplicate name) is what this test proves is now impossible,
+# without growth_merge needing its own separate uniqueness check.
+u = mkuser("blob_rename_collision", premium=True)
+push([prof("A", "Money"), prof("B", "Career")], at=T1)
+push([prof("A", "Career", at=T2), prof("B", "Career", at=T1)], at=T2)
+check("a stale push cannot rename A to collide with B's live name — A's canonical name is untouched",
+      find_stored(u, "A").get("profileName") == "Money",
+      str(find_stored(u, "A").get("profileName")))
+check("B's own name is also untouched (it was never targeted, only A's push mattered)",
+      find_stored(u, "B").get("profileName") == "Career",
+      str(find_stored(u, "B").get("profileName")))
+check("no two live profiles ended up sharing a normalized name",
+      len({(p.get("profileName") or "").strip().casefold() for p in stored_state(u).get("profiles", [])})
+      == len(stored_state(u).get("profiles", [])),
+      str(stored_state(u).get("profiles")))
 
 # Bodies carrying no per-profile timestamp fall back to the ROOT one. Not
 # every client stamps individual profiles; treating those as untimestamped
-# would make every pair an exact tie and silently discard each edit.
+# would make every pair an exact tie and silently discard each edit. Tests
+# a NON-name field (lifeArea) — a name change on the SAME profile is now
+# unconditionally blocked regardless of timestamp, per the fix above.
 u = mkuser("root_ts_only", premium=True)
 client.put("/profile/growth", json={"growth_state": {
-    "person": {"name": "P"}, "profiles": [{"id": "A", "name": "First"}],
+    "person": {"name": "P"}, "profiles": [{"id": "A", "name": "First", "lifeArea": "Old"}],
     "activeProfileId": "A", "updatedAt": T1}})
 client.put("/profile/growth", json={"growth_state": {
-    "person": {"name": "P"}, "profiles": [{"id": "A", "name": "Second"}],
+    "person": {"name": "P"}, "profiles": [{"id": "A", "name": "First", "lifeArea": "New"}],
     "activeProfileId": "A", "updatedAt": T2}})
 check("root timestamp breaks the tie when profiles are untimestamped",
-      find_stored(u, "A").get("name") == "Second",
-      str(find_stored(u, "A").get("name")))
+      find_stored(u, "A").get("lifeArea") == "New",
+      str(find_stored(u, "A").get("lifeArea")))
 
 # A wholly UNSTAMPED push (an old client sending no timestamps anywhere)
 # must still apply: there is no staleness claim to weigh, and those builds
-# depend on it. Only a DEMONSTRABLY older push is ignored.
+# depend on it. Only a DEMONSTRABLY older push is ignored. Tests a
+# non-name field for the same reason as above.
 u = mkuser("unstamped", premium=True)
 client.put("/profile/growth", json={"growth_state": {
-    "person": {"name": "First"}, "profiles": [{"id": "A", "name": "One"}],
+    "person": {"name": "First"}, "profiles": [{"id": "A", "name": "One", "lifeArea": "Old"}],
     "activeProfileId": "A"}})
 client.put("/profile/growth", json={"growth_state": {
-    "person": {"name": "Second"}, "profiles": [{"id": "A", "name": "Two"}],
+    "person": {"name": "Second"}, "profiles": [{"id": "A", "name": "One", "lifeArea": "New"}],
     "activeProfileId": "A"}})
 check("unstamped push from an older client still applies",
-      find_stored(u, "A").get("name") == "Two", str(find_stored(u, "A").get("name")))
+      find_stored(u, "A").get("lifeArea") == "New", str(find_stored(u, "A").get("lifeArea")))
 check("...including its root person value",
       (stored_state(u).get("person") or {}).get("name") == "Second")
 
@@ -500,6 +590,32 @@ r = client.post("/profile/growth/ensure",
                                        "activeProfileId": "Z", "updatedAt": T2}})
 check("ensure is idempotent — does not add a second profile",
       stored_ids(u) == before, "%s vs %s" % (stored_ids(u), before))
+
+section("F3. Repair/promotion run on a plain library READ, not only on a growth write")
+u = mkuser("repair_on_read_user", premium=True)
+# Seed the profile row DIRECTLY (bypassing any push/ensure call entirely) —
+# the ONLY thing that runs after this is a plain GET /library/, so any
+# repair observed below can only have come from the read path itself.
+db.add(Profile(
+    id="repair-on-read-profile", user_id=u, name="P",
+    growth_state={"person": {"name": "P"},
+                  "profiles": [prof("A", "Money")],
+                  "activeProfileId": "A", "updatedAt": T1},
+))
+db.commit()
+mkitem(u, "read_boot")                                 # both fields NULL
+mkitem(u, "read_legacy_matched", gp_name="Money")       # name, will match once repaired
+mkitem(u, "read_boot_story", mode="story")              # story: must stay null
+
+r = client.get("/library/")
+check("GET /library/ succeeds", r.status_code == 200, str(r.status_code))
+check("a bootstrap-unassigned row is attached by the READ itself, with NO prior push/ensure call",
+      item("read_boot").growth_profile_id == "A", str(item("read_boot").growth_profile_id))
+check("a uniquely-matchable legacy row is promoted by the READ itself",
+      item("read_legacy_matched").growth_profile_id == "A",
+      str(item("read_legacy_matched").growth_profile_id))
+check("a story book is NOT attached by the read repair pass",
+      item("read_boot_story").growth_profile_id is None)
 
 
 # ══════════════════════════════════════════════════════════════════════════

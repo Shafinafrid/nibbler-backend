@@ -255,6 +255,27 @@ def _load_growth_state(db, user_id: str) -> dict:
     return (prof.growth_state if prof and prof.growth_state else {}) or {}
 
 
+def _load_growth_state_and_tombstones(db, user_id: str):
+    """Same as _load_growth_state, plus the tombstone set.
+
+    Post-audit finding (Sep 2026, out of the original P2 scope but found
+    while wiring the scheduler's own repair-on-run pass below): this
+    scheduler had NO tombstone awareness at all — `_pick_profile` /
+    `resolve_assigned_profile` were called with tombstones=None
+    everywhere, so `live_profiles`'s own filtering had nothing to exclude
+    a deleted profile with here. Not fixed here (a separate, narrower
+    change than "wire the repair passes in") — flagged for its own
+    follow-up. This helper exists so the repair-on-run wiring below can at
+    least pass tombstones to the REPAIR passes correctly, matching
+    library.py's list_library fix.
+    """
+    from app.models.profile import Profile
+    prof = db.query(Profile).filter(Profile.user_id == user_id).first()
+    growth_state = (prof.growth_state if prof and prof.growth_state else {}) or {}
+    tombstones = set(prof.deleted_profile_ids or []) if prof else set()
+    return growth_state, tombstones
+
+
 def _pick_profile(growth_state: dict, item):
     """Which growth profile this book feeds.
 
@@ -460,7 +481,33 @@ def _prepare_user_nibbles(db_factory, user_id: str) -> None:
 
         cap = settings.premium_bites_per_day if user.effective_premium else settings.free_bites_per_day
         selected = _select_sources_for_today(active, min(cap, len(active)), today)
-        growth_state = _load_growth_state(db, user_id)
+
+        # Post-audit fix (Sep 2026): plan §1.4/§1.5 say the repair/promotion
+        # passes run "on later library reads and scheduler runs" — the
+        # scheduler side was never wired (matches library.py's list_library
+        # gap, fixed alongside this). Without it, a bootstrap-unassigned or
+        # now-uniquely-matchable legacy row for a source selected for
+        # today's generation only ever self-healed via a growth push the
+        # user's device happened to make — never simply by the scheduler
+        # ticking for them.
+        from app.services.profile_resolution import (
+            attach_unassigned_wisdom_books, lock_user_scope,
+            promote_resolvable_legacy_rows, redetermine_assignment_names,
+        )
+        growth_state, tombstones = _load_growth_state_and_tombstones(db, user_id)
+        if growth_state:
+            lock_user_scope(db, user_id)
+            try:
+                attach_unassigned_wisdom_books(db, user_id, growth_state, tombstones)
+                promote_resolvable_legacy_rows(db, user_id, growth_state, tombstones)
+                redetermine_assignment_names(db, user_id, growth_state, tombstones)
+                db.commit()
+            except Exception:
+                # Same contract as every other repair-pass call site: never
+                # take down an otherwise-normal generation tick. Idempotent,
+                # so it simply retries on the next scheduler pass.
+                db.rollback()
+                logger.exception("assignment repair-on-scheduler-run failed for %s (non-fatal)", user_id)
 
         made = 0
         for item in selected:

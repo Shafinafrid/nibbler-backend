@@ -88,6 +88,22 @@ def _get_or_create_profile(user: User, db: Session, *, for_update: bool = False)
     `populate_existing()` to force a fresh, lock-holding read from the
     database rather than SQLAlchemy's identity map handing back the
     already-loaded (unlocked) object.
+
+    Post-audit fix (Sep 2026): the bootstrap-creation branch used to
+    `db.commit()` the new row before re-locking it. Every one of this
+    function's five `for_update=True` callers takes the user-scoped
+    advisory lock (`lock_user_scope`) immediately before calling this, and
+    `pg_advisory_xact_lock` is TRANSACTION-scoped — it releases on commit.
+    So for a user's very first locked call (no profile row yet), that
+    commit silently ended the transaction holding the caller's advisory
+    lock, and the row was then re-locked with `SELECT ... FOR UPDATE` in a
+    BRAND NEW transaction with no advisory lock at all — reopening exactly
+    the bootstrap/create race §1.4's advisory lock exists to close, for
+    every brand-new account's first write. Fixed by using `db.flush()`
+    (sends the INSERT to Postgres, does not end the transaction) and
+    `db.refresh(profile, with_for_update=True)` (re-SELECTs and locks
+    in-place, same transaction) instead — the caller's own final
+    `db.commit()` remains the only commit for the whole locked operation.
     """
     if for_update and user.profile:
         return (
@@ -105,17 +121,11 @@ def _get_or_create_profile(user: User, db: Session, *, for_update: bool = False)
         name=user.display_name or (user.email or "").split("@")[0] or "Nibbler user",
     )
     db.add(profile)
-    db.commit()
-    db.refresh(profile)
-    db.refresh(user)
+    db.flush()
     if for_update:
-        return (
-            db.query(Profile)
-            .filter(Profile.id == profile.id)
-            .populate_existing()
-            .with_for_update()
-            .first()
-        )
+        db.refresh(profile, with_for_update=True)
+    else:
+        db.refresh(profile)
     return profile
 
 
@@ -414,8 +424,23 @@ def ensure_growth_state(
             # Seed from the client's onboarding profile. Only the FIRST is
             # taken: bootstrapping is not a way to create several profiles
             # without entitlement.
-            incoming["profiles"] = incoming_profiles[:1]
-            incoming["activeProfileId"] = incoming_profiles[0].get("id")
+            seeded = dict(incoming_profiles[0])
+            # Post-audit fix (Sep 2026): mark this name CANONICAL the moment
+            # the server establishes it, not only on a later explicit
+            # rename. Before this, a profile's ORIGINAL bootstrap name (the
+            # overwhelmingly common case — most users never rename) had no
+            # protection at all: growth_merge's narrow I2 defence only
+            # engages once CANONICAL_NAME_FLAG is set, so a stale push could
+            # silently rename this never-yet-renamed profile with zero
+            # uniqueness check (see growth_merge.py's merge logic) — exactly
+            # what §4.5c/§2.4 require never happens. Every profile the
+            # server creates already has its name established with server
+            # knowledge of uniqueness (trivially true here: it's the FIRST
+            # profile, nothing to collide with), so there is no reason to
+            # leave it unprotected until some later rename.
+            seeded[CANONICAL_NAME_FLAG] = True
+            incoming["profiles"] = [seeded]
+            incoming["activeProfileId"] = seeded.get("id")
             profile.growth_state = incoming
             person_name = ((incoming.get("person") or {}).get("name") or "").strip()
             if person_name:
@@ -480,6 +505,12 @@ def create_growth_profile(
     body["id"] = profile_id
     body["name"] = name
     body["profileName"] = name
+    # Post-audit fix (Sep 2026): same reasoning as ensure_growth_state's
+    # bootstrap seed above — this endpoint already validated uniqueness
+    # (_reject_duplicate_name, just above) before this name was ever
+    # stored, so it must be marked canonical from creation, not left
+    # unprotected until a later explicit rename.
+    body[CANONICAL_NAME_FLAG] = True
     state["profiles"] = list(state.get("profiles") or []) + [body]
     state.setdefault("activeProfileId", profile_id)
     profile.growth_state = state

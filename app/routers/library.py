@@ -160,6 +160,35 @@ def list_library(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
+    # Post-audit fix (Sep 2026): plan §1.4/§1.5 both say the repair/
+    # promotion passes run "on later library reads and scheduler runs" —
+    # never wired here, so a bootstrap-unassigned or now-uniquely-
+    # matchable legacy row only ever self-healed via a LATER growth push
+    # (ensure/PUT/create/rename/delete), not simply by the user opening
+    # their Library. profile_resolution.py's own module comment requires
+    # the caller to already hold lock_user_scope before calling these —
+    # a plain read taking the same advisory lock a write would is the
+    # documented contract, not new locking behavior invented here.
+    from app.services.profile_resolution import (
+        attach_unassigned_wisdom_books, lock_user_scope,
+        promote_resolvable_legacy_rows, redetermine_assignment_names,
+    )
+    growth_state, tombstones = _load_growth(db, current_user.id)
+    if growth_state:
+        lock_user_scope(db, current_user.id)
+        try:
+            attach_unassigned_wisdom_books(db, current_user.id, growth_state, tombstones)
+            promote_resolvable_legacy_rows(db, current_user.id, growth_state, tombstones)
+            redetermine_assignment_names(db, current_user.id, growth_state, tombstones)
+            db.commit()
+        except Exception:
+            # Matches _sync_assignments's own contract (profile.py): a
+            # repair pass failing must never take down an otherwise-normal
+            # read. The passes are idempotent, so whatever fails here is
+            # simply retried on the next call.
+            db.rollback()
+            logger.exception("assignment repair-on-read failed for %s (non-fatal)", current_user.id)
+
     items = (
         db.query(LibraryItem)
         .filter(LibraryItem.user_id == current_user.id)
@@ -491,6 +520,30 @@ def rename_library_item(
     Ownership is enforced by the same user_id filter every other route here
     uses: a valid token for account A can never rename account B's book.
     """
+    # Sep 2026: PRESENCE, not "is not None". For the assignment fields an
+    # explicit null is a real instruction ("reset to my default profile"),
+    # so `is not None` would silently treat it as "field absent" and ignore
+    # a request the user deliberately made.
+    sent = data.model_fields_set
+    wants_assignment = "growth_profile_id" in sent or "growth_profile_name" in sent
+    wants_mutation = (
+        data.title is not None or data.mode is not None or wants_assignment
+    )
+
+    # Post-audit fix (Sep 2026): §4.0's lock ordering applies to "every
+    # assignment write" — this was the one write path with NO lock at all.
+    # Without it, this read of `item`/`growth_state` could observe a
+    # profile as live, then commit an assignment to it AFTER a concurrent
+    # DELETE /profile/profiles/{id} has already tombstoned that same id in
+    # a separate, already-committed transaction — producing a dangling
+    # assignment exactly like the app-side deleteProfile gap (§ P1-1), via
+    # a completely different path. Only taken when the request actually
+    # touches assignment; a plain title/mode edit needs no serialization
+    # against profile mutations.
+    if wants_assignment:
+        from app.services.profile_resolution import lock_user_scope
+        lock_user_scope(db, current_user.id)
+
     item = db.query(LibraryItem).filter(
         LibraryItem.id == item_id,
         LibraryItem.user_id == current_user.id,
@@ -506,15 +559,6 @@ def rename_library_item(
     # mutation route here (set_item_active, etc.) already refuses. Any
     # requested field on a locked source is now refused BEFORE any
     # mutation is applied, using the same established 403 shape.
-    # Sep 2026: PRESENCE, not "is not None". For the assignment fields an
-    # explicit null is a real instruction ("reset to my default profile"),
-    # so `is not None` would silently treat it as "field absent" and ignore
-    # a request the user deliberately made.
-    sent = data.model_fields_set
-    wants_assignment = "growth_profile_id" in sent or "growth_profile_name" in sent
-    wants_mutation = (
-        data.title is not None or data.mode is not None or wants_assignment
-    )
     if wants_mutation and not is_source_unlocked(current_user, item):
         raise HTTPException(
             status_code=403,
