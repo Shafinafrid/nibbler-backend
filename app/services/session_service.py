@@ -32,7 +32,7 @@ from app.models.personalization import PersonalizationQuestion
 from app.models.user import User
 from app.services.llm import LLMService
 from app.services.embedding_service import EmbeddingService
-from app.services import image_select
+from app.services.personalization_history import question_memory, available_tags, is_novel_question, persist_novel_question
 from app.services.entitlement_service import is_source_unlocked, touch_last_active
 
 logger = logging.getLogger(__name__)
@@ -634,19 +634,6 @@ def _build_session_content(
             bodies = split_story_cards(excerpt, max(3, card_target - 1))
             if not bodies:
                 raise SessionGenerationError("No readable text stored for this book.", 422)
-            # Figures the reader has already reached. A picture from further
-            # ahead is a spoiler — a character, a place, a plot beat they have
-            # not met — so the shortlist is capped at today's position and the
-            # same cap is re-applied after the model answers.
-            # Both sides of this comparison are WORD fractions of the same
-            # text: `progress` is a word offset into item.content, and a
-            # candidate's position is the fraction of the book's words before
-            # it. Candidates recorded in pages or spine units are refused
-            # outright rather than converted — see image_select.
-            story_max_position = min(1.0, (progress + n) / max(1, len(words)))
-            story_candidates = image_select.safe_shortlist(
-                item.images, excerpt, max_position=story_max_position,
-            )
 
             # The model never carries the prose — it only names what it reads.
             # Story mode's whole promise is the book itself, so a paraphrase or
@@ -655,13 +642,11 @@ def _build_session_content(
                 meta = llm.generate_story_metadata(
                     book_title=item.title, author=item.author,
                     card_bodies=bodies, part_number=part_number,
-                    image_options=image_select.safe_prompt(story_candidates),
                 )
             except Exception as e:
                 logger.warning("Story metadata failed (%s) — serving plain headings", e)
                 meta = {}
             headings = meta.get("headings") or []
-            story_image_ids = meta.get("imageIds") or []
             result = {
                 "title": meta.get("title") or f"{item.title} — part {part_number}",
                 "chapter": f"PART {part_number}",
@@ -673,28 +658,11 @@ def _build_session_content(
                         "eyebrow": "TODAY'S READING" if i == 0 else "THE STORY CONTINUES",
                         "title": headings[i] if i < len(headings) else "",
                         "body": body,
-                        # Positional: story cards are server-owned and have no
-                        # id the model could name, so it answers with an array
-                        # parallel to `headings`. Validated below.
-                        "imageId": (story_image_ids[i]
-                                    if i < len(story_image_ids) else None),
                     }
                     for i, body in enumerate(bodies)
                 ],
                 "quiz": None,
             }
-            # Failure here must never cost the reader their portion: the text
-            # is already correct and complete, and a picture is a garnish.
-            try:
-                image_select.attach_images(
-                    result["cards"], shortlisted=story_candidates,
-                    user_id=user.id, item_id=item.id,
-                    max_position=story_max_position,
-                )
-            except Exception as e:
-                logger.warning("Story image attach failed (%s) — text-only portion", e)
-                for card in result["cards"]:
-                    card.pop("imageId", None)
             item.story_progress = min(progress + n, len(words))
     else:
         profile = profile or {}
@@ -754,10 +722,6 @@ def _build_session_content(
             chunk_ids = []
         if not chunks:
             raise SessionGenerationError("No indexed content found for this item.", 422)
-        # Figures whose caption/alt/nearby text overlaps the passages this
-        # deck is being written from. Empty for most books, which is the
-        # expected outcome — a text-only deck is a correct deck.
-        wisdom_candidates = image_select.safe_shortlist(item.images, " ".join(chunks))
 
         # Dynamic growth-profile personalization (Aug 2026): decided BEFORE
         # card_target is finalized, and generated in its own call BEFORE the
@@ -769,10 +733,16 @@ def _build_session_content(
         # grounded in real retrieved passages, never the 8000-char fallback.
         personalization_question = None
         if chunk_ids and _roll_personalization(db, user, item, chunks):
-            personalization_question = llm.generate_personalization_question(
-                book_title=item.title, author=item.author,
-                profile=profile, context_chunks=chunks,
-            )
+            history = question_memory(db, user.id, profile.get("id"))
+            if profile.get("id") and available_tags(history):
+                personalization_question = llm.generate_personalization_question(
+                    book_title=item.title, author=item.author,
+                    profile=profile, context_chunks=chunks, question_history=history,
+                )
+            # Independent of the prompt/provider: a paraphrased repeat is
+            # omitted, not charged another model call or shown to the reader.
+            if personalization_question and not is_novel_question(personalization_question, history):
+                personalization_question = None
             if personalization_question:
                 # Stamp a stable, purely positional id onto each option.
                 # "optN" by array index — never something a model invents
@@ -807,7 +777,6 @@ def _build_session_content(
                 book_title=item.title, author=item.author,
                 profile=profile, context_chunks=chunks,
                 card_target=card_target, read_length=read_length,
-                image_options=image_select.safe_prompt(wisdom_candidates),
             )
         except Exception as e:
             raise SessionGenerationError(f"Session generation failed: {e}", 502)
@@ -818,19 +787,6 @@ def _build_session_content(
                 profile_id=(profile or {}).get("id"),
             )
 
-        # Ownership, book and shortlist membership are all re-checked here from
-        # the stored rows — the id came back from a model, so nothing about it
-        # is trusted. An exception must not lose an otherwise valid deck.
-        try:
-            image_select.attach_images(
-                result.get("cards") or [], shortlisted=wisdom_candidates,
-                user_id=user.id, item_id=item.id,
-            )
-        except Exception as e:
-            logger.warning("Wisdom image attach failed (%s) — text-only deck", e)
-            for card in result.get("cards") or []:
-                if isinstance(card, dict):
-                    card.pop("imageId", None)
 
     # Finalize the ALREADY-CLAIMED placeholder row (claimed_bite_id) rather
     # than inserting a new one — it already holds the unique (user, item,
@@ -890,16 +846,11 @@ def _build_session_content(
     # `daily_bite_id` is unique (PersonalizationQuestion.__table_args__), so
     # this can never create two rows for one bite.
     if mode != "story" and personalization_question:
-        db.add(PersonalizationQuestion(
-            user_id=user.id,
-            daily_bite_id=claimed_bite_id,
-            library_item_id=item.id,
+        persist_novel_question(
+            db, user_id=user.id, bite_id=claimed_bite_id, item_id=item.id,
             profile_id=(profile or {}).get("id"),
-            question=personalization_question.get("question") or "",
-            options=personalization_question.get("options") or [],
-            source_chunk_ids=chunk_ids,
-        ))
-        db.commit()
+            question=personalization_question, chunk_ids=chunk_ids,
+        )
 
     # A session was actually generated for this source — real "use", the
     # authoritative signal the deterministic downgrade fallback ranks on

@@ -6,19 +6,6 @@ class Settings(BaseSettings):
     # Database
     database_url: str
 
-    # Image generation for nibble cards. INERT until openai_api_key is set —
-    # see services/image_gen.py. Cheapest tier by default because every image
-    # is a real charge (~$0.011 at gpt-image-1 low quality).
-    openai_api_key: str = ""
-    image_model: str = "gpt-image-1"
-    image_quality: str = "low"
-    # Default flipped True → False on 2026-08-02 after audit. The module was
-    # already unreachable, but "unreachable" was an accident of nothing
-    # importing it (and of a broken import inside it) rather than a decision.
-    # A default of True meant the day someone wired it up, image generation
-    # would switch itself on and start billing. Turning it on must take a
-    # deliberate act.
-    image_generation_enabled: bool = False
 
     # ── Text generation: provider-neutral routing ────────────────────────────
     # Nibbler talks to one of three interchangeable models through
@@ -41,9 +28,7 @@ class Settings(BaseSettings):
     llm_circuit_cooldown_seconds: int = 120
 
     # Luna (OpenAI GPT-5.6 Luna) — default provider.
-    # DELIBERATELY SEPARATE from `openai_api_key` above, which belongs to the
-    # inert image-generation module. Setting this key must never switch image
-    # generation on, so the two never share a field.
+    # Text-only credential; nibble image generation has been removed.
     openai_llm_api_key: str = ""
     # Always the explicit Luna id: the bare `gpt-5.6` alias routes to Sol.
     openai_llm_model: str = "gpt-5.6-luna"

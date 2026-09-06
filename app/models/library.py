@@ -9,7 +9,7 @@ class LibraryItem(Base):
     id = Column(String, primary_key=True)
     user_id = Column(String, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
     title = Column(String, nullable=False)
-    # Figures extracted from the source at upload — see services/image_extract.
+    # Legacy picture metadata, retained ONLY to delete already-stored S3 objects.
     # [{ref, page, w, h, context}]; empty for books with no usable pictures.
     images = Column(JSON, nullable=True)
     # Scanned PDFs: 'needed' once extraction finds no text, then 'running' /

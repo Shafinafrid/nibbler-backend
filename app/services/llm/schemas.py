@@ -141,14 +141,10 @@ def personalization_interpret_schema() -> Dict[str, Any]:
     }
 
 
-def card_schema(with_images: bool = False) -> Dict[str, Any]:
+def card_schema() -> Dict[str, Any]:
     """One card. Fields not used by a given kind are null, per the strict
     subset's no-optional-keys rule — see the module docstring.
 
-    `with_images` adds `imageId`, present only when the book actually has
-    candidate figures to offer. Leaving it out otherwise is not an
-    optimisation: a nullable field the model cannot legitimately fill is an
-    invitation to invent one.
     """
     props: Dict[str, Any] = {
         "kind": {"type": "string", "enum": CARD_KINDS},
@@ -173,13 +169,6 @@ def card_schema(with_images: bool = False) -> Dict[str, Any]:
         # optional keys), for a card kind the model must never emit.
     }
     required = ["kind", "eyebrow", "title", "body", "highlight", "options", "explanation"]
-    if with_images:
-        # An id from the supplied shortlist, or null. NOT a URL, a filename or
-        # a path — the server re-checks the value against the shortlist and
-        # rejects anything it did not itself offer, so this can only ever be a
-        # choice among what we handed over.
-        props["imageId"] = _str(nullable=True)
-        required.append("imageId")
     return {
         "type": "object",
         "additionalProperties": False,
@@ -188,8 +177,7 @@ def card_schema(with_images: bool = False) -> Dict[str, Any]:
     }
 
 
-def wisdom_schema(card_target: int, quiz_target: int,
-                  with_images: bool = False) -> Dict[str, Any]:
+def wisdom_schema(card_target: int, quiz_target: int) -> Dict[str, Any]:
     """A full Wisdom deck. Cardinality is baked in per request: the deck is
     exactly `card_target` cards and the review quiz exactly `quiz_target`
     questions, so a short deck is rejected by the provider rather than reaching
@@ -204,7 +192,7 @@ def wisdom_schema(card_target: int, quiz_target: int,
             "preview": _str(),
             "cards": {
                 "type": "array",
-                "items": card_schema(with_images),
+                "items": card_schema(),
                 "minItems": card_target,
                 "maxItems": card_target,
             },
@@ -219,14 +207,11 @@ def wisdom_schema(card_target: int, quiz_target: int,
     }
 
 
-def story_schema(card_count: int, with_images: bool = False) -> Dict[str, Any]:
+def story_schema(card_count: int) -> Dict[str, Any]:
     """Titling for a Story portion. The prose is NOT here and must never be:
     story cards carry the author's own text, cut server-side, and the model's
     only job is to name each card.
 
-    With images, it may also associate one candidate id per card — an array
-    positionally parallel to `headings`, because the cards themselves are
-    server-owned and have no other identifier the model could refer to.
     """
     props: Dict[str, Any] = {
         "title": _str(),
@@ -240,14 +225,6 @@ def story_schema(card_count: int, with_images: bool = False) -> Dict[str, Any]:
         },
     }
     required = ["title", "headline", "preview", "headings"]
-    if with_images:
-        props["imageIds"] = {
-            "type": "array",
-            "items": _str(nullable=True),
-            "minItems": card_count,
-            "maxItems": card_count,
-        }
-        required.append("imageIds")
     return {
         "type": "object",
         "additionalProperties": False,

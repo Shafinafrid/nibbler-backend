@@ -259,8 +259,8 @@ check("fixture is unambiguous: routes_lk4 is locked, routes_lk1 is unlocked",
 as_user("routes_locked")
 
 r = c.get("/library/routes_lk4/images/img_abc123")
-check("GET /library/{id}/images/{candidate_id} on a locked source is refused (403 source_locked)",
-      r.status_code == 403 and r.json()["detail"]["code"] == "source_locked", f"{r.status_code} {r.text[:150]}")
+check("GET /library/{id}/images/{candidate_id} is retired for every source (410)",
+      r.status_code == 410, f"{r.status_code} {r.text[:150]}")
 
 # Task 2 final consolidated backend pass (Verified Blocker 7): the generic
 # PATCH /library/{item_id} used to let a locked source's title, mode, or

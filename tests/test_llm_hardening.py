@@ -385,9 +385,9 @@ else:
 
 # ══ Finding 12 — image generation was off only by accident ══════════════════
 
-c.ok(make_settings().image_generation_enabled is False,
+c.ok(not hasattr(make_settings(), "image_generation_enabled"),
      "image generation defaults to OFF, not merely unreachable")
-c.ok(make_settings(openai_llm_api_key="sk-luna").image_generation_enabled is False,
+c.ok(not hasattr(make_settings(openai_llm_api_key="sk-luna"), "image_generation_enabled"),
      "configuring Luna does not switch image generation on")
 
 

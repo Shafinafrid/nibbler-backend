@@ -453,10 +453,10 @@ c.ok("is_premium=" not in sess_src,
      "no premium flag is passed into text generation — tier does not pick a model")
 
 image_settings = make_settings(openai_llm_api_key="sk-luna-only")
-c.ok(image_settings.openai_api_key == "",
+c.ok(not hasattr(image_settings, "openai_api_key"),
      "setting the Luna key leaves the image-generation key untouched")
-c.ok(image_settings.openai_llm_api_key != image_settings.openai_api_key,
-     "the Luna credential and the image credential are separate settings")
+c.ok(image_settings.openai_llm_api_key == "sk-luna-only",
+     "text generation keeps its own credential after pictures are removed")
 
 llm_dir = os.path.join(BACKEND, "app", "services", "llm")
 llm_src = "\n".join(open(os.path.join(llm_dir, f)).read()

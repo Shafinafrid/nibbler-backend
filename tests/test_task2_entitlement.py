@@ -310,12 +310,12 @@ check("POST /bites/session on a locked source is refused (403 source_locked) —
 # Free users' unlocked sources, only the existing Premium/trial/complimentary
 # access does, at which point `is_source_unlocked` is always True anyway.
 r = c.post("/connect/insights", json={"library_item_id": locked_id})
-check("POST /connect/insights for a non-entitled account stays premium-gated (Connect is untouched by Task 2)",
-      r.status_code == 403 and r.json()["detail"]["code"] == "premium_required", f"{r.status_code} {r.text[:150]}")
+check("POST /connect/insights is free but a locked source remains locked",
+      r.status_code == 403 and r.json()["detail"]["code"] == "source_locked", f"{r.status_code} {r.text[:150]}")
 
 r = c.get(f"/connect/stats/{locked_id}")
-check("GET /connect/stats/{id} for a non-entitled account stays premium-gated",
-      r.status_code == 403 and r.json()["detail"]["code"] == "premium_required", f"{r.status_code} {r.text[:150]}")
+check("GET /connect/stats/{id} is free but a locked source remains locked",
+      r.status_code == 403 and r.json()["detail"]["code"] == "source_locked", f"{r.status_code} {r.text[:150]}")
 
 r = c.post("/connect/chat", json={"library_item_id": locked_id, "message": "hi"})
 check("POST /connect/chat for a non-entitled account stays premium-gated — no paid chat call reached",

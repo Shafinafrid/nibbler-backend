@@ -1141,69 +1141,10 @@ check("no APScheduler thread and no scheduler event-loop thread remains "
 
 
 # ═════════════════════════════════════════════════════════════════════════
-section("H1 — Image extraction ownership (Verified Blocker 3): a superseded "
-        "attempt persists zero images and its own uploads get durable, "
-        "exact per-key cleanup tasks")
-# ═════════════════════════════════════════════════════════════════════════
-u_img = mkuser("img_own_u", successful_sources_total=0)
-it_img = mkitem("img_own_item", "img_own_u", processed=False, type="pdf")
-ent.reserve_free_capacity(db, it_img, "img_own_u")
-tok_img_a = ent.admit_worker_attempt(db, "img_own_item", "img_own_u")
-check("setup: attempt A admitted for image extraction", bool(tok_img_a))
+section("H1 — Nibble image extraction retired")
+check("uploads no longer have an image extraction entry point",
+      not hasattr(library_router, "_extract_book_images"))
 
-superseding = {}
-
-
-def _stale_extract_and_store(**kw):
-    # By the time extraction+upload finishes, this attempt has been
-    # superseded — a reaper expired it and a fresh attempt B was
-    # admitted — exactly what a slow extraction racing a reaper looks
-    # like in production.
-    db.query(LibraryItem).filter(LibraryItem.id == "img_own_item").update(
-        {"worker_attempt_expires_at": NOW - datetime.timedelta(minutes=1)})
-    db.commit()
-    superseding["tok_b"] = ent.admit_worker_attempt(db, "img_own_item", "img_own_u")
-    return [
-        {"id": "img_x1", "key": f"book-images/img_own_u/img_own_item/{tok_img_a}/img_x1.png",
-         "mime": "image/png", "checksum": "c1", "order": 0, "w": 400, "h": 400,
-         "page": 1, "spine": None, "chapter": None, "href": None, "context": "",
-         "caption": "", "alt": "", "position": 0.1, "position_basis": "words", "visual": "photo"},
-        {"id": "img_x2", "key": f"book-images/img_own_u/img_own_item/{tok_img_a}/img_x2.png",
-         "mime": "image/png", "checksum": "c2", "order": 1, "w": 400, "h": 400,
-         "page": 2, "spine": None, "chapter": None, "href": None, "context": "",
-         "caption": "", "alt": "", "position": 0.2, "position_basis": "words", "visual": "photo"},
-    ]
-
-
-with mock.patch("app.services.image_extract.extract_and_store", side_effect=_stale_extract_and_store), \
-     mock.patch("app.routers.library.S3Service") as MockS3Img:
-    MockS3Img.return_value.delete_file.return_value = True
-    img_count = library_router._extract_book_images(
-        db, refresh_item("img_own_item"), b"fake pdf bytes", "img_own_u", tok_img_a)
-
-check("a superseded attempt persists ZERO images", img_count == 0, img_count)
-check("item.images was never written by the stale attempt",
-      refresh_item("img_own_item").images is None)
-check("the fresh attempt B genuinely owns the item now — the stale attempt "
-      "never reclaimed it", refresh_item("img_own_item").worker_attempt_id == superseding.get("tok_b"))
-
-stale_image_tasks = db.query(CleanupTask).filter(
-    CleanupTask.item_id == "img_own_item", CleanupTask.attempt_token == tok_img_a,
-    CleanupTask.artifact_kind == "s3_image").all()
-check("exactly one durable per-key cleanup task exists for EACH of the "
-      "stale attempt's own uploaded images (multiple independent keys, "
-      "one attempt)", len(stale_image_tasks) == 2, len(stale_image_tasks))
-check("each durable cleanup task names an exact key inside the STALE "
-      "attempt's own attempt-scoped path — structurally incapable of "
-      "naming a different (newer) attempt's key",
-      all(f"/{tok_img_a}/" in (t.artifact_key or "") for t in stale_image_tasks),
-      [t.artifact_key for t in stale_image_tasks])
-check("the stale attempt's own uploaded objects were actually deleted "
-      "(best-effort immediate cleanup succeeded)",
-      MockS3Img.return_value.delete_file.call_count == 2)
-
-
-# ═════════════════════════════════════════════════════════════════════════
 section("H2 — Cleanup ledger identity/claim (Verified Blocker 4): ledger "
         "persistence failure prevents any provider call; direct-vs-"
         "scheduler mutual exclusion performs at most one provider action")

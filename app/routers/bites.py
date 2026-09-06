@@ -241,6 +241,9 @@ def _repair_personalize_cards(db: Session, bite: DailyBite, cards: list) -> list
 
 def _bite_to_session(bite: DailyBite, db: Session = None) -> SessionResponse:
     cards = bite.cards or []
+    # Retired pictures must also disappear from previously stored/replayed decks.
+    cards = [{k: v for k, v in c.items() if k not in ("image", "imageId", "imageUrl")}
+             if isinstance(c, dict) else c for c in cards]
     if db is not None:
         cards = _repair_personalize_cards(db, bite, cards)
     return SessionResponse(
@@ -979,8 +982,9 @@ def get_session_history(
     # mutated `cards` would rewrite the stored deck).
     sanitized = []
     for r in rows:
-        cards = r.cards or []
-        if any(isinstance(c, dict) and c.get("kind") == "personalize" for c in cards):
+        cards = [{k: v for k, v in c.items() if k not in ("image", "imageId", "imageUrl")}
+                 if isinstance(c, dict) else c for c in r.cards or []]
+        if cards != r.cards or any(isinstance(c, dict) and c.get("kind") == "personalize" for c in cards):
             sanitized.append(SessionHistoryItem(
                 id=r.id, library_item_id=r.library_item_id, date=r.date,
                 mode=r.mode or "wisdom", read_length=r.read_length or 5,

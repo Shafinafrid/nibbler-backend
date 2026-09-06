@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Form, BackgroundTasks, Request, Response
+from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Form, BackgroundTasks, Request
 from sqlalchemy.orm import Session
 from app.database import get_db
 from app.middleware.auth import get_current_user
@@ -1329,98 +1329,10 @@ def _delete_item_images(item: LibraryItem, user_id: str) -> bool:
 
 
 @router.get("/{item_id}/images/{candidate_id}")
-def get_book_image(
-    item_id: str,
-    candidate_id: str,
-    current_user: User = Depends(get_current_user),
-    db: Session = Depends(get_db),
-):
-    """Task 2 closeout (Verified Blocker 10): entitlement-revalidated
-    BYTE PROXY, for its owner — replaces the prior 1-hour presigned-URL
-    capability, which kept working for the rest of its hour even after a
-    downgrade mid-flight (a real, reusable, revocation-proof capability
-    handed to the client). Every single request now re-verifies Firebase
-    identity (via `get_current_user`), item ownership, that the item is
-    not tombstoned, and that the source is CURRENTLY unlocked — fetches
-    the private S3 object server-side — and streams the bytes back.
-    There is no capability outstanding between requests to revoke:
-    downgrading mid-session makes the very next request fail immediately.
-
-    Still NOT a 307 redirect to S3, for the same reason as before: a
-    redirect would have the client follow a cross-host hop while still
-    holding its `Authorization: Bearer <firebase id token>` header, and
-    iOS's URLSession forwards headers across redirects by default — that
-    would hand a user's Firebase token to Amazon. This endpoint fetches
-    the object itself and returns the bytes directly, so no S3 URL of any
-    kind — presigned or otherwise — is ever exposed to the client.
-
-    `Cache-Control: no-store` on every response: a locally cached copy
-    surviving a downgrade would be the same revocation gap through a
-    different door.
-
-    What a card persists is the API PATH — unchanged. Ownership is
-    established by the QUERY, not by comparing ids: the lookup is scoped
-    to this user AND this book, so an id belonging to another account is
-    simply not found. Scoping by BOOK as well as owner matters because
-    candidate ids were once derived from the image checksum alone.
-
-    Mobile contract change (documented, not implemented here — mobile is
-    a separate assignment): this endpoint used to return JSON
-    (`{"url", "expires_in", "mime", "alt", "w", "h"}`); it now returns the
-    raw image bytes directly, with `Content-Type` set to the image's real
-    MIME type. `alt`/`w`/`h` are no longer returned by this call — the
-    client must source that metadata from the card payload it already
-    received at session-generation time (see app/services/image_select.py,
-    which already attaches image identity/metadata to the card), not by
-    re-deriving it from this byte-fetching endpoint.
-    """
-    if not candidate_id or not candidate_id.startswith("img_") or len(candidate_id) > 64:
-        raise HTTPException(status_code=404, detail="Image not found.")
-
-    item = db.query(LibraryItem).filter(
-        LibraryItem.id == item_id,
-        LibraryItem.user_id == current_user.id,
-        LibraryItem.deletion_state.is_(None),  # a tombstoned item is gone
-    ).first()
-    if item is None:
-        raise HTTPException(status_code=404, detail="Image not found.")
-    if not is_source_unlocked(current_user, item):
-        # Task 2 remediation: a book's extracted figures are source-derived
-        # content exactly like its sessions/chat — a direct GET here must
-        # not bypass the same lock every other source-bearing route enforces.
-        raise HTTPException(
-            status_code=403,
-            detail={
-                "code": "source_locked",
-                "message": "This source is Premium-only right now. Upgrade to see its images again.",
-            },
-        )
-
-    for img in (item.images or []):
-        if not isinstance(img, dict) or img.get("id") != candidate_id:
-            continue
-        key = img.get("key") or ""
-        # The stored key must still sit under this owner's and book's prefix.
-        # A row that fails this was tampered with or written by a bug; either
-        # way it is not something to hand to S3.
-        if not key.startswith("book-images/%s/%s/" % (current_user.id, item.id)):
-            logger.error("Image row %s has an out-of-scope key", candidate_id)
-            raise HTTPException(status_code=404, detail="Image not found.")
-        try:
-            data = S3Service().download_file(key)
-        except Exception as e:
-            # Never expose the key, the bucket, or any provider detail —
-            # a bounded, generic failure only (S3Service's client itself
-            # carries a bounded connect/read timeout — see s3_service.py).
-            logger.warning("Image fetch failed for %s: %s", candidate_id, type(e).__name__)
-            raise HTTPException(status_code=502, detail="Image unavailable right now.")
-        return Response(
-            content=data,
-            media_type=img.get("mime") or "image/png",
-            headers={"Cache-Control": "no-store, private"},
-        )
-
-    raise HTTPException(status_code=404, detail="Image not found.")
+def get_book_image(item_id: str, candidate_id: str,
+                   current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    """Retired endpoint for installed older clients; never fetches image bytes."""
+    raise HTTPException(status_code=410, detail="Nibble pictures have been removed.")
 
 
 def _finish_item_deletion_cleanup(db, item, user_id: str) -> bool:
@@ -1645,117 +1557,6 @@ EMBEDDING_DOWN_MESSAGE = (
 )
 
 
-def _extract_book_images(db, item, file_bytes: bytes, user_id: str, attempt_token: str) -> int:
-    """Extract this book's figures onto `item.images`. Never raises.
-
-    Runs after text extraction and indexing have already succeeded, so the only
-    thing at risk is the pictures themselves. Everything is caught: Pillow
-    missing, a malformed PDF stream, S3 down, an EPUB with a broken OPF. All of
-    those end with a normal text-only book, which is the expected state for
-    most uploads anyway.
-
-    Existing library items are NOT reprocessed. A book uploaded before this
-    feature has `images = None` and keeps producing text-only sessions, which
-    is correct — re-reading every stored file to hunt for figures would be a
-    large, silent, retroactive S3 bill.
-
-    Task 2 closeout (Verified Blocker 3): `attempt_token` is threaded all
-    the way through — into the S3 key (see `image_extract.image_key`, so a
-    stale attempt's own uploaded objects can never collide with or be
-    deleted alongside a newer attempt's), checked BEFORE the (CPU- and
-    S3-bound) extraction pass even starts, and re-verified ATOMICALLY,
-    under a row lock, in the SAME transaction that persists `item.images`
-    — never a plain existence probe followed by a separate write. Runs
-    strictly inside the caller's worker-attempt lifetime: the caller
-    releases the attempt only in its own `finally` block, AFTER this
-    function returns."""
-    from app.services.image_extract import extract_and_store, pdf_page_texts
-
-    item_id = item.id
-
-    # Cheap pre-check, before any extraction/upload work: a stale or
-    # tombstoned attempt skips the whole pass rather than discovering the
-    # loss only after paying for it.
-    pre = db.query(LibraryItem).filter(LibraryItem.id == item_id).first()
-    if not pre or pre.deletion_state is not None or pre.last_processing_attempt_id != attempt_token:
-        logger.info("[images] %s: skipping extraction — attempt %s no longer owns this item",
-                     item_id, attempt_token)
-        return 0
-
-    try:
-        is_epub = (item.type or "").lower() == "epub"
-        page_texts = None
-        if not is_epub:
-            try:
-                page_texts = pdf_page_texts(file_bytes)
-            except Exception:
-                # Page text only sharpens relevance matching; without it the
-                # candidates are still usable, just less well described.
-                page_texts = None
-
-        images = extract_and_store(
-            file_bytes=file_bytes,
-            filename=("x.epub" if is_epub else "x.pdf"),
-            item_id=item_id,
-            user_id=user_id,
-            page_texts=page_texts,
-            attempt_token=attempt_token,
-        )
-        if not images:
-            return 0
-
-        # Ownership re-verified AND item.images persisted atomically, in
-        # ONE locked transaction (_atomic_ownership_write also refuses a
-        # tombstoned item — see its own docstring) — not a separate
-        # existence probe followed by a plain write, which left a real
-        # window open the same way every Blocker 2 write point did before
-        # this pass. A RAISED exception (e.g. the commit itself failing)
-        # is treated identically to an ordinary `False` return — both
-        # mean "not durably recorded", and both must run the SAME
-        # durable per-image cleanup below rather than let the raise
-        # escape to the generic catch-all further down, which has no
-        # per-image cleanup logic of its own.
-        try:
-            applied = _atomic_ownership_write(
-                db, item_id, user_id, attempt_token,
-                lambda locked: setattr(locked, "images", images),
-            )
-        except Exception as e:
-            logger.error("[images] could not persist rows for %s (%s)", item_id, e)
-            try:
-                db.rollback()
-            except Exception:
-                pass
-            applied = False
-        if not applied:
-            # The objects are already in S3, and this attempt has lost
-            # (or never had) the right to record them. Durable, per-image
-            # compensating cleanup — never an unconditional best-effort
-            # delete with no durable trace on failure — because the
-            # objects are invisible to book deletion/account erasure
-            # until either they're gone or a retryable record exists.
-            logger.error(
-                "[images] attempt %s lost ownership of %s before its images "
-                "could be persisted — cleaning up %d uploaded object(s)",
-                attempt_token, item_id, len(images),
-            )
-            for img in images:
-                key = (img or {}).get("key")
-                if not key:
-                    continue
-                _cleanup_one_image_after_ownership_loss(
-                    item_id, user_id, attempt_token, key,
-                    reason="ownership lost before images could be persisted",
-                )
-            return 0
-        return len(images)
-    except Exception as e:
-        logger.warning("[images] extraction skipped for %s: %s", item_id, e)
-        try:
-            db.rollback()
-        except Exception:
-            pass
-        return 0
 
 
 def _record_processing_error(item_id: str, message: str, attempt_token: str) -> bool:
@@ -2682,11 +2483,6 @@ def process_pdf_embeddings(item_id: str, pdf_bytes: bytes, user_id: str):
             lambda locked: setattr(locked, "content", text),
         )
 
-        # Figures, AFTER the text is safely indexed. Deliberately last and
-        # deliberately swallowed: a book's pictures are a garnish on a pipeline
-        # whose real job is text, and no failure here may cost the user their
-        # upload. `_extract_book_images` never raises.
-        _extract_book_images(db, item, pdf_bytes, user_id, attempt_token)
     except AttemptOwnershipLost as e:
         db.rollback()
         logger.warning("[process_pdf_embeddings] %s aborted — %s", item_id, e)
@@ -2929,10 +2725,6 @@ def process_epub_embeddings(item_id: str, epub_bytes: bytes, user_id: str):
             lambda locked: setattr(locked, "content", text),
         )
 
-        # Figures, after the text is safely indexed — see the PDF path. An
-        # EPUB's images come with captions and alt text, so they describe
-        # themselves far better than a PDF's do.
-        _extract_book_images(db, item, epub_bytes, user_id, attempt_token)
     except AttemptOwnershipLost as e:
         db.rollback()
         logger.warning("[process_epub_embeddings] %s aborted — %s", item_id, e)

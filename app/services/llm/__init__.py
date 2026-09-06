@@ -179,15 +179,8 @@ class LLMService:
         context_chunks: List[str],
         card_target: int,
         read_length: int,
-        image_options: Optional[str] = None,
     ) -> dict:
         """A personalized card deck built only from the user's own excerpts.
-
-        `image_options` is the rendered shortlist of book figures this session
-        may draw on (see services/image_select.py), or None when the book has
-        none. It only changes the prompt and the schema: the ids that come back
-        are suggestions, and session_service re-validates every one of them
-        against the stored rows before anything reaches a card.
 
         A personalization card, when today's session has one, is inserted by
         session_service AFTER this returns — this method neither knows nor
@@ -200,15 +193,12 @@ class LLMService:
         """
         quiz_target = quiz_target_for(read_length)
         interaction = interaction_kind_for(profile)
-        with_images = bool(image_options)
-        schema = wisdom_schema(card_target, quiz_target, with_images=with_images)
+        schema = wisdom_schema(card_target, quiz_target)
         user_message = build_wisdom_user_message(
             book_title=book_title, author=author, profile=profile,
             context_chunks=context_chunks, card_target=card_target,
             read_length=read_length,
         )
-        if with_images:
-            user_message += "\n\n" + image_options
         request = LLMRequest(
             operation=OP_WISDOM,
             system=SESSION_SYSTEM,
@@ -244,6 +234,7 @@ class LLMService:
         author: Optional[str],
         profile: dict,
         context_chunks: List[str],
+        question_history: Optional[list] = None,
     ) -> Optional[dict]:
         """A grounded preference question drawn from this book's own excerpts.
 
@@ -257,7 +248,7 @@ class LLMService:
         schema = personalization_schema()
         user_message = build_personalization_user_message(
             book_title=book_title, author=author, profile=profile,
-            context_chunks=context_chunks,
+            context_chunks=context_chunks, question_history=question_history,
         )
         request = LLMRequest(
             operation=OP_PERSONALIZATION_QUESTION,
@@ -363,7 +354,6 @@ class LLMService:
         author: Optional[str],
         card_bodies: List[str],
         part_number: int,
-        image_options: Optional[str] = None,
     ) -> dict:
         """Titling for a Story portion the app has already cut, verbatim.
 
@@ -375,17 +365,11 @@ class LLMService:
         catches it and serves plain headings.
         """
         card_count = len(card_bodies)
-        with_images = bool(image_options)
-        schema = story_schema(card_count, with_images=with_images)
+        schema = story_schema(card_count)
         user_message = build_story_user_message(
             book_title=book_title, author=author,
             card_bodies=card_bodies, part_number=part_number,
         )
-        if with_images:
-            # Only figures from the portion the reader has actually reached are
-            # in this list — the spoiler guard is applied when the shortlist is
-            # built, not left to the model's discretion.
-            user_message += "\n\n" + image_options
         request = LLMRequest(
             operation=OP_STORY,
             system=STORY_SYSTEM,

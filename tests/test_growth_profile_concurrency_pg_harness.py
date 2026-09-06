@@ -1374,6 +1374,58 @@ finally:
     stale.close()
     other.close()
 
+section("PG14 — concurrent books cannot persist the same personalization dimension")
+from app.models.bite import DailyBite
+from app.models.personalization import PersonalizationQuestion
+from app.services.personalization_history import persist_novel_question
+from unittest.mock import patch
+
+uid_pg14 = seed_user(premium=True)
+q14 = {"question": "Would you rather automate this routine or manage each step yourself?",
+       "options": [{"id": "a", "text": "Automate", "tag": "prefers_automation"},
+                   {"id": "b", "text": "Manage it", "tag": "prefers_manual_control"}]}
+with SessionLocal() as db14:
+    for bid14 in ("novel-first", "novel-second"):
+        db14.add(DailyBite(id=bid14, user_id=uid_pg14, library_item_id=bid14,
+                          title="T", insight="I", reflection="", action="",
+                          date=datetime.date.today(), cards=[{"kind": "personalize"}]))
+    db14.commit()
+holding14, release14, done14 = _threading.Event(), _threading.Event(), _threading.Event()
+results14 = {}
+original14 = profile_resolution.lock_user_scope
+def hold_first14(db, uid):
+    original14(db, uid)
+    if _threading.current_thread().name == "novel-first":
+        holding14.set()
+        if not release14.wait(10):
+            raise RuntimeError("novelty test release timed out")
+def persist14(bid):
+    try:
+        with SessionLocal() as db14:
+            results14[bid] = persist_novel_question(
+                db14, user_id=uid_pg14, profile_id="goal14", bite_id=bid,
+                item_id=bid, question=q14, chunk_ids=[0])
+    except Exception as exc:
+        results14[bid] = repr(exc)
+    finally:
+        if bid == "novel-second": done14.set()
+with patch.object(profile_resolution, "lock_user_scope", hold_first14):
+    first14 = _threading.Thread(target=persist14, args=("novel-first",), name="novel-first")
+    second14 = _threading.Thread(target=persist14, args=("novel-second",), name="novel-second")
+    first14.start()
+    check("first writer acquired the real transaction lock", holding14.wait(10))
+    second14.start()
+    check("second writer cannot finish while first owns the lock", not done14.wait(0.2))
+    release14.set()
+    first14.join(15); second14.join(15)
+check("both writers finished", not first14.is_alive() and not second14.is_alive())
+check("only first writer persisted a question", results14 == {"novel-first": True, "novel-second": False}, results14)
+with SessionLocal() as db14:
+    check("one question in the goal, across both books",
+          db14.query(PersonalizationQuestion).filter_by(user_id=uid_pg14).count() == 1)
+    check("losing deck is text-only without a duplicate question",
+          db14.query(DailyBite).filter_by(id="novel-second").one().cards == [])
+
 # ═════════════════════════════════════════════════════════════════════════
 print()
 if failures:

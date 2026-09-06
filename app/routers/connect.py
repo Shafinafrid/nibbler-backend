@@ -397,7 +397,7 @@ def _fail_chat_turn(db: Session, turn_id: str, user_id: str, worker_id: str, err
 
 
 def _require_premium(user: User):
-    """Connect is a Premium feature (PRD §5): free users see the paywall.
+    """Connect chat is a Premium feature; match/statistics are open to all.
     Structured detail so the app can route to the paywall by code."""
     if not user.effective_premium:
         raise HTTPException(
@@ -445,7 +445,7 @@ def _get_item(item_id: str, user: User, db: Session) -> LibraryItem:
             status_code=403,
             detail={
                 "code": "source_locked",
-                "message": "This source is Premium-only right now. Upgrade to chat with it again.",
+                "message": "This source is Premium-only right now. Upgrade to access it again.",
             },
         )
     return item
@@ -577,7 +577,6 @@ def get_insights(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    _require_premium(current_user)
     item = _get_item(data.library_item_id, current_user, db)
 
     # Resolved BEFORE any early return, so every response — including the
@@ -674,7 +673,6 @@ def get_book_stats(
       the moment the book finishes processing
     · goal_passage: from the most recent READ nibble, with its real date
     """
-    _require_premium(current_user)
     item = _get_item(library_item_id, current_user, db)
 
     bites = (
@@ -727,7 +725,7 @@ def get_book_stats(
     resolved_id = (resolved or {}).get("id")
 
     goal_passage = None
-    for b in read:  # newest first
+    for b in read if current_user.effective_premium else []:  # passage stays Pro-only
         if not b.goal_passage:
             continue
         if resolved_id and getattr(b, "growth_profile_id", None) == resolved_id:
