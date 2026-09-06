@@ -563,7 +563,12 @@ check("...and its original name is PRESERVED, not overwritten",
 # promoted without guessing.
 u2 = mkuser("ambig_user", premium=True)
 mkitem(u2, "ambig", gp_name="Money")
-push([prof("A", "Money"), prof("B", "Money", at=T1)], active="A", at=T1)
+# Legacy corrupt data is seeded directly: new pushes must not create duplicates.
+db.add(Profile(id="ambiguous-legacy-row", user_id=u2, name="P", growth_state={
+    "profiles": [prof("A", "Money"), prof("B", "Money", at=T1)], "activeProfileId": "A", "updatedAt": T1,
+}))
+db.commit()
+client.get("/library/")
 check("ambiguous legacy name is NOT promoted (never guesses)",
       item("ambig").growth_profile_id is None, str(item("ambig").growth_profile_id))
 check("ambiguous row keeps its name", item("ambig").growth_profile_name == "Money")
@@ -617,6 +622,69 @@ check("a uniquely-matchable legacy row is promoted by the READ itself",
 check("a story book is NOT attached by the read repair pass",
       item("read_boot_story").growth_profile_id is None)
 
+
+section("G. Codex regression checks: persisted bootstrap, old rows, and generic deletes")
+u = mkuser("lazy_get_user", premium=True)
+r = client.get("/profile/")
+check("first profile GET succeeds", r.status_code == 200)
+# Roll back anything the request left pending: a real GET must have committed.
+db.rollback()
+check("first profile GET persisted its new row", db.query(Profile).filter(Profile.user_id == u).first() is not None)
+
+u = mkuser("legacy_unflagged_user", premium=True)
+db.add(Profile(id="unflagged-row", user_id=u, name="U", growth_state={
+    "profiles": [prof("A", "Original", at=T1, ledger=["original"]), prof("B", "Other", at=T1)],
+    "activeProfileId": "A", "updatedAt": T1,
+}))
+db.commit()
+push([prof("A", " other ", at=T2, ledger=["new-answer"])], at=T2)
+check("pre-flag stored canonical name survives a newer blob, including collision attempts",
+      find_stored(u, "A")["profileName"] == "Original")
+check("protecting a legacy name still accepts its newer body",
+      find_stored(u, "A")["ledger"] == ["new-answer"])
+push([{"id": "A", "profileName": "Original", "name": "Original", "ledger": ["stale"]}], at=T3)
+check("one unstamped body cannot borrow a newer root clock",
+      find_stored(u, "A")["ledger"] == ["new-answer"])
+
+r = push([prof("C", " original ", at=T3)], at=T3)
+check("generic pushes cannot add a duplicate normalized name",
+      "C" in r.json().get("rejectedProfileIds", []) and find_stored(u, "C") is None)
+
+mkitem(u, "generic-delete-book", gp_id="A", gp_name="Original")
+r = client.put("/profile/growth", json={"growth_state": {
+    "profiles": [prof("B", "Other", at=T3)], "activeProfileId": "B", "updatedAt": T3
+}, "deletedProfileIds": ["A"]})
+check("old client's generic tombstone push succeeds", r.status_code == 200, r.text)
+check("generic deletion atomically reassigns stable id AND name",
+      item("generic-delete-book").growth_profile_id == "B"
+      and item("generic-delete-book").growth_profile_name == "Other")
+r = client.delete("/profile/profiles/A")
+check("repeated canonical delete is idempotent", r.status_code == 200, r.text)
+r = client.patch("/library/generic-delete-book", json={"mode": "story"})
+check("mode-only switch to story clears both assignment fields",
+      r.status_code == 200 and item("generic-delete-book").growth_profile_id is None
+      and item("generic-delete-book").growth_profile_name is None)
+r = client.patch("/library/generic-delete-book", json={"mode": "wisdom"})
+check("mode-only switch back to wisdom resolves the default",
+      r.status_code == 200 and item("generic-delete-book").growth_profile_id == "B")
+mkitem(u, "legacy-story", gp_name="Other", mode="story")
+client.get("/library/")
+check("legacy promotion never assigns a story-mode row", item("legacy-story").growth_profile_id is None)
+
+from app.services.profile_resolution import scoring_fingerprint, scoring_query
+fixture = {"id": "A", "name": "Money", "profileName": "Money", "lifeArea": "Finance",
+           "aspirationLabel": "Build wealth", "aspirationUnderstanding": None,
+           "interests": ["budgeting", "investing"], "contentMode": "practical", "goalOrientation": "growth"}
+check("shipped clients retain the exact v1 scoring contract",
+      scoring_fingerprint(fixture) == "607cf7dec5d8f19c8c28f458439af675")
+check("v2 matches the app's exact golden query digest",
+      scoring_fingerprint(fixture, 2) == "v2:a891bcaf1ba3101e5739d77009b62e20")
+check("v2 hashes the actual Connect query", scoring_query(fixture) == "Build wealth budgeting investing Finance")
+check("v2 includes interest order", scoring_fingerprint(dict(fixture, interests=["investing", "budgeting"]), 2)
+      != scoring_fingerprint(fixture, 2))
+check("v2 excludes display names and other non-query fields",
+      scoring_fingerprint(dict(fixture, name="Renamed", profileName="Renamed", contentMode="reflective"), 2)
+      == scoring_fingerprint(fixture, 2))
 
 # ══════════════════════════════════════════════════════════════════════════
 print("\n" + "=" * 70)

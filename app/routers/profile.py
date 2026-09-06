@@ -50,16 +50,13 @@ def _sync_assignments(db: Session, user_id: str, growth_state: dict, tombstones)
       3. re-derive the display-name snapshot on every assigned row, which is
          what makes rename automatically safe
 
-    Never raises into the request: a repair pass failing must not take down
-    an otherwise-valid growth push. The passes are idempotent, so whatever
-    fails here is simply retried on the next call.
+    Failure aborts the caller's transaction; assignment integrity is atomic.
     """
-    try:
-        attach_unassigned_wisdom_books(db, user_id, growth_state, tombstones)
-        promote_resolvable_legacy_rows(db, user_id, growth_state, tombstones)
-        redetermine_assignment_names(db, user_id, growth_state, tombstones)
-    except Exception:
-        logger.exception("assignment sync failed for %s (non-fatal)", user_id)
+    for deleted_id in sorted(tombstones or []):
+        reassign_books_from_deleted_profile(db, user_id, deleted_id, growth_state, tombstones)
+    attach_unassigned_wisdom_books(db, user_id, growth_state, tombstones)
+    promote_resolvable_legacy_rows(db, user_id, growth_state, tombstones)
+    redetermine_assignment_names(db, user_id, growth_state, tombstones)
 
 
 def _growth_push_result(profile: Profile, merged: dict, user: User) -> GrowthPushResult:
@@ -105,16 +102,12 @@ def _get_or_create_profile(user: User, db: Session, *, for_update: bool = False)
     in-place, same transaction) instead — the caller's own final
     `db.commit()` remains the only commit for the whole locked operation.
     """
-    if for_update and user.profile:
-        return (
-            db.query(Profile)
-            .filter(Profile.id == user.profile.id)
-            .populate_existing()
-            .with_for_update()
-            .first()
-        )
-    if user.profile:
-        return user.profile
+    query = db.query(Profile).filter(Profile.user_id == user.id).populate_existing()
+    if for_update:
+        query = query.with_for_update()
+    existing = query.first()
+    if existing:
+        return existing
     profile = Profile(
         id=str(uuid.uuid4()),
         user_id=user.id,
@@ -165,14 +158,15 @@ def get_profile(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    profile = _get_or_create_profile(current_user, db)
+    lock_user_scope(db, current_user.id)
+    profile = _get_or_create_profile(current_user, db, for_update=True)
     # Defense in depth: filter tombstoned profiles out of the READ response
     # too, in case anything ever wrote growth_state around the PUT path's
     # primary enforcement. Persist the cleanup so it doesn't need to be
     # recomputed on every future read.
-    if _filter_tombstoned_profiles(profile):
-        db.commit()
-        db.refresh(profile)
+    _filter_tombstoned_profiles(profile)
+    db.commit()
+    db.refresh(profile)
     return profile
 
 
@@ -602,6 +596,8 @@ def delete_growth_profile(
 
     target = find_profile_by_id(state, profile_id, tombstones)
     if not target:
+        if profile_id in tombstones:
+            return _growth_push_result(profile, {}, current_user)
         raise HTTPException(status_code=404, detail="Growth profile not found.")
     if len(live_profiles(state, tombstones)) <= 1:
         raise HTTPException(

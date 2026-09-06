@@ -259,67 +259,29 @@ def build_profile_payload(profile: Optional[dict]) -> dict:
     }
 
 
-def scoring_fingerprint(profile: Optional[dict]) -> Optional[str]:
-    """Stable digest of the profile inputs a score was actually computed from.
+def scoring_query(profile: Optional[dict]) -> str:
+    """The exact text embedded by Connect; interest order is significant."""
+    payload = build_profile_payload(profile)
+    bits = [
+        payload.get("aspirationUnderstanding") or payload.get("aspirationLabel") or "",
+        " ".join(payload.get("interests") or []),
+        payload.get("lifeArea") or "",
+    ]
+    return " ".join(b for b in bits if b).strip() or "personal growth and learning"
 
-    Returned to the client alongside `resolved_profile_id` so a cached score
-    can be proven to belong to the profile currently assigned — a book/day
-    cache key alone silently served the previous profile's percentage after a
-    switch on the same day.
 
-    Only the fields that genuinely feed retrieval/scoring are included, so an
-    unrelated edit (pacing, streak) doesn't needlessly invalidate a cache.
-    Sorted keys + separators make this byte-stable across processes.
-
-    Post-audit fix (Sep 2026): the ONLY consumer of this function is
-    connect.py's get_insights, whose retrieval query (built just above the
-    call site) is:
-        " ".join([aspirationUnderstanding or aspirationLabel, " ".join(interests), lifeArea])
-    — built from interests in STORED order, never sorted, and never
-    including `name` or `contentMode` at all. This function used to hash
-    `sorted(interests)` and include `name`/`contentMode` regardless — so
-    (a) reordering interests (a real, user-reachable edit) changed the
-    ACTUAL query text/embedding but left the fingerprint UNCHANGED, making
-    a stale cache look valid when it wasn't, and (b) `name`/`contentMode`
-    changing could invalidate a cache for a query that, byte for byte,
-    never actually changed. Fixed to mirror get_insights's own query
-    construction exactly: interests in stored order, and only the fields
-    that function's `query_bits` actually reads.
-    """
+def scoring_fingerprint(profile: Optional[dict], version: int = 1) -> Optional[str]:
+    """Version 2 hashes the actual retrieval query; v1 serves shipped clients."""
     if not profile:
         return None
     import hashlib
     import json
 
+    if version == 2:
+        blob = json.dumps({"query": scoring_query(profile)}, sort_keys=True, separators=(",", ":"))
+        return "v2:" + hashlib.sha256(blob.encode("utf-8")).hexdigest()[:32]
+
     payload = build_profile_payload(profile)
-    # KNOWN, NOT-YET-FIXED GAP (post-audit finding, Sep 2026 — documented
-    # here rather than half-fixed): this hashes sorted(interests) plus
-    # name/contentMode/goalOrientation, none of which match get_insights's
-    # (connect.py) ACTUAL retrieval query, which joins interests in STORED
-    # order and reads only aspirationUnderstanding/aspirationLabel/
-    # interests/lifeArea. Reordering interests changes the real query but
-    # leaves this fingerprint unchanged, and name/contentMode/
-    # goalOrientation changing can invalidate a cache for a query that
-    # never actually changed.
-    #
-    # NOT fixed in this pass: the app's mirror implementation
-    # (computeScoringFingerprint / scoringFingerprintMaterial in
-    # nibbler/src/data/profileSelectors.js) hashes the SAME wrong shape —
-    # sorted interests + id/name/contentMode/goalOrientation — and lives in
-    # a different repo this session could not edit (worktree-isolated to
-    # nibbler-backend). Changing ONLY this function's material would make
-    # every client/server fingerprint comparison mismatch permanently
-    # (client and server would compute different hashes for identical
-    # profiles), degrading the cache to "always refetch" — a real,
-    # immediate regression, strictly worse than the narrow reordering edge
-    # case this would fix. Fix BOTH sides in the same change: update this
-    # function's `material` dict to match get_insights's actual query_bits
-    # exactly (lifeArea, aspirationLabel, aspirationUnderstanding,
-    # interests in STORED order, drop id/name/contentMode/goalOrientation),
-    # AND update profileSelectors.js's scoringFingerprintMaterial to the
-    # identical shape in the same commit, verified against a fresh golden
-    # digest computed from this function directly (not reused from before
-    # this fix, since the byte format changes).
     material = {
         "id": payload.get("id"),
         "name": payload.get("name"),
@@ -361,6 +323,8 @@ def attach_unassigned_wisdom_books(db: Session, user_id: str, growth_state: dict
     if not target:
         return 0
 
+    # Sessions disable autoflush; do not refresh over an earlier repair's pending writes.
+    db.flush()
     rows = (
         db.query(LibraryItem)
         .filter(
@@ -369,6 +333,7 @@ def attach_unassigned_wisdom_books(db: Session, user_id: str, growth_state: dict
             LibraryItem.growth_profile_name.is_(None),
             LibraryItem.mode == "wisdom",
         )
+        .populate_existing().with_for_update()
         .all()
     )
     if not rows:
@@ -407,13 +372,17 @@ def promote_resolvable_legacy_rows(db: Session, user_id: str, growth_state: dict
     if not live_profiles(growth_state, tombstones):
         return 0
 
+    # Sessions disable autoflush; do not refresh over an earlier repair's pending writes.
+    db.flush()
     rows = (
         db.query(LibraryItem)
         .filter(
             LibraryItem.user_id == user_id,
             LibraryItem.growth_profile_id.is_(None),
             LibraryItem.growth_profile_name.isnot(None),
+            LibraryItem.mode == "wisdom",
         )
+        .populate_existing().with_for_update()
         .all()
     )
     promoted = 0
@@ -442,12 +411,15 @@ def redetermine_assignment_names(db: Session, user_id: str, growth_state: dict,
     """
     from app.models.library import LibraryItem
 
+    # Sessions disable autoflush; do not refresh over an earlier repair's pending writes.
+    db.flush()
     rows = (
         db.query(LibraryItem)
         .filter(
             LibraryItem.user_id == user_id,
             LibraryItem.growth_profile_id.isnot(None),
         )
+        .populate_existing().with_for_update()
         .all()
     )
     changed = 0
@@ -489,12 +461,15 @@ def reassign_books_from_deleted_profile(db: Session, user_id: str, deleted_profi
             target = next((p for p in survivors if p.get("id") == active_id), None)
         target = target or survivors[0]
 
+    # Sessions disable autoflush; do not refresh over an earlier repair's pending writes.
+    db.flush()
     rows = (
         db.query(LibraryItem)
         .filter(
             LibraryItem.user_id == user_id,
             LibraryItem.growth_profile_id == deleted_profile_id,
         )
+        .populate_existing().with_for_update()
         .all()
     )
     for row in rows:

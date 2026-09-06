@@ -494,9 +494,13 @@ def _prepare_user_nibbles(db_factory, user_id: str) -> None:
             attach_unassigned_wisdom_books, lock_user_scope,
             promote_resolvable_legacy_rows, redetermine_assignment_names,
         )
-        growth_state, tombstones = _load_growth_state_and_tombstones(db, user_id)
+        lock_user_scope(db, user_id)
+        from app.models.profile import Profile
+        locked_profile = (db.query(Profile).filter(Profile.user_id == user_id)
+                          .populate_existing().with_for_update().first())
+        growth_state = (locked_profile.growth_state or {}) if locked_profile else {}
+        tombstones = set(locked_profile.deleted_profile_ids or []) if locked_profile else set()
         if growth_state:
-            lock_user_scope(db, user_id)
             try:
                 attach_unassigned_wisdom_books(db, user_id, growth_state, tombstones)
                 promote_resolvable_legacy_rows(db, user_id, growth_state, tombstones)

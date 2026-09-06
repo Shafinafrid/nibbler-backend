@@ -50,7 +50,7 @@ def _should_start_active(db: Session, user_id: str) -> bool:
     return active_count < MAX_ACTIVE_SOURCES
 
 
-def _load_growth(db: Session, user_id: str):
+def _load_growth(db: Session, user_id: str, *, for_update=False):
     """(growth_state, tombstones) for this user — empty when no row exists yet.
 
     A missing row is normal, not an error: local-first onboarding never
@@ -58,7 +58,10 @@ def _load_growth(db: Session, user_id: str):
     """
     from app.models.profile import Profile
 
-    prof = db.query(Profile).filter(Profile.user_id == user_id).first()
+    query = db.query(Profile).filter(Profile.user_id == user_id).populate_existing()
+    if for_update:
+        query = query.with_for_update()
+    prof = query.first()
     if not prof:
         return {}, set()
     return (prof.growth_state or {}), set(prof.deleted_profile_ids or [])
@@ -109,10 +112,12 @@ def _assignment_for_new_item(db: Session, user: User, mode: str,
         return None, None
 
     lock_user_scope(db, user.id)
-    growth_state, tombstones = _load_growth(db, user.id)
+    growth_state, tombstones = _load_growth(db, user.id, for_update=True)
 
     target = None
-    if user.effective_premium:
+    # Auth may have loaded this user before waiting on the advisory lock.
+    fresh_user = db.query(User).filter(User.id == user.id).populate_existing().first()
+    if fresh_user and fresh_user.effective_premium:
         if requested_id:
             target = find_profile_by_id(growth_state, requested_id, tombstones)
         if target is None and requested_name:
@@ -173,9 +178,9 @@ def list_library(
         attach_unassigned_wisdom_books, lock_user_scope,
         promote_resolvable_legacy_rows, redetermine_assignment_names,
     )
-    growth_state, tombstones = _load_growth(db, current_user.id)
+    lock_user_scope(db, current_user.id)
+    growth_state, tombstones = _load_growth(db, current_user.id, for_update=True)
     if growth_state:
-        lock_user_scope(db, current_user.id)
         try:
             attach_unassigned_wisdom_books(db, current_user.id, growth_state, tombstones)
             promote_resolvable_legacy_rows(db, current_user.id, growth_state, tombstones)
@@ -538,17 +543,18 @@ def rename_library_item(
     # a separate, already-committed transaction — producing a dangling
     # assignment exactly like the app-side deleteProfile gap (§ P1-1), via
     # a completely different path. Only taken when the request actually
-    # touches assignment; a plain title/mode edit needs no serialization
+    # touches assignment; a plain title edit needs no serialization
     # against profile mutations.
-    if wants_assignment:
+    if wants_assignment or data.mode is not None:
         from app.services.profile_resolution import lock_user_scope
         lock_user_scope(db, current_user.id)
+        growth_state, tombstones = _load_growth(db, current_user.id, for_update=True)
 
     item = db.query(LibraryItem).filter(
         LibraryItem.id == item_id,
         LibraryItem.user_id == current_user.id,
         LibraryItem.deletion_state.is_(None),  # a tombstoned item is gone
-    ).first()
+    ).populate_existing().with_for_update().first()
     if not item:
         raise HTTPException(status_code=404, detail="Item not found.")
 
@@ -583,6 +589,14 @@ def rename_library_item(
         if data.mode == "story" and item.mode != "story":
             item.story_progress = 0
         item.mode = data.mode
+        if data.mode == "story":
+            item.growth_profile_id = None
+            item.growth_profile_name = None
+        elif not wants_assignment:
+            from app.services.profile_resolution import resolve_assigned_profile, profile_display_name
+            target = resolve_assigned_profile(growth_state, item, tombstones)
+            item.growth_profile_id = (target or {}).get("id")
+            item.growth_profile_name = profile_display_name(target) if target else None
 
     # ── Assignment: a PREMIUM choice, validated against real profiles ──────
     if wants_assignment:
@@ -620,7 +634,6 @@ def rename_library_item(
             item.growth_profile_id = None
             item.growth_profile_name = None
         else:
-            growth_state, tombstones = _load_growth(db, current_user.id)
             # Rollout tolerance: with strict enforcement OFF, a non-entitled
             # request already passed the 403 check above — so this is either
             # a genuinely entitled user, or an old client whose tap is being

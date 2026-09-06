@@ -34,7 +34,7 @@ from app.models.library import LibraryItem
 from app.models.bite import DailyBite
 from app.models.user_data import ChatTurn, ChatContextChunk
 from app.rate_limit import limiter
-from app.services.profile_resolution import resolve_assigned_profile, scoring_fingerprint
+from app.services.profile_resolution import resolve_assigned_profile, scoring_fingerprint, scoring_query
 from app.services.llm import LLMService, CONNECT_MAX_TOKENS, CONNECT_BROAD_MAX_TOKENS
 from app.services.embedding_service import EmbeddingService, EmbeddingError
 from app.services import mixpanel_service
@@ -106,6 +106,7 @@ class ConnectProfile(BaseModel):
 
 
 class InsightsRequest(BaseModel):
+    scoring_version: int = 1
     library_item_id: str
     growth_profile: Optional[ConnectProfile] = None
 
@@ -594,7 +595,7 @@ def get_insights(
             top_passages=[], chunk_count=item.chunk_count or 0,
             mode=item.mode or "wisdom",
             resolved_profile_id=(resolved or {}).get("id"),
-            scoring_fingerprint=scoring_fingerprint(resolved),
+            scoring_fingerprint=scoring_fingerprint(resolved, data.scoring_version),
         )
 
     # ── Server-authoritative profile resolution (Sep 2026) ───────────────
@@ -610,18 +611,7 @@ def get_insights(
     # percentage and the nibbles can never disagree about which goal a book
     # is being judged against. `data.growth_profile` is still ACCEPTED for
     # request compatibility with older builds, but deliberately ignored.
-    query_bits = []
-    if resolved:
-        interests = [
-            (i.get("tag") if isinstance(i, dict) else i)
-            for i in (resolved.get("interests") or [])
-        ]
-        query_bits = [
-            resolved.get("aspirationUnderstanding") or resolved.get("aspirationLabel") or "",
-            " ".join([i for i in interests if i]),
-            resolved.get("lifeArea") or "",
-        ]
-    query = " ".join(b for b in query_bits if b).strip() or "personal growth and learning"
+    query = scoring_query(resolved)
 
     embeddings = EmbeddingService()
     try:
@@ -664,7 +654,7 @@ def get_insights(
         chunk_count=item.chunk_count or 0,
         mode=item.mode or "wisdom",
         resolved_profile_id=(resolved or {}).get("id"),
-        scoring_fingerprint=scoring_fingerprint(resolved),
+        scoring_fingerprint=scoring_fingerprint(resolved, data.scoring_version),
     )
 
 

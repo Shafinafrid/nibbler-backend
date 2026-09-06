@@ -1311,6 +1311,69 @@ check("the book's stored assignment is NOT the tombstoned id — no dangling ass
       final_assignment_pg10[0] != "DOOMED", final_assignment_pg10)
 
 
+
+section("PG11 — auth-preloaded missing profile is rechecked after another session bootstraps")
+uid_pg11 = seed_user(premium=True)
+stale = SessionLocal()
+try:
+    stale_user = stale.query(User).filter(User.id == uid_pg11).first()
+    check("request A initially cached a missing relationship", stale_user.profile is None)
+    # Another real transaction creates the row while A still retains None.
+    seed_profile(uid_pg11, [{"id": "A", "name": "Existing"}], "A")
+    profile_resolution.lock_user_scope(stale, uid_pg11)
+    found = profile_router._get_or_create_profile(stale_user, stale, for_update=True)
+    stale.commit()
+    check("bootstrap helper discovers the existing row instead of inserting a duplicate",
+          found.growth_state["activeProfileId"] == "A")
+    check("exactly one profile row survives", stale.query(Profile).filter(Profile.user_id == uid_pg11).count() == 1)
+finally:
+    stale.close()
+
+section("PG12 — library repair refreshes growth after acquiring the advisory lock")
+uid_pg12 = seed_user(premium=True)
+seed_profile(uid_pg12, [{"id": "A", "name": "Old"}], "A")
+stale = SessionLocal()
+other = SessionLocal()
+try:
+    stale_user = stale.query(User).filter(User.id == uid_pg12).first()
+    cached_profile = stale.query(Profile).filter(Profile.user_id == uid_pg12).first()
+    check("read request has cached the old name", cached_profile.growth_state["profiles"][0]["name"] == "Old")
+    other_user = other.query(User).filter(User.id == uid_pg12).first()
+    profile_router.rename_growth_profile(profile_id="A", data=GrowthProfileRename(name="New"),
+                                         current_user=other_user, db=other)
+    # This row needs repair; using A's identity-map snapshot would attach the OLD name.
+    book_id = "repair-" + uuid.uuid4().hex[:8]
+    other.add(LibraryItem(id=book_id, user_id=uid_pg12, title="Repair",
+                          type="text", mode="wisdom", processed=True))
+    other.commit()
+    library_router.list_library(current_user=stale_user, db=stale)
+    other.expire_all()
+    repaired = other.query(LibraryItem).filter(LibraryItem.id == book_id).first()
+    check("repair used post-lock canonical growth, not the cached pre-lock body",
+          repaired.growth_profile_id == "A" and repaired.growth_profile_name == "New")
+finally:
+    stale.close()
+    other.close()
+
+
+section("PG13 — new-book assignment rechecks entitlement after waiting")
+uid_pg13 = seed_user(premium=True)
+seed_profile(uid_pg13, [{"id": "A", "name": "Default"}, {"id": "B", "name": "Other"}], "A")
+stale = SessionLocal()
+other = SessionLocal()
+try:
+    stale_user = stale.query(User).filter(User.id == uid_pg13).first()
+    check("request initially sees premium", stale_user.effective_premium)
+    other_user = other.query(User).filter(User.id == uid_pg13).first()
+    other_user.premium_until = datetime.datetime.utcnow() - datetime.timedelta(days=30)
+    other_user.is_premium = False
+    other.commit()
+    assigned_id, assigned_name = library_router._assignment_for_new_item(stale, stale_user, "wisdom", "B", "Other")
+    check("upload uses fresh entitlement and substitutes the default", assigned_id == "A", (assigned_id, assigned_name))
+finally:
+    stale.close()
+    other.close()
+
 # ═════════════════════════════════════════════════════════════════════════
 print()
 if failures:
