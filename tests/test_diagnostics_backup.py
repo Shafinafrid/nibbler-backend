@@ -2,7 +2,9 @@
 
 import os
 import tempfile
+import tomllib
 from datetime import datetime, timezone
+from pathlib import Path
 
 import hermetic  # noqa: F401
 from botocore.exceptions import ClientError
@@ -92,6 +94,13 @@ skipped = backups.create_daily_postgres_backup(
     s3=existing,
 )
 check("same-day retries are idempotent", skipped["status"] == "already_exists" and not existing.client.uploads)
+
+build_config = tomllib.loads((Path(__file__).parents[1] / "nixpacks.toml").read_text())
+setup = build_config["phases"]["setup"]
+check("Railway preserves the auto-selected Python runtime while adding PostgreSQL 18",
+      setup["nixPkgs"] == ["...", "postgresql_18"])
+check("Railway pins a reproducible Nixpkgs archive that contains PostgreSQL 18",
+      len(setup.get("nixpkgsArchive", "")) == 40)
 
 if failures:
     print(f"RESULT: {len(failures)} FAILURE(S): {failures}")
