@@ -7,3 +7,4 @@
 [phases.setup]
 aptPkgs = ["tesseract-ocr", "tesseract-ocr-eng"]
 nixPkgs = ["postgresql_18"]
+nixpkgsArchive = "c043004d1c6985732bcc1cbc5a9c9aecbbb4e0f0"
