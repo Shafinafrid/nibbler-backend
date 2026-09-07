@@ -557,6 +557,32 @@ def _run_migrations():
         "ALTER TABLE personalization_questions ADD COLUMN IF NOT EXISTS claimed_by VARCHAR",
         # Did the ORIGINAL file reach S3? `processed` never meant that.
         "ALTER TABLE library_items ADD COLUMN IF NOT EXISTS archive_status VARCHAR",
+        # Fail-closed original-file archival (Sep 2026). This single DO block
+        # takes an ACCESS EXCLUSIVE lock. Completed legacy rows are exempted,
+        # but every unfinished file is marked required so an old in-flight
+        # worker cannot finish fail-open after the migration. An old backend
+        # racing a new INSERT blocks and receives the TRUE default after
+        # commit. Re-running never exempts a post-cutover row.
+        "DO $$ BEGIN "
+        "IF NOT EXISTS (SELECT 1 FROM information_schema.columns "
+        "WHERE table_schema = 'public' AND table_name = 'library_items' "
+        "AND column_name = 'archive_required') THEN "
+        "LOCK TABLE library_items IN ACCESS EXCLUSIVE MODE; "
+        "ALTER TABLE library_items ADD COLUMN archive_required BOOLEAN NOT NULL DEFAULT TRUE; "
+        "UPDATE library_items SET archive_required = CASE "
+        "WHEN type IN ('pdf', 'epub') AND file_size IS NOT NULL "
+        "AND processed IS NOT TRUE THEN TRUE ELSE FALSE END; "
+        "END IF; END $$",
+        "DO $$ BEGIN "
+        "IF NOT EXISTS (SELECT 1 FROM pg_constraint "
+        "WHERE conname = 'ck_library_processed_file_is_archived' "
+        "AND conrelid = 'library_items'::regclass) THEN "
+        "ALTER TABLE library_items ADD CONSTRAINT ck_library_processed_file_is_archived "
+        "CHECK (NOT (archive_required AND type IN ('pdf', 'epub') "
+        "AND file_size IS NOT NULL AND processed = TRUE) OR "
+        "(archive_status IS NOT NULL AND archive_status = 'stored' "
+        "AND file_url IS NOT NULL)); "
+        "END IF; END $$",
         # daily_bites — per-book card-deck sessions (July 2026)
         "ALTER TABLE daily_bites ADD COLUMN IF NOT EXISTS library_item_id VARCHAR",
         "ALTER TABLE daily_bites ADD COLUMN IF NOT EXISTS cards JSON",
@@ -776,6 +802,7 @@ REQUIRED_COLUMNS = [
     ("deleted_library_items", "user_id"), ("deleted_library_items", "deleted_at"),
     ("library_items", "entitlement_status"), ("library_items", "reservation_lease_token"),
     ("library_items", "is_active"),
+    ("library_items", "archive_required"),
     ("users", "reserved_sources_count"), ("users", "entitlement_source"),
     ("daily_bites", "origin"), ("daily_bites", "read_at"),
     # Finding #5 (Aug 2026) — the generation claim/lease. Missing either
@@ -850,6 +877,12 @@ REQUIRED_PG_CONSTRAINTS = [
     ("delivery_cycles", "uq_delivery_cycle_user_date"),
     ("chat_context_chunks", "uq_chat_context_chunk"),
     ("personalization_questions", "uq_personalization_daily_bite"),
+]
+
+# CHECK constraints are verified separately from the uniqueness/index registry
+# because their enforcement shape is not an ordered list of index columns.
+REQUIRED_PG_CHECK_CONSTRAINTS = [
+    ("library_items", "ck_library_processed_file_is_archived"),
 ]
 
 # (table, constraint/index name, expected columns) — the subset of the above
@@ -970,6 +1003,22 @@ def verify_required_schema() -> "tuple[bool, list[str]]":
             for t, name in REQUIRED_PG_CONSTRAINTS:
                 if (t, name) not in existing_named:
                     missing.append(f"constraint:{t}.{name}")
+
+            for t, name in REQUIRED_PG_CHECK_CONSTRAINTS:
+                row = conn.execute(
+                    text(
+                        "SELECT c.convalidated FROM pg_constraint c "
+                        "JOIN pg_class rel ON rel.oid = c.conrelid "
+                        "JOIN pg_namespace n ON n.oid = rel.relnamespace "
+                        "WHERE n.nspname = 'public' AND rel.relname = :t "
+                        "AND c.conname = :name AND c.contype = 'c'"
+                    ),
+                    {"t": t, "name": name},
+                ).first()
+                if row is None:
+                    missing.append(f"constraint:{t}.{name}")
+                elif not row[0]:
+                    missing.append(f"constraint-not-validated:{t}.{name}")
 
             # Re-audit finding #10: existence-by-name is not the guarantee
             # these entries stand for. Every one of them is a UNIQUENESS

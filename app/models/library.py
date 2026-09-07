@@ -1,10 +1,22 @@
-from sqlalchemy import Column, String, ForeignKey, DateTime, Boolean, Integer, Text, JSON, func, UniqueConstraint
+from sqlalchemy import (
+    Column, String, ForeignKey, DateTime, Boolean, Integer, Text, JSON, func,
+    UniqueConstraint, CheckConstraint,
+)
 from sqlalchemy.orm import relationship
 from app.database import Base
 
 
 class LibraryItem(Base):
     __tablename__ = "library_items"
+    __table_args__ = (
+        CheckConstraint(
+            "NOT (archive_required AND type IN ('pdf', 'epub') "
+            "AND file_size IS NOT NULL AND processed = TRUE) OR "
+            "(archive_status IS NOT NULL AND archive_status = 'stored' "
+            "AND file_url IS NOT NULL)",
+            name="ck_library_processed_file_is_archived",
+        ),
+    )
 
     id = Column(String, primary_key=True)
     user_id = Column(String, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
@@ -33,6 +45,11 @@ class LibraryItem(Base):
     #   stored  → the original is in S3 at file_url
     #   failed  → archival failed; file_url is NULL and nothing retried
     archive_status = Column(String, nullable=True)
+    # False only for already-completed legacy rows that predate the fail-closed
+    # archive cutover. Existing unfinished files are opted in by the migration.
+    # The database default protects inserts made by an older backend during a
+    # rolling deployment; the upload route also sets this explicitly.
+    archive_required = Column(Boolean, nullable=False, default=True, server_default="true")
     # ── Nibble-session fields (July 2026) ──
     mode = Column(String, default="wisdom")            # wisdom | story
     kind = Column(String, default="book")              # book | article | paper

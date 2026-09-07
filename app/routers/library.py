@@ -325,6 +325,7 @@ def upload_pdf(
             type="epub" if is_epub else "pdf",
             file_url=None,
             file_size=len(file_content),
+            archive_required=True,
             mode=mode or "wisdom",
             kind=kind or "book",
             author=author,
@@ -1560,6 +1561,11 @@ EMBEDDING_DOWN_MESSAGE = (
     "unavailable. Delete it and upload again in a few minutes."
 )
 
+ARCHIVE_DOWN_MESSAGE = (
+    "Nibbler couldn't safely store the original file, so processing was "
+    "stopped before the book was added. Please upload it again in a few minutes."
+)
+
 
 def _archive_original_with_retry(file_content: bytes, key: str, content_type: str) -> str:
     """Archive an upload while its only recoverable byte copy is in memory.
@@ -1585,6 +1591,48 @@ def _archive_original_with_retry(file_content: bytes, key: str, content_type: st
             if attempt < 2:
                 time.sleep(1 << attempt)
     raise last_error
+
+
+def _stop_after_required_archive_failure(
+    db, item_id: str, user_id: str, attempt_token: str,
+    lease_token: str, s3_key: str,
+) -> None:
+    """Fail one file-ingestion attempt before extraction or indexing.
+
+    The exact attempt-scoped S3 key is durably scheduled for deletion even
+    when upload outcome was uncertain (for example PUT succeeded but the
+    verifying HEAD response was lost). The user-visible failure and the Free
+    capacity release are both attempt/lease scoped, so a stale worker cannot
+    damage a newer retry.
+    """
+    applied = _atomic_ownership_write(
+        db, item_id, user_id, attempt_token,
+        lambda locked: (
+            setattr(locked, "archive_status", "failed"),
+            setattr(locked, "file_url", None),
+            setattr(locked, "processed", False),
+            setattr(locked, "processing_error", ARCHIVE_DOWN_MESSAGE),
+        ),
+    )
+    if not applied:
+        raise AttemptOwnershipLost(item_id, attempt_token)
+
+    from app.database import SessionLocal as _ArchiveFailureSession
+    failure_db = _ArchiveFailureSession()
+    try:
+        failure_item = failure_db.query(LibraryItem).filter(LibraryItem.id == item_id).first()
+        if failure_item:
+            release_reservation(
+                failure_db, failure_item, user_id,
+                reason=ARCHIVE_DOWN_MESSAGE, lease_token=lease_token,
+            )
+    finally:
+        failure_db.close()
+
+    _cleanup_archive_after_abandoned_processing(
+        item_id, attempt_token, s3_key,
+        reason=ARCHIVE_DOWN_MESSAGE, user_id=user_id,
+    )
 
 
 
@@ -2394,8 +2442,8 @@ def process_pdf_embeddings(item_id: str, pdf_bytes: bytes, user_id: str):
         guard = _AttemptGuard(item_id, user_id, lease_token, attempt_token)
         guard.start()
 
-        # Best-effort archive of the original file (needs AWS keys on Railway;
-        # skipped silently when unavailable — nothing downstream depends on it)
+        # Archiving is a required first phase. Derived text and vectors must
+        # never become live without the original file needed to restore them.
         guard.check()
         try:
             uploaded_key = _archive_original_with_retry(
@@ -2431,13 +2479,11 @@ def process_pdf_embeddings(item_id: str, pdf_bytes: bytes, user_id: str):
         except AttemptOwnershipLost:
             raise
         except Exception as e:
-            # Recorded rather than only printed. `processed` alone conflates
-            # three independent things — archived, extracted, indexed — so a
-            # silent S3 failure left a row that looked completely fine while
-            # the user's original file did not exist anywhere.
-            item.archive_status = "failed"
-            db.commit()
             logger.error("[process_pdf_embeddings] S3 archive FAILED for %s: %s", item_id, e)
+            _stop_after_required_archive_failure(
+                db, item_id, user_id, attempt_token, lease_token, s3_key,
+            )
+            return
         guard.check()
 
         # Paragraph-preserving extraction: story mode serves this text to the
@@ -2681,7 +2727,7 @@ def process_epub_embeddings(item_id: str, epub_bytes: bytes, user_id: str):
         guard = _AttemptGuard(item_id, user_id, lease_token, attempt_token)
         guard.start()
 
-        # Best-effort archive of the original file (same as PDFs)
+        # Required archive phase — identical fail-closed contract to PDFs.
         guard.check()
         try:
             uploaded_key = _archive_original_with_retry(
@@ -2707,9 +2753,11 @@ def process_epub_embeddings(item_id: str, epub_bytes: bytes, user_id: str):
         except AttemptOwnershipLost:
             raise
         except Exception as e:
-            item.archive_status = "failed"
-            db.commit()
             logger.error("[process_epub_embeddings] S3 archive FAILED for %s: %s", item_id, e)
+            _stop_after_required_archive_failure(
+                db, item_id, user_id, attempt_token, lease_token, s3_key,
+            )
+            return
         guard.check()
 
         text = _extract_epub_text(epub_bytes)

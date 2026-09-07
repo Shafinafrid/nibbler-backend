@@ -1062,6 +1062,26 @@ def finalize_successful_processing(
             )
             return False
 
+    # A post-cutover PDF/EPUB is not successfully processed until its exact
+    # original has been archived. This is the clean application-level refusal;
+    # a matching PostgreSQL CHECK constraint is the final backstop for raw SQL,
+    # mixed-version workers, and future callers that bypass this helper.
+    if (
+        locked_item.archive_required
+        and locked_item.type in ("pdf", "epub")
+        and locked_item.file_size is not None
+        and (
+            locked_item.archive_status != "stored"
+            or not locked_item.file_url
+        )
+    ):
+        logger.error(
+            "finalize_successful_processing: refusing unarchived file item %s "
+            "(archive_status=%r, file_url_present=%s)",
+            item.id, locked_item.archive_status, bool(locked_item.file_url),
+        )
+        return False
+
     if locked_item.processed:
         return True  # idempotent retry by the SAME, still-current attempt
 

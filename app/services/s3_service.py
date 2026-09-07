@@ -1,4 +1,5 @@
 import boto3
+import hashlib
 from botocore.config import Config
 from botocore.exceptions import ClientError
 import logging
@@ -33,14 +34,22 @@ class S3Service:
         return ref.split(f"{self.bucket}.s3.{settings.aws_region}.amazonaws.com/")[-1]
 
     def upload_file(self, file_content: bytes, filename: str, content_type: str) -> str:
-        """Upload a file to S3 and return its object KEY — not a URL. The
-        bucket is private; use generate_presigned_url() for temporary access."""
+        """Upload and verify a file, returning its object key (not a URL)."""
+        digest = hashlib.sha256(file_content).hexdigest()
         self.client.put_object(
             Bucket=self.bucket,
             Key=filename,
             Body=file_content,
             ContentType=content_type,
+            Metadata={"sha256": digest},
         )
+        head = self.client.head_object(Bucket=self.bucket, Key=filename)
+        stored_size = head.get("ContentLength")
+        stored_digest = (head.get("Metadata") or {}).get("sha256")
+        if stored_size != len(file_content) or stored_digest != digest:
+            raise RuntimeError(
+                "S3 archive verification failed: stored object metadata does not match upload"
+            )
         return filename
 
     def download_file(self, ref: str) -> bytes:

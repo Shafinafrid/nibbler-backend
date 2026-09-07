@@ -219,8 +219,10 @@ lib_src = open(f"{BACKEND}/app/routers/library.py").read()
 # concurrent ownership change — same effect, different call shape.
 check("archival success is recorded",
       '"archive_status", "stored")' in lib_src)
-check("archival failure is recorded rather than only printed",
-      'archive_status = "failed"' in lib_src and "S3 archive FAILED" in lib_src)
+check("archival failure is recorded and processing stops fail-closed",
+      'setattr(locked, "archive_status", "failed")' in lib_src
+      and "_stop_after_required_archive_failure" in lib_src
+      and "S3 archive FAILED" in lib_src)
 
 db.close()
 print("\n" + "=" * 62)

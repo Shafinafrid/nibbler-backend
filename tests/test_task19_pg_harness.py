@@ -25,6 +25,9 @@ write arbitrary test data into; never point this at a real environment.
   PG1 — create_tables() on a fresh real Postgres database succeeds (the
         actual production code path, not a simulation) and
         verify_required_schema() independently confirms zero missing items.
+  PG1b — the archive-required migration preserves completed legacy rows,
+         opts unfinished file uploads into the strict rule, and the real
+         PostgreSQL CHECK rejects a fail-open completion write.
   PG2 — a genuinely broken required migration (the notes table dropped out
         from under `ALTER TABLE notes ADD COLUMN ...`) makes _run_migrations()
         RAISE on Postgres — proving the fail-hard behavior fires for a REAL
@@ -173,6 +176,7 @@ os.chdir(_cwd_tempdir)
 atexit.register(lambda: shutil.rmtree(_cwd_tempdir, ignore_errors=True))
 
 from sqlalchemy import text, create_engine
+from sqlalchemy.exc import IntegrityError
 
 import app.database as dbmod
 from app.database import (
@@ -193,6 +197,64 @@ try:
 
     ok, missing = verify_required_schema()
     check("verify_required_schema() independently confirms zero missing items", ok, str(missing))
+
+    # ═════════════════════════════════════════════════════════════════════
+    section("PG1b — fail-closed archive cutover and database constraint")
+    # ═════════════════════════════════════════════════════════════════════
+    from app.database import SessionLocal
+    from app.models.user import User
+    from app.models.library import LibraryItem
+
+    session = SessionLocal()
+    session.add(User(id="archive-cutover-user", email="archive-cutover@example.test"))
+    session.add_all([
+        LibraryItem(
+            id="archive-legacy-complete", user_id="archive-cutover-user",
+            title="Legacy", type="pdf", file_size=10, processed=True,
+            archive_status="failed", archive_required=False,
+        ),
+        LibraryItem(
+            id="archive-in-flight", user_id="archive-cutover-user",
+            title="In flight", type="pdf", file_size=10, processed=False,
+            archive_required=False, entitlement_status="premium",
+        ),
+    ])
+    session.commit()
+    session.close()
+
+    # Reconstruct the exact pre-cutover schema, then run the real migration.
+    with db_engine.connect() as conn:
+        conn.execute(text(
+            "ALTER TABLE library_items DROP CONSTRAINT ck_library_processed_file_is_archived"
+        ))
+        conn.execute(text("ALTER TABLE library_items DROP COLUMN archive_required"))
+        conn.commit()
+    dbmod._run_migrations()
+
+    with db_engine.connect() as conn:
+        states = dict(conn.execute(text(
+            "SELECT id, archive_required FROM library_items "
+            "WHERE id IN ('archive-legacy-complete', 'archive-in-flight')"
+        )).all())
+    check("completed legacy row is exempted without rewriting user data",
+          states.get("archive-legacy-complete") is False, str(states))
+    check("unfinished file present at cutover is opted into strict archival",
+          states.get("archive-in-flight") is True, str(states))
+
+    rejected = False
+    with db_engine.connect() as conn:
+        try:
+            conn.execute(text(
+                "UPDATE library_items SET processed = TRUE WHERE id = 'archive-in-flight'"
+            ))
+            conn.commit()
+        except IntegrityError:
+            rejected = True
+            conn.rollback()
+    check("PostgreSQL rejects a processed=true write without a stored archive", rejected)
+    ok_archive, missing_archive = verify_required_schema()
+    check("readiness verifies the restored archive column and CHECK constraint",
+          ok_archive, str(missing_archive))
 
     # ═════════════════════════════════════════════════════════════════════
     section("PG2 — a genuinely broken required migration makes _run_migrations() RAISE")
