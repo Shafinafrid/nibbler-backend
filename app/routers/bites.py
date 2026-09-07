@@ -6,7 +6,7 @@ from datetime import date, datetime, timedelta, timezone
 from typing import Optional, List
 from pydantic import BaseModel, Field
 from app.database import get_db, SessionLocal
-from app.middleware.auth import get_current_user
+from app.middleware.auth import get_current_user, get_current_verified_user
 from app.rate_limit import limiter
 from app.models.user import User
 from app.models.bite import DailyBite, SavedBite
@@ -277,7 +277,7 @@ def get_or_create_session(
     request: Request,
     data: SessionRequest,
     background_tasks: BackgroundTasks,
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(get_current_verified_user),
     db: Session = Depends(get_db),
 ):
     """Today's card-deck session for one library item. Cached per (user, item, day)."""
@@ -719,7 +719,7 @@ def submit_personalize_answer(
     request: Request,
     bite_id: str,
     data: PersonalizeAnswerRequest,
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(get_current_verified_user),
     db: Session = Depends(get_db),
 ):
     """Record the user's answer to a session's personalization card and

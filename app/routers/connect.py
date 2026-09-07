@@ -28,7 +28,7 @@ from typing import Optional, List
 from app.database import SessionLocal
 from pydantic import BaseModel, Field
 from app.database import get_db
-from app.middleware.auth import get_current_user
+from app.middleware.auth import get_current_user, get_current_verified_user
 from app.models.user import User
 from app.models.library import LibraryItem
 from app.models.bite import DailyBite
@@ -574,7 +574,7 @@ def get_insights(
     request: Request,
     data: InsightsRequest,
     background_tasks: BackgroundTasks,
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(get_current_verified_user),
     db: Session = Depends(get_db),
 ):
     item = _get_item(data.library_item_id, current_user, db)
@@ -748,7 +748,7 @@ def chat(
     request: Request,
     data: ChatRequest,
     background_tasks: BackgroundTasks,
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(get_current_verified_user),
     db: Session = Depends(get_db),
 ):
     _require_premium(current_user)

@@ -21,7 +21,7 @@ session right before use (never an ORM object carried across sessions) —
 an earlier commit is unsafe to read after that session closes.
 
   A — happy path: due -> generated (exactly one AI call) -> push_pending ->
-      sent (ticket 'ok') -> completed.
+      accepted ticket -> delivered receipt -> completed.
   B — restart recovery, generation phase: a cycle claimed by a "dead"
       worker (lease already expired) is safely reclaimed and finished by
       the next reconcile pass — with exactly one AI call, not two. A
@@ -34,7 +34,8 @@ an earlier commit is unsafe to read after that session closes.
       DailyBite — the claim lease, not luck, prevents the duplicate.
   E — unread-hold: an existing unread bite blocks generation (held_unread,
       zero AI calls); once read, the NEXT reconcile pass generates.
-  F — Expo outcome differentiation: ticket 'ok' -> completed; ticket
+  F — Expo outcome differentiation: ticket 'ok' -> receipt_pending and only
+      a delivered receipt -> completed; ticket
       DeviceNotRegistered -> terminal_failure (dead-letter, no retry);
       transport failure (no tickets) -> push_submitted_unknown, retried,
       NEVER regenerates; MAX_ATTEMPTS exhausted -> terminal_failure.
@@ -137,7 +138,8 @@ def _fake_generate_session_for_item(db, user, item, read_length, profile, today,
 session_service.generate_session_for_item = _fake_generate_session_for_item
 
 push_calls = []
-push_tickets_to_return = {"tickets": [{"status": "ok"}]}
+push_tickets_to_return = {"tickets": [{"status": "ok", "id": "ticket-default"}]}
+push_receipts_to_return = {"receipts": {"ticket-default": {"status": "ok"}}}
 
 
 async def _fake_send_push_messages(messages, expo_access_token=""):
@@ -146,6 +148,14 @@ async def _fake_send_push_messages(messages, expo_access_token=""):
 
 
 notif_service.send_push_messages = _fake_send_push_messages
+
+
+async def _fake_fetch_push_receipts(ticket_ids, expo_access_token=""):
+    return {ticket_id: push_receipts_to_return["receipts"][ticket_id]
+            for ticket_id in ticket_ids if ticket_id in push_receipts_to_return["receipts"]}
+
+
+notif_service.fetch_push_receipts = _fake_fetch_push_receipts
 
 
 def mkuser(uid, active_book=True, token=True):
@@ -202,6 +212,14 @@ def run_push(cycle_id, worker_id, now):
     return result
 
 
+def run_receipt(cycle_id, worker_id, now):
+    db = db_factory()
+    c = db.query(DeliveryCycle).filter(DeliveryCycle.id == cycle_id).first()
+    result = dl.process_receipt_phase(db, c, worker_id, now)
+    db.close()
+    return result
+
+
 def try_claim(cycle_id, worker_id, expected_states, now):
     db = db_factory()
     claimed = dl._try_claim(db, cycle_id, worker_id, expected_states, now)
@@ -227,7 +245,7 @@ def bite_count(uid, cdate=TODAY):
 
 
 # ═════════════════════════════════════════════════════════════════════════
-section("A — happy path: due -> generated (1 AI call) -> push sent -> completed")
+section("A — happy path: due -> generated -> accepted ticket -> delivered receipt -> completed")
 # ═════════════════════════════════════════════════════════════════════════
 gen_calls.clear(); push_calls.clear()
 mkuser("userA")
@@ -242,10 +260,13 @@ snap = get_cycle_state("userA")
 check("cycle now push_pending with a daily_bite_id set",
       snap["state"] == "push_pending" and snap["daily_bite_id"], snap)
 
-push_tickets_to_return["tickets"] = [{"status": "ok"}]
+push_tickets_to_return["tickets"] = [{"status": "ok", "id": "ticket-A"}]
+push_receipts_to_return["receipts"] = {"ticket-A": {"status": "ok"}}
 result2 = run_push(cid, "test-worker", NOW)
-check("push phase result is completed", result2 == "completed", result2)
+check("accepted Expo ticket waits for a delivery receipt", result2 == "receipt_pending", result2)
 check("exactly one push batch sent", len(push_calls) == 1, len(push_calls))
+result3 = run_receipt(cid, "receipt-worker", NOW)
+check("delivered receipt completes the cycle", result3 == "completed", result3)
 snap = get_cycle_state("userA")
 check("cycle terminal state is completed, claim released",
       snap["state"] == "completed" and snap["claimed_by"] is None, snap)
@@ -296,9 +317,11 @@ check("setup: exactly one AI call so far", len(gen_calls) == 1, len(gen_calls))
 set_cycle_fields(cid, claimed_by="dead-worker",
                   claimed_until=datetime.datetime.utcnow() - datetime.timedelta(minutes=1))
 
-push_tickets_to_return["tickets"] = [{"status": "ok"}]
+push_tickets_to_return["tickets"] = [{"status": "ok", "id": "ticket-C"}]
+push_receipts_to_return["receipts"] = {"ticket-C": {"status": "ok"}}
 result2 = run_push(cid, "worker-2", NOW)
-check("push resumed and completed after the restart", result2 == "completed", result2)
+check("push resumed and persisted its accepted ticket after restart", result2 == "receipt_pending", result2)
+check("receipt reconciliation completes the restarted cycle", run_receipt(cid, "worker-3", NOW) == "completed")
 check("STILL exactly one AI call total (push resume never regenerates)", len(gen_calls) == 1, len(gen_calls))
 check("exactly one push attempt made", len(push_calls) == 1, len(push_calls))
 
@@ -372,15 +395,17 @@ check("generation ran exactly once for the freed hold, in the same tick that fre
 
 
 # ═════════════════════════════════════════════════════════════════════════
-section("F — Expo outcome differentiation: ok / DeviceNotRegistered / transport-unknown / exhausted")
+section("F — Expo outcome differentiation: receipt / DeviceNotRegistered / transport-unknown / exhausted")
 # ═════════════════════════════════════════════════════════════════════════
-# F1: ticket 'ok' -> completed (already proven in section A, re-confirmed here explicitly)
+# F1: ticket 'ok' is only acceptance; a later delivered receipt completes it.
 mkuser("userF1")
 cid = create_cycle("userF1")
 run_generation(cid, "w", NOW)
-push_tickets_to_return["tickets"] = [{"status": "ok"}]
+push_tickets_to_return["tickets"] = [{"status": "ok", "id": "ticket-F1"}]
+push_receipts_to_return["receipts"] = {"ticket-F1": {"status": "ok"}}
 r = run_push(cid, "w", NOW)
-check("F1: ticket 'ok' -> completed", r == "completed", r)
+check("F1: ticket 'ok' -> receipt_pending, not a false delivery success", r == "receipt_pending", r)
+check("F1: delivered receipt -> completed", run_receipt(cid, "wr", NOW) == "completed")
 
 # F2: DeviceNotRegistered -> terminal_failure (dead-letter, no retry)
 push_calls.clear()
@@ -424,7 +449,8 @@ check("F3b: attempts is bounded at/near MAX_ATTEMPTS, not unbounded",
       snap_final["attempts"] <= dl.MAX_ATTEMPTS, snap_final["attempts"])
 check("F3b: STILL exactly one AI call across the entire retry sequence",
       len(gen_calls) == 1, len(gen_calls))
-push_tickets_to_return["tickets"] = [{"status": "ok"}]  # reset for later sections
+push_tickets_to_return["tickets"] = [{"status": "ok", "id": "ticket-default"}]  # reset for later sections
+push_receipts_to_return["receipts"] = {"ticket-default": {"status": "ok"}}
 
 
 # ═════════════════════════════════════════════════════════════════════════
@@ -488,7 +514,7 @@ db.commit()
 db.close()
 
 push_calls.clear()
-push_tickets_to_return["tickets"] = [{"status": "ok"}]
+push_tickets_to_return["tickets"] = [{"status": "ok", "id": "ticket-streak"}]
 exact_slot_now = datetime.datetime.combine(TODAY, datetime.time(9, 0))
 asyncio.run(notif_service._notify_streak_alert_slot(db_factory, exact_slot_now))
 check("K1: exact-slot match fires the streak alert", len(push_calls) == 1, len(push_calls))
@@ -664,7 +690,7 @@ check("reconcile_delivery_cycles does not raise TypeError on a real aware `now` 
 # above, not the file's local-date-based TODAY constant.
 snap = get_cycle_state("userO", cdate=aware_now.date())
 check("the cycle was actually processed (not silently skipped) under an aware `now`",
-      snap is not None and snap["state"] in ("push_pending", "completed"), snap)
+      snap is not None and snap["state"] in ("push_pending", "receipt_pending", "completed"), snap)
 
 # Also drive the actual production entry point (_run_delivery_cycle) once,
 # fully mocked, to prove the aware `now` it constructs internally survives

@@ -1093,7 +1093,8 @@ with mock.patch("app.routers.library.EmbeddingService") as MockEmbedDel, \
      mock.patch("app.routers.auth.S3Service") as MockS3Erase, \
      mock.patch("firebase_admin.auth.delete_user") as MockFirebaseDel, \
      mock.patch("app.routers.auth._delete_revenuecat_subscriber", return_value=True), \
-     mock.patch("app.routers.auth._delete_mixpanel_profile_sync", return_value=True):
+     mock.patch("app.routers.auth._delete_mixpanel_profile_sync", return_value=True), \
+     mock.patch("app.routers.auth._delete_mixpanel_events_sync", return_value=(True, "job-sched", "success")):
     MockEmbedDel.return_value.delete_item_vectors.return_value = True
     MockS3Del.return_value.delete_file.return_value = True
     MockEmbedErase.return_value.delete_user_namespace.return_value = True
@@ -1274,7 +1275,8 @@ with mock.patch("app.routers.auth.EmbeddingService") as MockEmbedH4b, \
      mock.patch("app.routers.auth.S3Service") as MockS3H4b, \
      mock.patch("firebase_admin.auth.delete_user") as MockFirebaseH4b, \
      mock.patch("app.routers.auth._delete_revenuecat_subscriber", return_value=True), \
-     mock.patch("app.routers.auth._delete_mixpanel_profile_sync", return_value=True):
+     mock.patch("app.routers.auth._delete_mixpanel_profile_sync", return_value=True), \
+     mock.patch("app.routers.auth._delete_mixpanel_events_sync", return_value=(True, "job-h4", "success")):
     MockEmbedH4b.return_value.delete_user_namespace.return_value = True
     MockS3H4b.return_value.delete_file.return_value = True
     MockFirebaseH4b.return_value = None

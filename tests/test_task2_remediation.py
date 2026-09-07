@@ -326,7 +326,7 @@ section("OCR route — locked source rejected, reservation before the paid OCR c
 # ─────────────────────────────────────────────────────────────────────────
 from fastapi.testclient import TestClient
 from app.database import get_db
-from app.middleware.auth import get_current_user
+from app.middleware.auth import get_current_user, get_current_verified_user
 import main
 
 CURRENT_UID = {"v": None}
@@ -334,6 +334,7 @@ def _db(): yield db
 def _current_user(): return db.query(User).filter(User.id == CURRENT_UID["v"]).first()
 main.app.dependency_overrides[get_db] = _db
 main.app.dependency_overrides[get_current_user] = _current_user
+main.app.dependency_overrides[get_current_verified_user] = _current_user
 c = TestClient(main.app)
 def as_user(uid): CURRENT_UID["v"] = uid
 

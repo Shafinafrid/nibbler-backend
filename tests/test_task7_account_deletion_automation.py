@@ -259,6 +259,7 @@ with mock.patch("app.routers.auth.EmbeddingService") as MockEmbed, \
      mock.patch("firebase_admin.auth.delete_user") as MockFirebase, \
      mock.patch("app.routers.auth._delete_revenuecat_subscriber", return_value=True), \
      mock.patch("app.routers.auth._delete_mixpanel_profile_sync", return_value=True), \
+     mock.patch("app.routers.auth._delete_mixpanel_events_sync", return_value=(True, "job-g", "success")), \
      mock.patch("app.routers.auth._send_email_sync", return_value=True):
     MockEmbed.return_value.delete_user_namespace.return_value = True
     MockS3.return_value.delete_file.return_value = True
@@ -346,6 +347,7 @@ with mock.patch("app.routers.auth.EmbeddingService") as MockEmbedH, \
      mock.patch("firebase_admin.auth.delete_user", side_effect=Exception("still down")), \
      mock.patch("app.routers.auth._delete_revenuecat_subscriber", return_value=True), \
      mock.patch("app.routers.auth._delete_mixpanel_profile_sync", return_value=True), \
+     mock.patch("app.routers.auth._delete_mixpanel_events_sync", return_value=(True, "job-h", "success")), \
      mock.patch("app.routers.auth._send_email_sync", side_effect=_fake_send_email):
     MockEmbedH.return_value.delete_user_namespace.return_value = True
     MockS3H.return_value.delete_file.return_value = True
@@ -367,6 +369,7 @@ with mock.patch("app.routers.auth.EmbeddingService") as MockEmbedH2, \
      mock.patch("firebase_admin.auth.delete_user", side_effect=Exception("still down")), \
      mock.patch("app.routers.auth._delete_revenuecat_subscriber", return_value=True), \
      mock.patch("app.routers.auth._delete_mixpanel_profile_sync", return_value=True), \
+     mock.patch("app.routers.auth._delete_mixpanel_events_sync", return_value=(True, "job-h", "success")), \
      mock.patch("app.routers.auth._send_email_sync", side_effect=_fake_send_email):
     MockEmbedH2.return_value.delete_user_namespace.return_value = True
     MockS3H2.return_value.delete_file.return_value = True
@@ -406,6 +409,7 @@ with mock.patch("app.routers.auth.EmbeddingService") as MockEmbedI1, \
      mock.patch("firebase_admin.auth.delete_user", side_effect=not_found), \
      mock.patch("app.routers.auth._delete_revenuecat_subscriber", return_value=True), \
      mock.patch("app.routers.auth._delete_mixpanel_profile_sync", return_value=True), \
+     mock.patch("app.routers.auth._delete_mixpanel_events_sync", return_value=(True, "job-i1", "success")), \
      mock.patch("app.routers.auth._send_email_sync", return_value=True):
     MockEmbedI1.return_value.delete_user_namespace.return_value = True
     MockS3I1.return_value.delete_file.return_value = True

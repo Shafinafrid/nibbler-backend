@@ -54,6 +54,12 @@ PERSONALIZATION_TAGS = [
     "prefers_analytical_depth", "prefers_simplicity",
     "increase_confidence", "decrease_confidence",
     "shift_practical", "shift_reflective", "shift_analytical",
+    "prefers_small_steps", "prefers_bold_experiments",
+    "prefers_solo_progress", "prefers_accountability",
+    "prefers_routine", "prefers_flexibility",
+    "prefers_examples", "prefers_principles",
+    "prefers_fast_feedback", "prefers_long_horizon",
+    "prefers_visual_learning", "prefers_verbal_learning",
 ]
 
 

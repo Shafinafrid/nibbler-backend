@@ -102,6 +102,9 @@ class Settings(BaseSettings):
 
     # Analytics
     mixpanel_token: str = ""    # Same project token as frontend
+    # OAuth/service-account bearer used only by Mixpanel's async GDPR API.
+    # The ingestion project token cannot authorize historical-event erasure.
+    mixpanel_gdpr_bearer_token: str = ""
 
     # Support (bug reports + email)
     resend_api_key: str = ""    # Same Resend account the website contact form uses
@@ -144,6 +147,14 @@ class Settings(BaseSettings):
     # MAX_UPLOAD_MB in nibbler/src/screens/UploadScreen.js; keep them in sync.
     max_pdf_upload_mb: int = 50
     max_extracted_text_chars: int = 2_000_000
+
+    # Railway volume backups are not available to this project through the
+    # current account role. Production therefore creates its own encrypted,
+    # restorable PostgreSQL logical backup in the versioned S3 bucket once a
+    # day. The scheduler only runs this job when APP_ENV is production and the
+    # database URL is PostgreSQL, so local SQLite development remains inert.
+    database_backup_enabled: bool = True
+    database_backup_retention_days: int = 35
 
     # Dynamic growth-profile personalization (Aug 2026): chance any single
     # eligible wisdom session also carries a book-grounded "personalize" card.

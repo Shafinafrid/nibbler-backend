@@ -10,6 +10,7 @@ from app.config import get_settings
 from app.services.entitlement_service import reconcile_free_lock_state
 import logging
 import uuid
+import threading
 
 logger = logging.getLogger(__name__)
 
@@ -18,10 +19,20 @@ security = HTTPBearer()
 
 # Initialise Firebase Admin SDK once
 _firebase_initialized = False
+_firebase_init_lock = threading.Lock()
 
 def init_firebase():
     global _firebase_initialized
-    if not _firebase_initialized and not firebase_admin._apps:
+    if _firebase_initialized or firebase_admin._apps:
+        _firebase_initialized = True
+        return
+    with _firebase_init_lock:
+        # A second request may have completed initialization while this one
+        # waited for the lock. The inner check is the one that closes the
+        # cold-start race.
+        if _firebase_initialized or firebase_admin._apps:
+            _firebase_initialized = True
+            return
         cred_dict = {
             "type": "service_account",
             "project_id": settings.firebase_project_id,
@@ -139,6 +150,7 @@ def get_current_user(
 ) -> User:
     token = credentials.credentials
     decoded = verify_firebase_token(token)
+    request.state.firebase_claims = decoded
     user = get_or_create_user(decoded, db)
     _erasure_gate(db, user.id)
     # Rate limits key on the uid so one user can't dodge them by rotating IPs
@@ -150,6 +162,30 @@ def get_current_user(
     # Hooked here rather than per-route so no future endpoint can forget it.
     reconcile_free_lock_state(db, user)
     return user
+
+
+def get_current_verified_user(
+    request: Request,
+    current_user: User = Depends(get_current_user),
+) -> User:
+    """Require a verified identity before work that incurs provider cost.
+
+    Password users must prove control of their inbox. Apple and Google are
+    trusted federated providers; Firebase normally marks them verified, and
+    the provider check also handles older tokens where that Boolean is absent.
+    """
+    claims = getattr(request.state, "firebase_claims", {}) or {}
+    provider = (claims.get("firebase") or {}).get("sign_in_provider")
+    verified = claims.get("email_verified") is True or provider in {"google.com", "apple.com"}
+    if not verified:
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "code": "email_verification_required",
+                "message": "Verify your email before uploading or generating new content.",
+            },
+        )
+    return current_user
 
 
 def get_current_user_allow_pending_erasure(
@@ -165,6 +201,7 @@ def get_current_user_allow_pending_erasure(
     other route: everywhere else, a pending erasure must refuse access."""
     token = credentials.credentials
     decoded = verify_firebase_token(token)
+    request.state.firebase_claims = decoded
     user = get_or_create_user(decoded, db)
     request.state.user_id = user.id
     return user

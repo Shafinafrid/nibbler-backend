@@ -95,6 +95,7 @@ logger = logging.getLogger(__name__)
 # day for the user, worse than just missing it and starting fresh tomorrow).
 GENERATION_CATCHUP_WINDOW = timedelta(hours=6)
 PUSH_CATCHUP_WINDOW = timedelta(hours=6)
+RECEIPT_CATCHUP_WINDOW = timedelta(hours=24)
 # Streak alerts are inherently time-sensitive ("ends in 1 hour") — a much
 # tighter bound applies so a stale alert is never sent (requirement #4,
 # "never send a misleading 'streak ends in one hour' alert after its
@@ -117,7 +118,8 @@ RECONCILE_BATCH_SIZE = 25
 
 # States that mean "this cycle is still open — something may need doing."
 OPEN_STATES = (
-    "due", "held_unread", "push_pending", "push_submitted_unknown", "retryable_failure",
+    "due", "held_unread", "push_pending", "push_submitted_unknown",
+    "receipt_pending", "retryable_failure",
 )
 # States that mean "this cycle is finished — nothing will ever act on it again."
 TERMINAL_STATES = ("completed", "terminal_failure", "window_expired", "superseded")
@@ -247,7 +249,8 @@ def process_generation_phase(db, cycle: DeliveryCycle, worker_id: str, now) -> s
     from app.models.library import LibraryItem
     from app.services.entitlement_service import reconcile_free_lock_state
     from app.services.notification_service import (
-        _live_unread_query, _select_sources_for_today, _load_growth_state, _read_length_for, _build_profile_dict,
+        _live_unread_query, _select_sources_for_today, _load_growth_state,
+        _read_length_for, _build_profile_dict, _feature_bite,
     )
     from app.services.session_service import generate_session_for_item, SessionGenerationError
     from app.config import get_settings
@@ -277,6 +280,19 @@ def process_generation_phase(db, cycle: DeliveryCycle, worker_id: str, now) -> s
     reconcile_free_lock_state(db, user)
     unread_list = _live_unread_query(db, user)
     if unread_list:
+        # The fast pre-generation path may already have made TODAY's nibble
+        # immediately before this ledger pass. Adopt it into the cycle rather
+        # than treating it as an older hold; this is what lets the ledger own
+        # the on-time push without generating a duplicate.
+        todays = [b for b in unread_list if b.date >= cycle.cycle_date]
+        if todays:
+            bite, _title, item_id = _feature_bite(db, user, todays, cycle.cycle_date)
+            if bite:
+                _finish(
+                    db, cycle.id, worker_id, state="push_pending",
+                    daily_bite_id=bite.id, library_item_id=item_id,
+                )
+                return "push_pending"
         _finish(db, cycle.id, worker_id, state="held_unread")
         return "held_unread"
 
@@ -380,12 +396,12 @@ def process_push_phase(db, cycle: DeliveryCycle, worker_id: str, now) -> str:
         _finish(db, cycle.id, worker_id, state="completed")
         return "completed"
 
-    live_tokens = [
-        t.token for t in db.query(PushToken)
+    live_token_rows = [
+        t for t in db.query(PushToken)
         .filter(PushToken.user_id == user.id, PushToken.notifications_enabled.is_(True))
         .all()
     ]
-    if not live_tokens:
+    if not live_token_rows:
         # Nothing owed: notifications disabled or every token replaced/
         # signed out since generation — the nibble is already generated
         # and available in-app; that is a completed cycle, not a failure.
@@ -396,17 +412,21 @@ def process_push_phase(db, cycle: DeliveryCycle, worker_id: str, now) -> str:
     kind = "fresh" if bite.date >= cycle.cycle_date else "forgotten"
     title, body = build_notification_copy(kind, item_title, bite, cycle.cycle_date)
     data = _notification_data(item_id, bite)
-    messages = [{"to": tok, "title": title, "body": body, "sound": "default", "data": data} for tok in live_tokens]
+    messages = [
+        {"to": row.token, "title": title, "body": body, "sound": "default", "data": data}
+        for row in live_token_rows
+    ]
 
     settings = get_settings()
+    # Production invokes this synchronous phase in asyncio.to_thread(), so
+    # there is deliberately no running event loop here. Catching RuntimeError
+    # and re-running the coroutine used to duplicate a provider call when the
+    # RuntimeError came from *inside* the HTTP client rather than asyncio.
     try:
         tickets = asyncio.run(send_push_messages(messages, getattr(settings, "expo_access_token", "")))
-    except RuntimeError:
-        # Already inside an event loop (e.g. called from async scheduler
-        # context) — run on the loop directly instead of asyncio.run(),
-        # which refuses to nest.
-        loop = asyncio.get_event_loop()
-        tickets = loop.run_until_complete(send_push_messages(messages, getattr(settings, "expo_access_token", "")))
+    except Exception as exc:
+        logger.error("Expo push submission raised before tickets were recorded: %s", type(exc).__name__)
+        tickets = []
 
     attempts = cycle.attempts + 1
     if not tickets:
@@ -421,18 +441,25 @@ def process_push_phase(db, cycle: DeliveryCycle, worker_id: str, now) -> str:
                 last_error="push_transport_failed")
         return "push_submitted_unknown"
 
-    statuses = {t.get("status") for t in tickets}
-    if "ok" in statuses:
-        _finish(db, cycle.id, worker_id, state="completed", attempts=attempts)
-        return "completed"
+    accepted = []
+    terminal_ticket_errors = 0
+    for row, ticket in zip(live_token_rows, tickets):
+        if ticket.get("status") == "ok" and ticket.get("id"):
+            accepted.append({"ticket_id": ticket["id"], "push_token_id": row.id})
+        elif ticket.get("status") == "error" and ticket.get("details", {}).get("error") in _EXPO_TERMINAL_ERRORS:
+            db.delete(row)
+            terminal_ticket_errors += 1
+    db.commit()
+    if accepted:
+        _finish(
+            db, cycle.id, worker_id, state="receipt_pending", attempts=attempts,
+            expo_tickets=accepted, receipt_state="pending", last_error=None,
+        )
+        return "receipt_pending"
 
-    terminal = any(
-        t.get("status") == "error" and t.get("details", {}).get("error") in _EXPO_TERMINAL_ERRORS
-        for t in tickets
-    )
-    if terminal:
+    if terminal_ticket_errors == len(live_token_rows):
         _finish(db, cycle.id, worker_id, state="terminal_failure", attempts=attempts,
-                last_error="expo_device_not_registered")
+                receipt_state="failed", last_error="all_push_tokens_invalid")
         return "terminal_failure"
 
     if attempts >= MAX_ATTEMPTS:
@@ -442,6 +469,72 @@ def process_push_phase(db, cycle: DeliveryCycle, worker_id: str, now) -> str:
     _finish(db, cycle.id, worker_id, state="push_submitted_unknown", attempts=attempts,
             last_error="push_error_retryable")
     return "push_submitted_unknown"
+
+
+def process_receipt_phase(db, cycle: DeliveryCycle, worker_id: str, now) -> str:
+    """Resolve accepted Expo tickets into actual APNs/FCM delivery outcomes."""
+    from app.models.push_token import PushToken
+    from app.services.notification_service import fetch_push_receipts
+    from app.config import get_settings
+    import asyncio
+
+    claimed = _try_claim(db, cycle.id, worker_id, ("receipt_pending",), now)
+    if claimed is None:
+        return "skipped_not_claimable"
+    cycle = claimed
+    if _window_expired(cycle, now, RECEIPT_CATCHUP_WINDOW):
+        _finish(
+            db, cycle.id, worker_id, state="terminal_failure",
+            receipt_state="failed", receipt_checked_at=datetime.utcnow(),
+            last_error="expo_receipt_missing_after_24h",
+        )
+        return "terminal_failure"
+
+    ticket_rows = cycle.expo_tickets or []
+    ids = [r.get("ticket_id") for r in ticket_rows if r.get("ticket_id")]
+    if not ids:
+        _finish(db, cycle.id, worker_id, state="terminal_failure", receipt_state="failed",
+                last_error="expo_ticket_identity_missing")
+        return "terminal_failure"
+    try:
+        receipts = asyncio.run(fetch_push_receipts(ids, getattr(get_settings(), "expo_access_token", "")))
+    except Exception as exc:
+        _finish(
+            db, cycle.id, worker_id, state="receipt_pending",
+            receipt_checked_at=datetime.utcnow(), last_error=f"receipt_transport:{type(exc).__name__}",
+        )
+        return "receipt_pending"
+
+    delivered = False
+    definitive = 0
+    errors = []
+    for ticket_row in ticket_rows:
+        receipt = receipts.get(ticket_row.get("ticket_id"))
+        if not receipt:
+            continue
+        definitive += 1
+        if receipt.get("status") == "ok":
+            delivered = True
+            continue
+        code = (receipt.get("details") or {}).get("error")
+        errors.append(code or "unknown")
+        if code in _EXPO_TERMINAL_ERRORS and ticket_row.get("push_token_id"):
+            token = db.query(PushToken).filter(PushToken.id == ticket_row["push_token_id"]).first()
+            if token:
+                db.delete(token)
+    db.commit()
+
+    if delivered:
+        _finish(db, cycle.id, worker_id, state="completed", receipt_state="delivered",
+                receipt_checked_at=datetime.utcnow(), last_error=None)
+        return "completed"
+    if definitive == len(ids):
+        _finish(db, cycle.id, worker_id, state="terminal_failure", receipt_state="failed",
+                receipt_checked_at=datetime.utcnow(), last_error=("expo_receipt:" + ",".join(errors))[:250])
+        return "terminal_failure"
+    _finish(db, cycle.id, worker_id, state="receipt_pending", receipt_state="pending",
+            receipt_checked_at=datetime.utcnow(), last_error="expo_receipts_not_ready")
+    return "receipt_pending"
 
 
 def discover_and_create_due_cycles(db, now, worker_id: str) -> int:
@@ -515,7 +608,7 @@ def reconcile_delivery_cycles(db_factory, now, worker_id: str = "reconciler") ->
     """
     counts = {
         "created": 0, "generation_processed": 0, "push_processed": 0,
-        "held_rechecked": 0, "by_result": {},
+        "held_rechecked": 0, "receipt_processed": 0, "by_result": {},
     }
 
     def _bump(result: str):
@@ -588,9 +681,22 @@ def reconcile_delivery_cycles(db_factory, now, worker_id: str = "reconciler") ->
             counts["push_processed"] += 1
             _bump(result)
 
+        receipt_rows = (
+            db.query(DeliveryCycle)
+            .filter(DeliveryCycle.cycle_date >= now_naive.date() - timedelta(days=1),
+                    DeliveryCycle.state == "receipt_pending")
+            .filter((DeliveryCycle.claimed_until.is_(None)) | (DeliveryCycle.claimed_until < now_naive))
+            .limit(RECONCILE_BATCH_SIZE)
+            .all()
+        )
+        for cycle in receipt_rows:
+            result = process_receipt_phase(db, cycle, worker_id, now_naive)
+            counts["receipt_processed"] += 1
+            _bump(result)
+
     logger.info(
-        "delivery_cycle reconcile: created=%d generation=%d push=%d held_rechecked=%d results=%s",
+        "delivery_cycle reconcile: created=%d generation=%d push=%d receipts=%d held_rechecked=%d results=%s",
         counts["created"], counts["generation_processed"], counts["push_processed"],
-        counts["held_rechecked"], counts["by_result"],
+        counts["receipt_processed"], counts["held_rechecked"], counts["by_result"],
     )
     return counts

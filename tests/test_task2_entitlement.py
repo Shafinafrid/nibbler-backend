@@ -26,7 +26,7 @@ def section(t): print(f"\n=== {t} ===")
 
 from fastapi.testclient import TestClient
 from app.database import create_tables, SessionLocal, get_db
-from app.middleware.auth import get_current_user
+from app.middleware.auth import get_current_user, get_current_verified_user
 from app.models.user import User
 from app.models.library import LibraryItem
 from app.models.bite import DailyBite
@@ -73,6 +73,7 @@ def _current_user():
 
 main.app.dependency_overrides[get_db] = _db
 main.app.dependency_overrides[get_current_user] = _current_user
+main.app.dependency_overrides[get_current_verified_user] = _current_user
 c = TestClient(main.app)
 
 

@@ -38,11 +38,16 @@ _voyage_client = None
 
 def _get_voyage_client():
     """One client for the process — it was being re-created per chunk.
-    max_retries handles transient rate limits / 5xx with backoff."""
+    The SDK itself has a short transport timeout and no hidden retries; the
+    explicit outer loop below owns the complete retry policy and budget."""
     global _voyage_client
     if _voyage_client is None and settings.voyage_api_key:
         import voyageai
-        _voyage_client = voyageai.Client(api_key=settings.voyage_api_key, max_retries=5)
+        _voyage_client = voyageai.Client(
+            api_key=settings.voyage_api_key,
+            max_retries=0,
+            timeout=6.0,
+        )
     return _voyage_client
 
 
@@ -64,7 +69,7 @@ def embedding_provider() -> str:
 
 def _embed_batch_with_backoff(client, batch: List[str], input_type: str, max_attempts: int = 6, base_delay: int = 5):
     """
-    Manual retry on top of the client's own max_retries: without a payment
+    Explicit retry with a bounded six-second transport attempt: without a payment
     method on the Voyage account, the limit is 3 RPM / 10K TPM (documented,
     LAUNCH_CHECKLIST §3b) — a book with several batches back-to-back WILL hit
     that ceiling. Background ingestion has no request timeout, so the default
@@ -121,7 +126,7 @@ def _get_query_embedding(text: str) -> List[float]:
     if client is None:
         return _mock_embedding(text)
     try:
-        result = _embed_batch_with_backoff(client, [text], "query", max_attempts=3, base_delay=2)
+        result = _embed_batch_with_backoff(client, [text], "query", max_attempts=2, base_delay=1)
         return result.embeddings[0]
     except Exception as e:
         raise EmbeddingError(f"Voyage AI query embedding failed: {e}") from e

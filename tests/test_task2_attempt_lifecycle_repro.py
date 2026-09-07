@@ -4749,12 +4749,15 @@ def run_all():
                 # generic `Exception` and never re-raises), so any exception
                 # reaching here is by construction NOT that second accepted
                 # outcome under today's code.
-                if worker_exc_s:
+                if worker_exc_s and not isinstance(worker_exc_s[0], library_router.GuardShutdownFailed):
                     raise RuntimeError(f"section S worker raised {worker_exc_s[0]!r}")
                 if t_s.is_alive():
                     raise RuntimeError("section S worker thread did not finish within its join timeout")
 
-                worker_surfaced_lifecycle_failure_s = len(worker_exc_s) > 0  # always False today — see above
+                worker_surfaced_lifecycle_failure_s = bool(
+                    worker_exc_s
+                    and isinstance(worker_exc_s[0], library_router.GuardShutdownFailed)
+                )
                 check(
                     "EITHER (a) Section S's own exact guard thread is stopped and joined before "
                     "the worker reports completion, OR (b) the worker surfaces a specific "

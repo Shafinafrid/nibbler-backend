@@ -1,10 +1,11 @@
 """Server-owned question memory, shared across every book serving one goal.
 
-Do not ask the same preference with different wording. The current tag vocabulary
-measures four dimensions; once a dimension was offered, choose another or omit
-the optional card. No new inference is better than repeatedly confirming one.
+Do not ask the same preference with different wording. Answered dimensions stay
+retired; unanswered cards reserve a dimension only temporarily, so skipping a
+question does not permanently stop the profile from learning.
 """
 from difflib import SequenceMatcher
+from datetime import datetime, timedelta
 import re
 
 DIMENSIONS = (
@@ -12,7 +13,15 @@ DIMENSIONS = (
     ("prefers_analytical_depth", "prefers_simplicity"),
     ("increase_confidence", "decrease_confidence"),
     ("shift_practical", "shift_reflective", "shift_analytical"),
+    ("prefers_small_steps", "prefers_bold_experiments"),
+    ("prefers_solo_progress", "prefers_accountability"),
+    ("prefers_routine", "prefers_flexibility"),
+    ("prefers_examples", "prefers_principles"),
+    ("prefers_fast_feedback", "prefers_long_horizon"),
+    ("prefers_visual_learning", "prefers_verbal_learning"),
 )
+
+PENDING_DIMENSION_TTL = timedelta(days=7)
 
 
 def question_memory(db, user_id, profile_id):
@@ -34,6 +43,7 @@ def question_memory(db, user_id, profile_id):
         ), ""),
         "tags": row.applied_tags or [],
         "status": row.status,
+        "created_at": row.created_at,
     } for row in rows]
 
 
@@ -66,6 +76,15 @@ def persist_novel_question(db, *, user_id, profile_id, bite_id, item_id, questio
 def available_tags(history):
     seen = set()
     for row in history:
+        created = row.get("created_at")
+        if (
+            row.get("status") in {"pending", "processing"}
+            and isinstance(created, datetime)
+            and created < datetime.utcnow() - PENDING_DIMENSION_TTL
+        ):
+            # Still keep the old wording in history for similarity rejection,
+            # but release its dimension: the user never answered it.
+            continue
         seen.update(row.get("tags") or [])
         seen.update(o.get("tag") for o in row.get("options", []) if isinstance(o, dict))
     return [tag for dimension in DIMENSIONS if not seen.intersection(dimension)

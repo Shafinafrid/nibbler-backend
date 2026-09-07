@@ -230,6 +230,7 @@ try:
     db.add(it)
     db.commit()
     ent.reserve_free_capacity(db, it, "pg_same")
+    attempt_same = ent.admit_worker_attempt(db, "pg_same_item", "pg_same")
     tok_same = db.query(LibraryItem).filter(LibraryItem.id == "pg_same_item").first().reservation_lease_token
     db.close()
 
@@ -238,7 +239,10 @@ try:
         s = SessionLocal()
         try:
             item = s.query(LibraryItem).filter(LibraryItem.id == "pg_same_item").first()
-            ok = ent.finalize_successful_processing(s, item, "pg_same", chunk_count=5, lease_token=tok_same)
+            ok = ent.finalize_successful_processing(
+                s, item, "pg_same", chunk_count=5,
+                lease_token=tok_same, attempt_token=attempt_same,
+            )
             results.append(ok)
         except Exception as e:
             errors.append(str(e))

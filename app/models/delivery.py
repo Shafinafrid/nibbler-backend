@@ -22,7 +22,7 @@ protects "two ticks/workers both think this user is due right now" from
 ever producing two cycles for the same day.
 """
 from sqlalchemy import (
-    Column, String, Integer, Date, DateTime, ForeignKey, UniqueConstraint, Index, func,
+    Column, String, Integer, Date, DateTime, ForeignKey, UniqueConstraint, Index, JSON, func,
 )
 from app.database import Base
 from app.models.user_data import _uuid
@@ -105,6 +105,11 @@ class DeliveryCycle(Base):
     claimed_until = Column(DateTime, nullable=True)
     attempts = Column(Integer, nullable=False, default=0)
     last_error = Column(String, nullable=True)  # safe, short, operator-facing only — never source text/hooks
+    # [{"ticket_id": Expo ticket id, "push_token_id": our row id}]. The
+    # credential-bearing token itself is never duplicated here.
+    expo_tickets = Column(JSON, nullable=True)
+    receipt_state = Column(String, nullable=True)  # pending | delivered | failed
+    receipt_checked_at = Column(DateTime, nullable=True)
     due_at = Column(DateTime, nullable=False)   # the ORIGINAL computed due time (UTC) — the catch-up window's fixed anchor, never rewritten
     created_at = Column(DateTime, server_default=func.now())
     updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now())

@@ -6,7 +6,7 @@ from unittest.mock import patch
 from fastapi.testclient import TestClient
 
 from app.database import create_tables, SessionLocal, get_db
-from app.middleware.auth import get_current_user
+from app.middleware.auth import get_current_user, get_current_verified_user
 from app.models.user import User
 from app.models.library import LibraryItem
 from app.models.profile import Profile
@@ -85,6 +85,7 @@ assert "increase_confidence" not in available_tags(question_memory(db, "free", "
 
 main.app.dependency_overrides[get_db] = lambda: db
 main.app.dependency_overrides[get_current_user] = lambda: user
+main.app.dependency_overrides[get_current_verified_user] = lambda: user
 client = TestClient(main.app)
 with patch("app.routers.connect.EmbeddingService") as embeddings:
     embeddings.return_value.search_item_scored.return_value = [

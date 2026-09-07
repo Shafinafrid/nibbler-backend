@@ -6,3 +6,4 @@
 # Railway's existing build path alone.
 [phases.setup]
 aptPkgs = ["tesseract-ocr", "tesseract-ocr-eng"]
+nixPkgs = ["postgresql_18"]

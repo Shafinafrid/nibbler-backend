@@ -1,7 +1,7 @@
 from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Form, BackgroundTasks, Request
 from sqlalchemy.orm import Session
 from app.database import get_db
-from app.middleware.auth import get_current_user
+from app.middleware.auth import get_current_user, get_current_verified_user
 from app.models.user import User
 from app.models.library import LibraryItem, DeletedLibraryItem
 from app.models.bite import DailyBite, SavedBite
@@ -221,7 +221,7 @@ def add_library_item(
     request: Request,
     data: LibraryItemCreate,
     background_tasks: BackgroundTasks,
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(get_current_verified_user),
     db: Session = Depends(get_db),
 ):
     check_upload_limit(current_user, db)
@@ -266,7 +266,7 @@ def upload_pdf(
     author: str = Form(None),
     growth_profile_id: str = Form(None),
     growth_profile_name: str = Form(None),
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(get_current_verified_user),
     db: Session = Depends(get_db),
 ):
     check_upload_limit(current_user, db)
@@ -356,7 +356,7 @@ def add_url(
     request: Request,
     data: LibraryItemUrlCreate,
     background_tasks: BackgroundTasks,
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(get_current_verified_user),
     db: Session = Depends(get_db),
 ):
     """Scrape an article/blog URL and add its content to the library."""
@@ -1183,6 +1183,7 @@ def _run_ocr(item_id: str, user_id: str, attempt_token: str = None):
         logger.error("[ocr] FAILED for %s: %s", item_id, e)
         _compensate_failed_attempt(item_id, user_id, attempt_token=attempt_token, reason=message)
     finally:
+        shutdown_error = None
         if guard is not None:
             try:
                 guard.stop()
@@ -1194,6 +1195,7 @@ def _run_ocr(item_id: str, user_id: str, attempt_token: str = None):
                 # _record_guard_shutdown_failure) — but must not skip this
                 # function's own db.close() below.
                 _record_guard_shutdown_failure(item_id, user_id, e)
+                shutdown_error = e
         # Release the worker-attempt claim on EVERY terminal outcome
         # (success or failure) — idempotent (a no-op if this attempt is no
         # longer the current owner) — so a legitimate future retry (the
@@ -1210,6 +1212,8 @@ def _run_ocr(item_id: str, user_id: str, attempt_token: str = None):
         except Exception:
             logger.exception("[ocr] failed to release worker attempt for %s", item_id)
         db.close()
+        if shutdown_error is not None:
+            raise shutdown_error
 
 
 # ── POST /library/{item_id}/ocr ───────────────────────────────────────────────
@@ -1217,7 +1221,7 @@ def _run_ocr(item_id: str, user_id: str, attempt_token: str = None):
 def start_ocr(
     item_id: str,
     background_tasks: BackgroundTasks,
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(get_current_verified_user),
     db: Session = Depends(get_db),
 ):
     """Opt in to reading a scanned PDF with OCR. Free to the user, and slow —
@@ -1555,6 +1559,32 @@ EMBEDDING_DOWN_MESSAGE = (
     "Nibbler couldn't finish reading this one — the reading service is briefly "
     "unavailable. Delete it and upload again in a few minutes."
 )
+
+
+def _archive_original_with_retry(file_content: bytes, key: str, content_type: str) -> str:
+    """Archive an upload while its only recoverable byte copy is in memory.
+
+    The key is attempt-scoped, so retrying an uncertain PUT is idempotent. A
+    short bounded retry here is materially different from a later scheduler:
+    after this worker exits there may be no original left to retry from.
+    """
+    import time
+    last_error = None
+    for attempt in range(3):
+        try:
+            uploaded = S3Service().upload_file(
+                file_content=file_content,
+                filename=key,
+                content_type=content_type,
+            )
+            if not uploaded:
+                raise RuntimeError("S3 upload returned no object key")
+            return uploaded
+        except Exception as exc:
+            last_error = exc
+            if attempt < 2:
+                time.sleep(1 << attempt)
+    raise last_error
 
 
 
@@ -2267,6 +2297,7 @@ def process_item_embeddings(item_id: str, user_id: str):
             item_id, user_id, message, lease_token=lease_token, attempt_token=attempt_token,
         )
     finally:
+        shutdown_error = None
         if guard is not None:
             try:
                 guard.stop()
@@ -2278,6 +2309,7 @@ def process_item_embeddings(item_id: str, user_id: str):
                 # _record_guard_shutdown_failure) — but must not skip this
                 # function's own db.close() below.
                 _record_guard_shutdown_failure(item_id, user_id, e)
+                shutdown_error = e
         if attempt_token is not None:
             # Release the worker-attempt claim on EVERY terminal outcome —
             # idempotent (a no-op if this attempt is no longer the current
@@ -2293,6 +2325,8 @@ def process_item_embeddings(item_id: str, user_id: str):
             except Exception:
                 logger.exception("failed to release worker attempt for %s", item_id)
         db.close()
+        if shutdown_error is not None:
+            raise shutdown_error
 
 
 def process_pdf_embeddings(item_id: str, pdf_bytes: bytes, user_id: str):
@@ -2364,11 +2398,8 @@ def process_pdf_embeddings(item_id: str, pdf_bytes: bytes, user_id: str):
         # skipped silently when unavailable — nothing downstream depends on it)
         guard.check()
         try:
-            s3 = S3Service()
-            uploaded_key = s3.upload_file(
-                file_content=pdf_bytes,
-                filename=s3_key,
-                content_type="application/pdf",
+            uploaded_key = _archive_original_with_retry(
+                pdf_bytes, s3_key, "application/pdf",
             )
             # `archived` (used below to decide whether compensating cleanup
             # gets `s3_key`) must track whether the S3 OBJECT itself was
@@ -2512,6 +2543,7 @@ def process_pdf_embeddings(item_id: str, pdf_bytes: bytes, user_id: str):
             s3_key=s3_key if archived else None,
         )
     finally:
+        shutdown_error = None
         if guard is not None:
             try:
                 guard.stop()
@@ -2523,6 +2555,7 @@ def process_pdf_embeddings(item_id: str, pdf_bytes: bytes, user_id: str):
                 # _record_guard_shutdown_failure) — but must not skip this
                 # function's own db.close() below.
                 _record_guard_shutdown_failure(item_id, user_id, e)
+                shutdown_error = e
         if attempt_token is not None:
             # Release the worker-attempt claim on EVERY terminal outcome —
             # idempotent (a no-op if this attempt is no longer the current
@@ -2538,6 +2571,8 @@ def process_pdf_embeddings(item_id: str, pdf_bytes: bytes, user_id: str):
             except Exception:
                 logger.exception("failed to release worker attempt for %s", item_id)
         db.close()
+        if shutdown_error is not None:
+            raise shutdown_error
 
 
 def _extract_epub_text(epub_bytes: bytes) -> str:
@@ -2649,11 +2684,8 @@ def process_epub_embeddings(item_id: str, epub_bytes: bytes, user_id: str):
         # Best-effort archive of the original file (same as PDFs)
         guard.check()
         try:
-            s3 = S3Service()
-            uploaded_key = s3.upload_file(
-                file_content=epub_bytes,
-                filename=s3_key,
-                content_type="application/epub+zip",
+            uploaded_key = _archive_original_with_retry(
+                epub_bytes, s3_key, "application/epub+zip",
             )
             # `archived` must track whether the S3 OBJECT itself was
             # actually written, not whether the row write that follows
@@ -2752,6 +2784,7 @@ def process_epub_embeddings(item_id: str, epub_bytes: bytes, user_id: str):
             s3_key=s3_key if archived else None,
         )
     finally:
+        shutdown_error = None
         if guard is not None:
             try:
                 guard.stop()
@@ -2763,6 +2796,7 @@ def process_epub_embeddings(item_id: str, epub_bytes: bytes, user_id: str):
                 # _record_guard_shutdown_failure) — but must not skip this
                 # function's own db.close() below.
                 _record_guard_shutdown_failure(item_id, user_id, e)
+                shutdown_error = e
         if attempt_token is not None:
             # Release the worker-attempt claim on EVERY terminal outcome —
             # idempotent (a no-op if this attempt is no longer the current
@@ -2778,6 +2812,8 @@ def process_epub_embeddings(item_id: str, epub_bytes: bytes, user_id: str):
             except Exception:
                 logger.exception("failed to release worker attempt for %s", item_id)
         db.close()
+        if shutdown_error is not None:
+            raise shutdown_error
 
 
 def process_url_embeddings(item_id: str, url: str, user_id: str):
@@ -2935,6 +2971,7 @@ def process_url_embeddings(item_id: str, url: str, user_id: str):
             lease_token=lease_token, attempt_token=attempt_token,
         )
     finally:
+        shutdown_error = None
         if guard is not None:
             try:
                 guard.stop()
@@ -2946,6 +2983,7 @@ def process_url_embeddings(item_id: str, url: str, user_id: str):
                 # _record_guard_shutdown_failure) — but must not skip this
                 # function's own db.close() below.
                 _record_guard_shutdown_failure(item_id, user_id, e)
+                shutdown_error = e
         if attempt_token is not None:
             # Release the worker-attempt claim on EVERY terminal outcome —
             # idempotent (a no-op if this attempt is no longer the current
@@ -2961,3 +2999,5 @@ def process_url_embeddings(item_id: str, url: str, user_id: str):
             except Exception:
                 logger.exception("failed to release worker attempt for %s", item_id)
         db.close()
+        if shutdown_error is not None:
+            raise shutdown_error

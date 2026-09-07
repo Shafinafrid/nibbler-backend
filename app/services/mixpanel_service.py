@@ -17,6 +17,7 @@ logger = logging.getLogger(__name__)
 
 MIXPANEL_TRACK_URL = "https://api.mixpanel.com/track"
 MIXPANEL_ENGAGE_URL = "https://api.mixpanel.com/engage"
+MIXPANEL_DELETION_URL = "https://mixpanel.com/api/app/data-deletions/v3.0/"
 
 
 def _encode(payload: list) -> str:
@@ -68,11 +69,9 @@ async def delete_profile(distinct_id: str) -> bool:
     raises) on any failure or missing token — caller treats that as
     'needs retry', same as every other erasure artifact class.
 
-    Scope note: this deletes the profile's stored PROPERTIES, not historical
-    EVENTS already ingested (book_chat_message, session_generated, etc.) —
-    full event-level erasure needs Mixpanel's separate, async GDPR Deletions
-    API (a service-account-authenticated job, not the project-token ingestion
-    API used here). Flagged as a known follow-up, not silently claimed done.
+    Scope note: this deletes only profile properties. The account-erasure
+    state machine separately calls ``delete_historical_events`` below and
+    retains its durable row until Mixpanel's async GDPR job reports success.
     """
     settings = get_settings()
     token = settings.mixpanel_token
@@ -97,10 +96,63 @@ async def delete_profile(distinct_id: str) -> bool:
             logger.warning("Mixpanel profile delete HTTP %s for %s", resp.status_code, distinct_id)
             return False
         body = resp.json()
-        # verbose=1 replies {"status": 1, ...} on success even for a
-        # distinct_id with no existing profile — deleting nothing is still
-        # a successful "this profile does not carry your data" outcome.
         return bool(body.get("status") == 1)
     except Exception as exc:
         logger.warning("Mixpanel profile delete failed for %s: %s", distinct_id, exc)
         return False
+
+
+async def delete_historical_events(distinct_id: str, tracking_id: str = None) -> tuple[bool, str, str]:
+    """Submit or poll Mixpanel's asynchronous end-user data deletion.
+
+    Returns (complete, tracking_id, status). A successfully accepted but
+    unfinished job is deliberately not complete; the durable account-erasure
+    scheduler calls this again until Mixpanel confirms completion.
+    """
+    settings = get_settings()
+    bearer = settings.mixpanel_gdpr_bearer_token
+    token = settings.mixpanel_token
+    if not bearer or not token:
+        return False, tracking_id, "credentials_missing"
+    headers = {"Authorization": f"Bearer {bearer}", "Accept": "application/json"}
+    params = {"token": token}
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            if tracking_id:
+                resp = await client.get(
+                    f"{MIXPANEL_DELETION_URL}{tracking_id}", headers=headers, params=params,
+                )
+            else:
+                resp = await client.post(
+                    MIXPANEL_DELETION_URL,
+                    headers={**headers, "Content-Type": "application/json"},
+                    params=params,
+                    json={"compliance_type": "GDPR", "distinct_ids": [distinct_id]},
+                )
+            resp.raise_for_status()
+            body = resp.json()
+
+        # v3 wraps POST results in a one-element list and GET results in an
+        # object. The top-level status is merely "ok"; lifecycle state lives
+        # inside results (PENDING/STAGING/STARTED/SUCCESS/etc.).
+        results = body.get("results") if isinstance(body, dict) else None
+        if isinstance(results, list):
+            result = results[0] if results else {}
+        elif isinstance(results, dict):
+            result = results
+        else:
+            result = {}
+        job_id = str(result.get("tracking_id") or result.get("task_id") or tracking_id or "")
+        status = str(result.get("status") or "pending").lower()
+        complete = status == "success"
+        if status in {"failure", "revoked", "not_found", "unknown"}:
+            # This provider task cannot make further progress. Clear its id so
+            # the next durable erasure retry submits a fresh deletion job.
+            return False, "", status
+        if not job_id and not complete:
+            logger.warning("Mixpanel deletion response had no tracking id for %s", distinct_id)
+            return False, "", "malformed_response"
+        return complete, job_id, status
+    except Exception as exc:
+        logger.warning("Mixpanel historical deletion failed for %s: %s", distinct_id, exc)
+        return False, tracking_id, "request_failed"

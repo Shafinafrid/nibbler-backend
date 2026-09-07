@@ -36,6 +36,7 @@ logger = logging.getLogger(__name__)
 _WORKER_ID = f"scheduler-{socket.gethostname()}-{os.getpid()}-{uuid.uuid4().hex[:8]}"
 
 EXPO_PUSH_URL = "https://exp.host/--/api/v2/push/send"
+EXPO_RECEIPTS_URL = "https://exp.host/--/api/v2/push/getReceipts"
 
 # Minimum hours between one user's scheduled nibble sets. A hard ~24h cooldown
 # stops users farming extra nibbles by nudging their delivery time forward the
@@ -187,11 +188,48 @@ async def send_push_messages(messages: list[dict], expo_access_token: str = "") 
                 resp = await client.post(EXPO_PUSH_URL, json=chunk, headers=headers)
                 resp.raise_for_status()
                 result = resp.json()
-                tickets.extend(result.get("data", []))
+                batch = result.get("data", [])
+                if not isinstance(batch, list):
+                    batch = []
+                tickets.extend(batch[:len(chunk)])
+                # A malformed/partial provider response is an unknown outcome
+                # for each omitted message, not permission to shift the next
+                # ticket onto the wrong push token.
+                if len(batch) < len(chunk):
+                    tickets.extend([
+                        {"status": "unknown", "message": "push ticket missing"}
+                        for _ in range(len(chunk) - len(batch))
+                    ])
             except Exception as exc:
                 logger.error("Expo push batch failed: %s", exc)
+                # Preserve positional correspondence with the input messages.
+                # The lifecycle ledger needs to know which token each outcome
+                # belongs to, including an unknown transport result.
+                tickets.extend([
+                    {"status": "unknown", "message": "push transport failed"}
+                    for _ in chunk
+                ])
 
     return tickets
+
+
+async def fetch_push_receipts(ticket_ids: list[str], expo_access_token: str = "") -> dict:
+    """Fetch Expo's delivery receipts for previously accepted ticket ids."""
+    if not ticket_ids:
+        return {}
+    headers = {"Content-Type": "application/json", "Accept": "application/json"}
+    if expo_access_token:
+        headers["Authorization"] = f"Bearer {expo_access_token}"
+    receipts = {}
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        for i in range(0, len(ticket_ids), 1000):
+            chunk = ticket_ids[i:i + 1000]
+            resp = await client.post(EXPO_RECEIPTS_URL, json={"ids": chunk}, headers=headers)
+            resp.raise_for_status()
+            data = resp.json().get("data", {})
+            if isinstance(data, dict):
+                receipts.update(data)
+    return receipts
 
 
 async def send_push_notifications(
@@ -806,14 +844,11 @@ async def _run_delivery_cycle(db_factory) -> None:
         except Exception as e:
             logger.error("Pre-generation failed for user %s: %s", uid, e)
 
-    await _notify_delivery_slot(db_factory, now)
-
-    # Task 20: durable reconciliation, additive to everything above — never
-    # replaces the on-time passes, only resumes/finishes whatever a
-    # restart, crash or long stall left incomplete (or fully missed). See
-    # app/services/delivery_lifecycle.py's module docstring for the full
-    # design. Runs every tick, same cadence as the rest of this function;
-    # failure here must not take down the rest of the scheduler's tick.
+    # The durable lifecycle owns notification submission for both on-time
+    # and catch-up work. It adopts anything the fast pre-generation pass just
+    # created, records Expo ticket ids, and later resolves delivery receipts.
+    # Keeping a second direct-send path here made on-time pushes invisible to
+    # the ledger and could duplicate sends during reconciliation.
     try:
         await asyncio.to_thread(
             delivery_lifecycle.reconcile_delivery_cycles, db_factory, now, _WORKER_ID,
@@ -929,6 +964,102 @@ async def _run_task2_maintenance_cycle(db_factory) -> None:
         logger.error("[task2-maintenance] account-erasure retry pass failed: %s", e)
 
 
+async def _run_database_backup() -> None:
+    """Create and validate the daily production database recovery point."""
+    import asyncio
+    from app.config import get_settings
+    from app.services.backup_service import create_daily_postgres_backup
+    from app.services.email_service import send_email
+
+    current_settings = get_settings()
+    if (
+        not current_settings.database_backup_enabled
+        or current_settings.app_env.lower() != "production"
+        or not current_settings.database_url.lower().startswith(("postgresql://", "postgres://"))
+    ):
+        return
+
+    try:
+        result = await asyncio.to_thread(create_daily_postgres_backup)
+        logger.info("[database-backup] %s", result["status"])
+    except Exception as exc:
+        logger.exception("[database-backup] daily backup failed")
+        # One scheduled attempt per day means one alert at most per day. The
+        # next run retries automatically; no secret or database URL is emailed.
+        await send_email(
+            to=current_settings.account_deletion_alert_email,
+            subject="Nibbler production database backup failed",
+            html=(
+                "<p>The scheduled PostgreSQL backup failed.</p>"
+                f"<p>Error: {type(exc).__name__}: {str(exc)[:300]}</p>"
+                "<p>Check Railway logs and the S3 backup prefix.</p>"
+            ),
+            text=(
+                "The scheduled PostgreSQL backup failed. "
+                f"Error: {type(exc).__name__}: {str(exc)[:300]}. "
+                "Check Railway logs and the S3 backup prefix."
+            ),
+        )
+
+
+async def _run_vector_ownership_audit(db_factory) -> None:
+    """Weekly, read-only Pinecone/Postgres ownership reconciliation.
+
+    Unknown namespaces are never auto-deleted: absence from the current user
+    table alone cannot distinguish a test namespace from an incomplete old
+    erasure. The alert contains only aggregate counts and irreversible hash
+    prefixes, giving operations a stable comparison key without emailing UID
+    or namespace values.
+    """
+    import asyncio
+    from app.config import get_settings
+    from app.services.email_service import send_email
+    from app.services.vector_integrity_service import inspect_namespace_ownership
+
+    current_settings = get_settings()
+    if current_settings.app_env.lower() != "production":
+        return
+
+    def _inspect():
+        with db_factory() as db:
+            return inspect_namespace_ownership(db)
+
+    try:
+        result = await asyncio.to_thread(_inspect)
+    except Exception:
+        logger.exception("[vector-integrity] ownership reconciliation failed")
+        return
+
+    if not result["unknown_count"]:
+        logger.info("[vector-integrity] all %d namespace(s) have a durable owner",
+                    result["namespace_count"])
+        return
+
+    fingerprints = ", ".join(result["unknown_fingerprints"])
+    logger.error(
+        "[vector-integrity] unknown_namespaces=%d unknown_vectors=%d fingerprints=%s",
+        result["unknown_count"], result["unknown_vectors"], fingerprints,
+    )
+    await send_email(
+        to=current_settings.account_deletion_alert_email,
+        subject="Nibbler vector ownership review required",
+        html=(
+            "<p>The weekly Pinecone ownership check found namespaces with no "
+            "current or durable-erasure owner.</p>"
+            f"<p>Namespaces: {result['unknown_count']}<br>"
+            f"Vectors: {result['unknown_vectors']}<br>"
+            f"SHA-256 prefixes: {fingerprints}</p>"
+            "<p>Review provenance before deleting anything.</p>"
+        ),
+        text=(
+            "The weekly Pinecone ownership check found namespaces with no current "
+            f"or durable-erasure owner. Namespaces: {result['unknown_count']}; "
+            f"vectors: {result['unknown_vectors']}; SHA-256 prefixes: {fingerprints}. "
+            "Review provenance before deleting anything."
+        ),
+    )
+
+
 def start_scheduler(db_factory) -> None:
     """
     Start the APScheduler with the daily notification job and the Task 2
@@ -956,6 +1087,32 @@ def start_scheduler(db_factory) -> None:
         id="task2_cleanup_reconciliation",
         replace_existing=True,
         misfire_grace_time=240,
+        max_instances=1,
+    )
+    scheduler.add_job(
+        _run_database_backup,
+        trigger="cron",
+        hour=2,
+        minute=30,
+        timezone="UTC",
+        id="daily_postgres_backup",
+        replace_existing=True,
+        misfire_grace_time=6 * 60 * 60,
+        coalesce=True,
+        max_instances=1,
+    )
+    scheduler.add_job(
+        _run_vector_ownership_audit,
+        trigger="cron",
+        day_of_week="sun",
+        hour=3,
+        minute=15,
+        timezone="UTC",
+        kwargs={"db_factory": db_factory},
+        id="weekly_vector_ownership_audit",
+        replace_existing=True,
+        misfire_grace_time=24 * 60 * 60,
+        coalesce=True,
         max_instances=1,
     )
     scheduler.start()

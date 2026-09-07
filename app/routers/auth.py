@@ -267,6 +267,14 @@ def _delete_mixpanel_profile_sync(user_id: str) -> bool:
         return False
 
 
+def _delete_mixpanel_events_sync(user_id: str, tracking_id: str = None):
+    try:
+        return asyncio.run(mixpanel_service.delete_historical_events(user_id, tracking_id))
+    except Exception as e:
+        logger.error("Mixpanel event deletion raised for %s: %s", user_id, e)
+        return False, tracking_id, "request_failed"
+
+
 def _send_email_sync(*args, **kwargs) -> bool:
     try:
         return asyncio.run(email_service.send_email(*args, **kwargs))
@@ -399,16 +407,21 @@ def _attempt_account_erasure_cleanup(db: Session, erasure: AccountErasure) -> bo
         logger.error("Erasure: RevenueCat delete raised for %s: %s", user_id, e)
     progress["revenuecat"] = revenuecat_ok
 
-    # ── Mixpanel profile ─────────────────────────────────────────────────
-    # Erases the stored PEOPLE-PROFILE properties (name/email/plan/
-    # platform). Does not purge historical EVENTS already ingested — see
-    # mixpanel_service.delete_profile's docstring for why that's a
-    # separate, heavier async API, flagged as a known follow-up.
+    # ── Mixpanel profile + historical events ─────────────────────────────
     try:
-        mixpanel_ok = _delete_mixpanel_profile_sync(identity.get("firebase_uid") or user_id)
+        mixpanel_profile_ok = _delete_mixpanel_profile_sync(identity.get("firebase_uid") or user_id)
     except Exception as e:
-        mixpanel_ok = False
+        mixpanel_profile_ok = False
         logger.error("Erasure: Mixpanel delete raised for %s: %s", user_id, e)
+    progress["mixpanel_profile"] = mixpanel_profile_ok
+    mixpanel_events_ok, tracking_id, event_status = _delete_mixpanel_events_sync(
+        identity.get("firebase_uid") or user_id,
+        progress.get("mixpanel_event_deletion_tracking_id"),
+    )
+    progress["mixpanel_event_deletion_tracking_id"] = tracking_id
+    progress["mixpanel_event_deletion_status"] = event_status
+    progress["mixpanel_events"] = mixpanel_events_ok
+    mixpanel_ok = mixpanel_profile_ok and mixpanel_events_ok
     progress["mixpanel"] = mixpanel_ok
 
     # ── Firebase identity ────────────────────────────────────────────────

@@ -34,6 +34,12 @@ OPPOSING_TAG_PAIRS = [
     ("shift_practical", "shift_reflective"),
     ("shift_practical", "shift_analytical"),
     ("shift_reflective", "shift_analytical"),
+    ("prefers_small_steps", "prefers_bold_experiments"),
+    ("prefers_solo_progress", "prefers_accountability"),
+    ("prefers_routine", "prefers_flexibility"),
+    ("prefers_examples", "prefers_principles"),
+    ("prefers_fast_feedback", "prefers_long_horizon"),
+    ("prefers_visual_learning", "prefers_verbal_learning"),
 ]
 
 
@@ -97,4 +103,16 @@ PERSONALIZATION_TAG_DELTAS = {
         "contentModeShift": "analytical",
         "label": "leaning toward understanding how things work",
     },
+    "prefers_small_steps": {"interestBump": ("small_steps", 0.15), "contentModeShift": "practical", "label": "preferring small, achievable steps"},
+    "prefers_bold_experiments": {"interestBump": ("bold_experiments", 0.15), "contentModeShift": "practical", "label": "preferring bold experiments"},
+    "prefers_solo_progress": {"interestBump": ("independent_progress", 0.15), "label": "preferring independent progress"},
+    "prefers_accountability": {"interestBump": ("accountability", 0.15), "label": "valuing accountability and support"},
+    "prefers_routine": {"interestBump": ("consistent_routines", 0.15), "contentModeShift": "practical", "label": "preferring consistent routines"},
+    "prefers_flexibility": {"interestBump": ("flexible_approaches", 0.15), "contentModeShift": "reflective", "label": "preferring flexible approaches"},
+    "prefers_examples": {"interestBump": ("worked_examples", 0.15), "contentModeShift": "practical", "label": "learning best through concrete examples"},
+    "prefers_principles": {"interestBump": ("underlying_principles", 0.15), "contentModeShift": "analytical", "label": "learning best through underlying principles"},
+    "prefers_fast_feedback": {"interestBump": ("fast_feedback", 0.15), "contentModeShift": "practical", "label": "preferring quick feedback loops"},
+    "prefers_long_horizon": {"interestBump": ("long_term_progress", 0.15), "contentModeShift": "reflective", "label": "preferring long-term progress"},
+    "prefers_visual_learning": {"interestBump": ("visual_explanations", 0.15), "label": "preferring visual explanations"},
+    "prefers_verbal_learning": {"interestBump": ("verbal_explanations", 0.15), "label": "preferring written explanations"},
 }

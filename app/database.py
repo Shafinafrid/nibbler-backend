@@ -540,6 +540,9 @@ def _run_migrations():
         # GET /connect/stats. Legacy rows stay NULL and are hidden rather than
         # guessed at.
         "ALTER TABLE daily_bites ADD COLUMN IF NOT EXISTS growth_profile_id VARCHAR",
+        "ALTER TABLE delivery_cycles ADD COLUMN IF NOT EXISTS expo_tickets JSON",
+        "ALTER TABLE delivery_cycles ADD COLUMN IF NOT EXISTS receipt_state VARCHAR",
+        "ALTER TABLE delivery_cycles ADD COLUMN IF NOT EXISTS receipt_checked_at TIMESTAMP",
         "ALTER TABLE library_items ADD COLUMN IF NOT EXISTS story_progress INTEGER DEFAULT 0",
         "ALTER TABLE library_items ADD COLUMN IF NOT EXISTS source_url VARCHAR",
         "ALTER TABLE library_items ADD COLUMN IF NOT EXISTS file_size INTEGER",
@@ -786,6 +789,8 @@ REQUIRED_COLUMNS = [
     ("delivery_cycles", "user_id"), ("delivery_cycles", "cycle_date"),
     ("delivery_cycles", "state"), ("delivery_cycles", "claimed_by"),
     ("delivery_cycles", "claimed_until"), ("delivery_cycles", "due_at"),
+    ("delivery_cycles", "expo_tickets"), ("delivery_cycles", "receipt_state"),
+    ("delivery_cycles", "receipt_checked_at"),
     # Task 8 fix — without these two columns the webhook/sync-premium write
     # paths would silently fall back to corrupting the shared premium_until
     # again, exactly the bug this migration exists to close.

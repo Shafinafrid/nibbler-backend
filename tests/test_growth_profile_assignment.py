@@ -48,7 +48,7 @@ import hermetic  # noqa: E402,F401
 from fastapi.testclient import TestClient  # noqa: E402
 
 from app.database import create_tables, SessionLocal, get_db  # noqa: E402
-from app.middleware.auth import get_current_user  # noqa: E402
+from app.middleware.auth import get_current_user, get_current_verified_user  # noqa: E402
 from app.models.user import User  # noqa: E402
 from app.models.library import LibraryItem  # noqa: E402
 from app.models.profile import Profile  # noqa: E402
@@ -73,6 +73,8 @@ db = SessionLocal()
 ACTIVE = {"id": None}
 main.app.dependency_overrides[get_db] = lambda: db
 main.app.dependency_overrides[get_current_user] = \
+    lambda: db.query(User).filter(User.id == ACTIVE["id"]).first()
+main.app.dependency_overrides[get_current_verified_user] = \
     lambda: db.query(User).filter(User.id == ACTIVE["id"]).first()
 client = TestClient(main.app)
 

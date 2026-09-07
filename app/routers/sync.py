@@ -777,10 +777,36 @@ def delete_avatar(
     db: Session = Depends(get_db),
 ):
     if current_user.avatar_url:
+        from app.routers.library import _cleanup_ledger_upsert_pending, _cleanup_ledger_resolve
+        key = current_user.avatar_url
+        attempt = f"avatar-{current_user.id}-{int(datetime.utcnow().timestamp() * 1000000)}"
+        ledger = _cleanup_ledger_upsert_pending(
+            item_id=f"avatar:{current_user.id}",
+            user_id=current_user.id,
+            attempt_token=attempt,
+            artifact_kind="s3",
+            artifact_key=key,
+            reason="user requested avatar deletion",
+        )
+        if ledger == "failed":
+            raise HTTPException(
+                status_code=503,
+                detail="Could not safely schedule avatar deletion. Please try again.",
+            )
+        deleted = False
+        error_detail = None
         try:
-            S3Service().delete_file(current_user.avatar_url)
-        except Exception:
-            pass
+            deleted = bool(S3Service().delete_file(key))
+            if not deleted:
+                error_detail = "delete_file returned False"
+        except Exception as exc:
+            error_detail = str(exc)[:250]
+            logger.exception("avatar delete failed for %s", current_user.id)
+        _cleanup_ledger_resolve(
+            f"avatar:{current_user.id}", attempt, "s3", deleted,
+            error_detail, artifact_key=key,
+        )
         current_user.avatar_url = None
         db.commit()
-    return {"ok": True}
+        return {"ok": True, "cleanup_pending": not deleted}
+    return {"ok": True, "cleanup_pending": False}
