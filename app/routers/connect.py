@@ -669,8 +669,9 @@ def get_book_stats(
       the same session can never bump the count)
     · explored_pct: distinct chunk indexes across READ sessions over the whole
       book — a 5-page article and a 1000-page book fill it at honest speeds
-    · sessions_total: derived from chunk_count / avg chunks-per-session, known
-      the moment the book finishes processing
+    · sessions_total: completed sessions plus an estimate of the remaining
+      sessions at the book's observed/default nibble size (legacy API field;
+      the current app displays the honest completed count only)
     · goal_passage: from the most recent READ nibble, with its real date
     """
     item = _get_item(library_item_id, current_user, db)
@@ -688,22 +689,23 @@ def get_book_stats(
 
     chunk_count = item.chunk_count or 0
 
-    read_chunks: set = set()
-    for b in read:
-        read_chunks.update(i for i in (b.chunk_ids or []) if isinstance(i, int))
+    from app.services.session_service import wisdom_chunk_indexes
+    read_chunks = wisdom_chunk_indexes(db, current_user.id, item.id, read_only=True)
 
     # Chunks-per-session: average of what sessions actually drew, falling back
     # to the 5-minute default (6) before any session exists.
     sized = [len(b.chunk_ids) for b in bites if b.chunk_ids]
     per_session = (sum(sized) / len(sized)) if sized else 6
-    sessions_total = max(1, math.ceil(chunk_count / per_session)) if chunk_count else max(1, len(read))
+    remaining_chunks = max(0, chunk_count - len(read_chunks))
+    sessions_total = (
+        len(read) + math.ceil(remaining_chunks / per_session)
+        if chunk_count else max(1, len(read))
+    )
 
     if chunk_count:
         explored = round(len(read_chunks) / chunk_count * 100)
-        # Pre-chunk_ids sessions (legacy rows) still count for a floor estimate
-        legacy_read = [b for b in read if not b.chunk_ids]
-        if legacy_read and explored < 100:
-            explored = min(100, explored + round(len(legacy_read) * per_session / chunk_count * 100))
+        # Legacy rows without chunk_ids cannot prove which parts were read.
+        # Do not inflate exploration with a guessed six chunks per session.
     else:
         explored = 0
 

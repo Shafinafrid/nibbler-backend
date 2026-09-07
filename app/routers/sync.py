@@ -559,12 +559,20 @@ def session_complete(
 
     streak = db.query(Streak).filter(Streak.user_id == current_user.id).first()
     if existing:
+        item = db.query(LibraryItem).filter(
+            LibraryItem.id == data.book_id,
+            LibraryItem.user_id == current_user.id,
+        ).first()
+        from app.services.session_service import wisdom_source_complete
+        source_completed = bool(item and wisdom_source_complete(db, current_user.id, item))
         return SessionCompleteOut(
             already_applied=True,
             bite_marked_read=True,
             current_streak=streak.current_streak if streak else 0,
             longest_streak=streak.longest_streak if streak else 0,
             total_bites_read=streak.total_bites_read if streak else 0,
+            source_completed=source_completed,
+            source_deactivated=False,
         )
 
     # Task 2 remediation (3rd audit, sync/restore lock enforcement): a NEW
@@ -618,6 +626,20 @@ def session_complete(
 
     streak = apply_checkin(db, current_user.id)
 
+    # Completing the nibble that contains the final new indexed chunk closes
+    # the source immediately.  This prevents the scheduler or a later manual
+    # tap from generating a raw-text/repeated deck and frees an active slot for
+    # another book.  Legacy bites without chunk_ids never count by guesswork.
+    item = db.query(LibraryItem).filter(
+        LibraryItem.id == data.book_id,
+        LibraryItem.user_id == current_user.id,
+    ).first()
+    from app.services.session_service import wisdom_source_complete
+    source_completed = bool(item and wisdom_source_complete(db, current_user.id, item))
+    source_deactivated = bool(source_completed and item and item.is_active)
+    if source_deactivated:
+        item.is_active = False
+
     try:
         db.commit()
     except IntegrityError:
@@ -631,6 +653,8 @@ def session_complete(
             current_streak=streak.current_streak if streak else 0,
             longest_streak=streak.longest_streak if streak else 0,
             total_bites_read=streak.total_bites_read if streak else 0,
+            source_completed=source_completed,
+            source_deactivated=False,
         )
 
     db.refresh(streak)
@@ -640,6 +664,8 @@ def session_complete(
         current_streak=streak.current_streak,
         longest_streak=streak.longest_streak,
         total_bites_read=streak.total_bites_read,
+        source_completed=source_completed,
+        source_deactivated=source_deactivated,
     )
 
 

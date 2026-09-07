@@ -400,6 +400,45 @@ class SessionGenerationError(Exception):
         self.code = code
 
 
+def wisdom_chunk_indexes(
+    db: Session,
+    user_id: str,
+    item_id: str,
+    *,
+    read_only: bool = False,
+) -> set[int]:
+    """Chunk indexes this user has provably seen (or been served).
+
+    Legacy bites written before ``chunk_ids`` existed deliberately contribute
+    nothing: guessing six chunks per old session made short/partially-extracted
+    books report 100% explored even when half their indexed chunks had never
+    appeared in a nibble.  Completion is a product boundary, so it must be
+    based on evidence rather than an estimate.
+    """
+    query = db.query(DailyBite.chunk_ids).filter(
+        DailyBite.user_id == user_id,
+        DailyBite.library_item_id == item_id,
+        DailyBite.chunk_ids.isnot(None),
+    )
+    if read_only:
+        query = query.filter(DailyBite.read_at.isnot(None))
+
+    indexes: set[int] = set()
+    for (chunk_ids,) in query.all():
+        indexes.update(
+            value for value in (chunk_ids or [])
+            if isinstance(value, int) and not isinstance(value, bool)
+        )
+    return indexes
+
+
+def wisdom_source_complete(db: Session, user_id: str, item: LibraryItem) -> bool:
+    """Whether every indexed chunk has already been assigned to a nibble."""
+    if (item.mode or "wisdom") != "wisdom" or not (item.chunk_count or 0):
+        return False
+    return len(wisdom_chunk_indexes(db, user_id, item.id)) >= item.chunk_count
+
+
 def _slice_words(text: str, start: int, count: int) -> str:
     """The slice of `text` covering words [start, start+count) — with every
     space, line break and blank line between them left exactly as written.
@@ -519,6 +558,21 @@ def generate_session_for_item(
         # is also the one place that must refuse unconditionally rather than
         # trust every caller to have checked (Task 2).
         raise SessionGenerationError("This source is locked for Free accounts.", status_code=403)
+
+    # A completed wisdom source must never fall through to the raw-text
+    # fallback and manufacture a repeated nibble.  The completion receipt
+    # normally deactivates it immediately; this guard also covers old clients,
+    # scheduler races, and a user manually reactivating an exhausted source.
+    if wisdom_source_complete(db, user.id, item):
+        if item.is_active:
+            item.is_active = False
+            db.commit()
+        raise SessionGenerationError(
+            "You've explored everything Nibbler could find in this source. "
+            "It has been made inactive so it won't repeat itself.",
+            status_code=409,
+            code="source_complete",
+        )
 
     worker_id = _worker_id()
     claimed_row, won = _claim_or_find_daily_bite(db, user.id, item.id, today, worker_id)
@@ -674,17 +728,7 @@ def _build_session_content(
         # sessions already drew from, so each nibble explores NEW ground —
         # without this, the same profile query returned the same top-K chunks
         # every single day, and 'Explored %' could never honestly grow.
-        served: set = set()
-        for (ids,) in (
-            db.query(DailyBite.chunk_ids)
-            .filter(
-                DailyBite.user_id == user.id,
-                DailyBite.library_item_id == item.id,
-                DailyBite.chunk_ids.isnot(None),
-            )
-            .all()
-        ):
-            served.update(i for i in (ids or []) if isinstance(i, int))
+        served = wisdom_chunk_indexes(db, user.id, item.id)
 
         try:
             fresh = embeddings.search_item_fresh(
@@ -717,7 +761,11 @@ def _build_session_content(
         if chunks and pq:
             goal_passage = " ".join(chunks[0].split())
             goal_passage = goal_passage[:280] + ("…" if len(goal_passage) > 280 else "")
-        if not chunks and item.content:
+        # Raw text is a cold-start resilience path only. Once indexed chunks
+        # have been served, using the whole-book prefix during a Pinecone
+        # miss/outage would create an untracked duplicate (chunk_ids=[]), then
+        # falsely look like fresh progress. Retry later instead.
+        if not chunks and item.content and not served:
             chunks = [item.content[:8000]]  # Pinecone down — fall back to raw text
             chunk_ids = []
         if not chunks:

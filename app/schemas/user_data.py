@@ -134,6 +134,8 @@ class SessionCompleteOut(BaseModel):
     current_streak: int
     longest_streak: int
     total_bites_read: int
+    source_completed: bool = False
+    source_deactivated: bool = False
 
 
 # ── Settings / state ─────────────────────────────────────────────────────────
